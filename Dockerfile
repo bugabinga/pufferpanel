@@ -52,8 +52,19 @@ ARG curseforgeKey=''
 
 RUN xx-apk add musl-dev gcc
 RUN xx-go build -buildvcs=false -tags "$tags" -ldflags "-X 'github.com/pufferpanel/pufferpanel/v3/config.curseforgeKey=$curseforgeKey' -X 'github.com/pufferpanel/pufferpanel/v3.Hash=$sha' -X 'github.com/pufferpanel/pufferpanel/v3.Version=$version'" -o /pufferpanel/pufferpanel github.com/pufferpanel/pufferpanel/v3/cmd
-RUN if [ "$BUILDPLATFORM" = "$TARGETPLATFORM" ]; then go test ./...; fi
 RUN xx-verify /pufferpanel/pufferpanel
+
+# Lifecycle tests download glibc-based game runtimes.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26 AS tests
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+WORKDIR /build/pufferpanel
+COPY --from=builder /go/pkg/mod /go/pkg/mod
+COPY --from=builder /build/pufferpanel .
+COPY --from=builder /pufferpanel /pufferpanel
+RUN if [ "$BUILDPLATFORM" = "$TARGETPLATFORM" ]; then go test ./...; fi
 
 ###
 # Generate final image
@@ -77,7 +88,7 @@ ENV GIN_MODE=release \
 #COPY --from=builder --chown=pufferpanel:pufferpanel --chmod=755 /pufferpanel /pufferpanel/bin
 #COPY --from=builder --chown=pufferpanel:pufferpanel --chmod=755 /build/pufferpanel/entrypoint.sh /pufferpanel/bin/entrypoint.sh
 #COPY --from=builder --chown=pufferpanel:pufferpanel --chmod=755 /build/pufferpanel/config.docker.json /etc/pufferpanel/config.json
-COPY --from=builder --chmod=755 /pufferpanel /pufferpanel/bin
+COPY --from=tests --chmod=755 /pufferpanel /pufferpanel/bin
 COPY --from=builder --chmod=755 /build/pufferpanel/entrypoint.sh /pufferpanel/bin/entrypoint.sh
 COPY --from=builder --chmod=755 /build/pufferpanel/config.docker.json /etc/pufferpanel/config.json
 
