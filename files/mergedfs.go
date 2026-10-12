@@ -39,6 +39,7 @@ func (m *MergedFS) Open(name string) (fs.File, error) {
 
 func (m *MergedFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	results := make([]fs.DirEntry, 0)
+	seen := make(map[string]struct{})
 
 	for _, fss := range m.fileSystems {
 		if dirFs, ok := fss.(fs.ReadDirFS); ok {
@@ -47,16 +48,13 @@ func (m *MergedFS) ReadDir(name string) ([]fs.DirEntry, error) {
 				return nil, err
 			}
 
-			for _, v := range secondary {
-				inPrimary := false
-				for _, z := range results {
-					if v.Name() == z.Name() {
-						inPrimary = true
-					}
+			for _, entry := range secondary {
+				name := entry.Name()
+				if _, exists := seen[name]; exists {
+					continue
 				}
-				if !inPrimary {
-					results = append(results, v)
-				}
+				seen[name] = struct{}{}
+				results = append(results, entry)
 			}
 		}
 	}
