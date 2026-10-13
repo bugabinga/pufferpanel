@@ -1,0 +1,10 @@
+{
+  "defaultProvider": "zai",
+  "ultra": {
+    "providerModelTiers": {
+      "zai": {
+        "medium": { "model": "zai/glm-5.3", "thinkingLevel": "high" }
+      }
+    }
+  }
+}

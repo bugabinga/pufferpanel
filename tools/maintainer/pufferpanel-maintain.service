@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily PufferPanel fork maintenance and verified registry release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Workspace/pufferpanel
+Environment=PATH=%h/.local/share/pi-node/current/bin:%h/.local/share/mise/shims:%h/.pi/agent/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/bash %h/Workspace/pufferpanel/tools/maintainer/run.sh
+TimeoutStartSec=2h1min
+TimeoutStopSec=30s
+KillMode=control-group
+Nice=10
+UMask=0077

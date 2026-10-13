@@ -1,0 +1,164 @@
+name: honest_annie
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'check: offline CI only; maintain: paid maintenance and verified release'
+        type: choice
+        default: check
+        options: [check, maintain]
+  push:
+    branches: [trunk]
+    paths: ['tools/maintainer/**', '.github/workflows/honest-annie.yml']
+  pull_request:
+    branches: [trunk]
+    paths: ['tools/maintainer/**', '.github/workflows/honest-annie.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: honest-annie-${{ github.event_name == 'pull_request' && github.ref || 'trunk' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - name: Install pinned harness dependencies
+        run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - name: Test honest_annie without model requests or publication
+        run: |
+          npm test
+          bash -n ci.sh gate.sh publish.sh run.sh
+        working-directory: tools/maintainer
+
+  maintain:
+    needs: check
+    if: >-
+      github.repository == 'bugabinga/pufferpanel' && github.ref == 'refs/heads/trunk' &&
+      vars.HONEST_ANNIE_ENABLED == 'true' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && inputs.mode == 'maintain'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 125
+    environment: honest-annie-model
+    outputs:
+      candidate: ${{ steps.candidate.outputs.candidate }}
+    env:
+      PUFFER_MAINT_DEFER_PUBLISH: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure runner-temporary paths
+        run: bash tools/maintainer/ci.sh init
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - name: Ensure rootless container tools
+        run: |
+          if ! command -v podman; then
+            sudo apt-get update
+            sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          fi
+          podman info
+      - name: Install pinned harness dependencies
+        run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - name: Configure isolated honest_annie runtime
+        run: bash tools/maintainer/ci.sh prepare
+      - name: Maintain, independently review, run fixed gates, commit locally
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: |
+          test -n "$ZAI_API_KEY" || { echo 'Set ZAI_API_KEY in honest-annie-model environment' >&2; exit 1; }
+          bash tools/maintainer/run.sh
+      - name: Export only reviewed source and exact-tree gate receipt
+        id: candidate
+        run: bash tools/maintainer/ci.sh export
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.candidate.outputs.candidate == 'true'
+        with:
+          name: honest-annie-candidate
+          path: ${{ env.HONEST_ANNIE_ARTIFACT }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Show failed gate diagnostics, not model transcripts
+        if: failure()
+        run: |
+          if test -d "$PUFFER_MAINT_STATE/runs"; then
+            find "$PUFFER_MAINT_STATE/runs" -type f -name '*.log' -exec tail -n 80 {} +
+          fi
+
+  release:
+    needs: maintain
+    if: needs.maintain.outputs.candidate == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: honest-annie-release
+    permissions:
+      contents: write
+    env:
+      PUFFER_MAINT_REGISTRY: registry.bugabinga.net/pufferpanel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure runner-temporary paths
+        run: bash tools/maintainer/ci.sh init
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - name: Ensure rootless container tools
+        run: |
+          if ! command -v podman; then
+            sudo apt-get update
+            sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          fi
+          podman info
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: honest-annie-candidate
+          path: ${{ env.HONEST_ANNIE_ARTIFACT }}
+      - name: Verify candidate identity, immutable CI, and gate receipt
+        run: bash tools/maintainer/ci.sh import
+      - name: Independently rerun fixed gates before release credentials
+        run: bash tools/maintainer/ci.sh gate
+      - name: Authenticate publisher only
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          test -n "$REGISTRY_USERNAME" && test -n "$REGISTRY_PASSWORD" || { echo 'Set registry secrets in honest-annie-release environment' >&2; exit 1; }
+          printf '%s' "$REGISTRY_PASSWORD" | podman login --authfile "$REGISTRY_AUTH_FILE" --username "$REGISTRY_USERNAME" --password-stdin registry.bugabinga.net
+      - name: Persist reviewed commit without overwriting newer trunk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/maintainer/ci.sh push
+      - name: Publish immutable numbered image, verify, promote latest
+        run: bash tools/maintainer/ci.sh publish
+      - name: Show failed publication diagnostics
+        if: failure()
+        run: |
+          if test -d "$PUFFER_MAINT_STATE/runs"; then
+            find "$PUFFER_MAINT_STATE/runs" -type f -name '*.log' -exec tail -n 80 {} +
+          fi
+      - name: Remove registry credentials
+        if: always()
+        run: rm -f "$REGISTRY_AUTH_FILE"

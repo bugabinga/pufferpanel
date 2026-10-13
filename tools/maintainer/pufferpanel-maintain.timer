@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule daily PufferPanel maintenance
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=pufferpanel-maintain.service
+
+[Install]
+WantedBy=timers.target
