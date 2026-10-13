@@ -43,7 +43,7 @@ export class TemplateApi {
       const res = await this._api.get(`/api/templates/${repo}/${name}`, undefined, undefined, {unhandledErrors: [404]})
       if (!res.status || res.status >= 400) throw new Error('template doesn\'t exist, behave yourself js...')
       return true
-    } catch (e) {
+    } catch {
       return false
     }
   }

@@ -2,7 +2,9 @@ package tests
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -14,11 +16,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/mholt/archiver/v3"
 	"github.com/pkg/sftp"
 	"github.com/pufferpanel/pufferpanel/v3"
 	"github.com/pufferpanel/pufferpanel/v3/config"
@@ -229,9 +231,9 @@ func TestServers(t *testing.T) {
 
 			//previous test is a block,so we can now open up a websocket connection and start playing with it
 			//the test here is... do we get all 3 types of messages
-			statsReceived := false
-			messageReceived := false
-			statusReceived := false
+			var statsReceived atomic.Bool
+			var messageReceived atomic.Bool
+			var statusReceived atomic.Bool
 
 			addr := fmt.Sprintf("%s:%d", models.LocalNode.PrivateHost, models.LocalNode.PrivatePort)
 
@@ -244,11 +246,12 @@ func TestServers(t *testing.T) {
 			if !assert.NoError(t, webErr) {
 				return
 			}
-			listening := true
+			var listening atomic.Bool
+			listening.Store(true)
 			defer utils.Close(c)
 
 			go func(conn *websocket.Conn) {
-				for listening {
+				for listening.Load() {
 					messageType, data, err := conn.ReadMessage()
 					if err != nil {
 						fmt.Printf("Error on websocket: %s\n", err.Error())
@@ -280,11 +283,11 @@ func TestServers(t *testing.T) {
 							fmt.Printf("[WEBSOCKET] %s\n", ms.Logs)
 						}
 
-						messageReceived = true
+						messageReceived.Store(true)
 					case pufferpanel.MessageTypeStatus:
-						statusReceived = true
+						statusReceived.Store(true)
 					case pufferpanel.MessageTypeStats:
-						statsReceived = true
+						statsReceived.Store(true)
 					default:
 						fmt.Printf("unknown message type: %s\n", msg["type"])
 						continue
@@ -584,7 +587,7 @@ func TestServers(t *testing.T) {
 				t.Run("StopServerAgain", stopServer)
 			})
 
-			listening = false
+			listening.Store(false)
 			_ = c.Close()
 
 			//create a fake file that we can use to both
@@ -604,7 +607,7 @@ func TestServers(t *testing.T) {
 				hasher := sha256.New()
 				w := io.MultiWriter(tmpFile, hasher)
 
-				_, err = io.CopyN(w, rand.Reader, 1024*1024*1024)
+				_, err = io.CopyN(w, rand.Reader, 8*1024*1024)
 				if !assert.NoError(t, err) {
 					return
 				}
@@ -663,16 +666,8 @@ func TestServers(t *testing.T) {
 					return
 				}
 
-				//now we can validate the zip is empty
-				exists := false
-				e = archiver.Walk(filepath.Join(serverDir, "archive.zip"), func(archiver.File) error {
-					exists = true
-					return nil
-				})
-
-				if !assert.NoError(t, e) || !assert.False(t, exists, "zip is not empty") {
-					return
-				}
+				// Compression gathers every input before creating an output artifact.
+				assert.NoFileExists(t, filepath.Join(serverDir, "archive.zip"))
 			})
 
 			t.Run("Extract-IndirectFile", func(t *testing.T) {
@@ -688,8 +683,20 @@ func TestServers(t *testing.T) {
 				_ = tmpZip.Close()
 				_ = os.Remove(tmpZip.Name())
 
-				e = archiver.Archive([]string{tmpFile.Name()}, tmpZip.Name())
+				zipFile, e := os.Create(tmpZip.Name())
 				if !assert.NoError(t, e) {
+					return
+				}
+				zipWriter := zip.NewWriter(zipFile)
+				entry, e := zipWriter.Create(filepath.Base(tmpFile.Name()))
+				if !assert.NoError(t, e) {
+					return
+				}
+				_, e = entry.Write([]byte("this is a test"))
+				if !assert.NoError(t, e) {
+					return
+				}
+				if !assert.NoError(t, zipWriter.Close()) || !assert.NoError(t, zipFile.Close()) {
 					return
 				}
 
@@ -960,9 +967,9 @@ func TestServers(t *testing.T) {
 			})
 
 			t.Run("WebSocketReceivedAll", func(t *testing.T) {
-				assert.True(t, statsReceived, "Stats were not received")
-				assert.True(t, statusReceived, "Status was not received")
-				assert.True(t, messageReceived, "Console messages were not received")
+				assert.True(t, statsReceived.Load(), "Stats were not received")
+				assert.True(t, statusReceived.Load(), "Status was not received")
+				assert.True(t, messageReceived.Load(), "Console messages were not received")
 			})
 
 			t.Run("Vulns", func(t *testing.T) {
@@ -975,50 +982,26 @@ func TestServers(t *testing.T) {
 					}
 
 					fullPath := filepath.Join(backupDir, ServerId)
-
-					fmt.Printf("ABS for testing: %s\n", fullPath)
-					/*
-						_ = os.RemoveAll(fullPath)
-						defer os.Remove(fullPath)
-
-						err = os.MkdirAll(config.BackupsFolder.Value(), 0755)
-						if !assert.NoError(t, err) {
-							return
-						}
-
-						_ = os.Remove(ServerId)
-						err = os.Symlink("/tmp", ServerId)
-						if !assert.NoError(t, err) {
-							return
-						}
-
-						fi, err := os.Lstat(ServerId)
-						if !assert.NoError(t, err) {
-							return
-						}
-
-						var malTar bytes.Buffer
-
-						tarWriter := archiver.NewTarGz()
-						tarWriter.Create(&malTar)
-						err = tarWriter.Write(archiver.File{
-							FileInfo: archiver.FileInfo{
-								FileInfo:   fi,
-								SourcePath: ServerId,
-							},
-							ReadCloser: io.NopCloser(strings.NewReader("/tmp")),
-						})
-						if !assert.NoError(t, err) {
-							return
-						}
-						tarWriter.Close()
-					*/
+					before, err := os.Lstat(fullPath)
+					if !assert.NoError(t, err) || !assert.True(t, before.IsDir()) {
+						return
+					}
+					insideSentinel := filepath.Join(fullPath, "backup-sentinel")
+					outsideDir, err := filepath.Abs(serverDir)
+					if !assert.NoError(t, err) {
+						return
+					}
+					outsideSentinel := filepath.Join(outsideDir, "outside-sentinel")
+					if !assert.NoError(t, os.WriteFile(insideSentinel, []byte("inside"), 0600)) ||
+						!assert.NoError(t, os.WriteFile(outsideSentinel, []byte("outside"), 0600)) {
+						return
+					}
 
 					malTar, err := createBadTarGz([]tarItem{
 						{
 							Name:    ServerId,
 							Mode:    os.ModeSymlink,
-							Content: "/tmp",
+							Content: outsideDir,
 						},
 					})
 					if !assert.NoError(t, err) {
@@ -1039,15 +1022,23 @@ func TestServers(t *testing.T) {
 						t.Logf("%v", response.Body)
 						return
 					}
-					fi, err := os.Lstat(fullPath)
-					if !assert.ErrorIs(t, err, os.ErrNotExist) {
-						t.Logf("File: %s (%s)\n", fi.Name(), fi.Mode())
-						if fi.Mode()&os.ModeSymlink != 0 {
-							var p string
-							p, err = os.Readlink(fullPath)
-							t.Logf("Links to: %s\n", p)
-						}
+					after, err := os.Lstat(fullPath)
+					if !assert.NoError(t, err) {
+						return
 					}
+					assert.True(t, after.IsDir())
+					assert.Zero(t, after.Mode()&os.ModeSymlink)
+					assert.True(t, os.SameFile(before, after))
+					inside, err := os.ReadFile(insideSentinel)
+					if !assert.NoError(t, err) {
+						return
+					}
+					outside, err := os.ReadFile(outsideSentinel)
+					if !assert.NoError(t, err) {
+						return
+					}
+					assert.Equal(t, []byte("inside"), inside)
+					assert.Equal(t, []byte("outside"), outside)
 				})
 
 				t.Run("RestoreUnsafeZip", func(t *testing.T) {
@@ -1302,9 +1293,10 @@ func createBadTarGz(items []tarItem) (writer bytes.Buffer, err error) {
 	}
 	t.Close()
 
-	tr := tar.NewReader(&tarWriter)
-
-	gz := archiver.NewGz()
-	err = gz.Compress(tr, &writer)
+	gz := gzip.NewWriter(&writer)
+	if _, err = gz.Write(tarWriter.Bytes()); err != nil {
+		return
+	}
+	err = gz.Close()
 	return
 }

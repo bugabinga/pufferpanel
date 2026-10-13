@@ -4,7 +4,7 @@ import (
 	"errors"
 	"github.com/gofrs/uuid/v5"
 	"github.com/pufferpanel/pufferpanel/v3"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
 	"strings"
 	"time"

@@ -35,8 +35,6 @@ type Docker struct {
 	Labels        map[string]string    `json:"labels,omitempty"`
 	Config        container.Config     `json:"config,omitempty"`
 
-	connection          client.HijackedResponse
-	cli                 *client.Client
 	statLocker          sync.Mutex
 	lastStats           *pufferpanel.ServerStats
 	lastStatTime        time.Time
@@ -45,14 +43,13 @@ type Docker struct {
 }
 
 func CreateDockerEnvironment() pufferpanel.EnvironmentImpl {
-	/*return &Docker{
+	return &Docker{
 		ImageName: "pufferpanel/generic",
 		Network:   "host",
 		Ports:     make([]string, 0),
 		Binds:     make(map[string]string),
 		Labels:    make(map[string]string),
-	}*/
-	return nil
+	}
 }
 
 func (d *Docker) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps pufferpanel.ExecutionData) error {
@@ -74,12 +71,11 @@ func (d *Docker) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps pu
 		return errors.New("docker container already exists")
 	}
 
-	err = d.createContainer(environment, steps, ctx)
+	err = d.createContainer(environment, steps, ctx, dockerClient)
 	if err != nil {
 		return err
 	}
 
-	d.disableSpecialStats = steps.DisableStats
 	//d.disableStdin = steps.DisableStdin
 
 	cfg := client.ContainerAttachOptions{
@@ -93,21 +89,26 @@ func (d *Docker) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps pu
 	if err != nil {
 		return err
 	}
-	d.connection = res.HijackedResponse
-
+	connection := res.HijackedResponse
 	go func() {
-		defer d.connection.Close()
-		_, _ = io.Copy(environment.Wrapper, d.connection.Reader)
+		defer connection.Close()
+		_, _ = io.Copy(environment.Wrapper, connection.Reader)
 	}()
 
 	//if !d.disableStdin {
-	//	environment.CreateConsoleStdinProxy(steps.StdInConfig, d.connection.Conn)
+	//	environment.CreateConsoleStdinProxy(steps.StdInConfig, connection.Conn)
 	//}
-	environment.CreateConsoleStdinProxy(steps.StdInConfig, d.connection.Conn)
+	environment.CreateConsoleStdinProxy(steps.StdInConfig, connection.Conn)
 
 	environment.Console.Start()
 
 	startOpts := client.ContainerStartOptions{}
+
+	d.statLocker.Lock()
+	d.disableSpecialStats = steps.DisableStats
+	d.lastStats = nil
+	d.lastStatTime = time.Time{}
+	d.statLocker.Unlock()
 
 	_ = environment.StatusTracker.WriteMessage(pufferpanel.Transmission{
 		Message: pufferpanel.ServerRunning{
@@ -120,6 +121,11 @@ func (d *Docker) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps pu
 	environment.DisplayToConsole(true, "Starting container\n")
 	_, err = dockerClient.ContainerStart(ctx, environment.Server.Id(), startOpts)
 	if err != nil {
+		d.statLocker.Lock()
+		d.disableSpecialStats = false
+		d.lastStats = nil
+		d.lastStatTime = time.Time{}
+		d.statLocker.Unlock()
 		return err
 	}
 
@@ -270,7 +276,7 @@ func (d *Docker) GetStatsImpl(environment *pufferpanel.Environment) (*pufferpane
 	return stats, nil
 }
 
-func (d *Docker) createContainer(environment *pufferpanel.Environment, data pufferpanel.ExecutionData, ctx context.Context) error {
+func (d *Docker) createContainer(environment *pufferpanel.Environment, data pufferpanel.ExecutionData, ctx context.Context, dockerClient *client.Client) error {
 	environment.Log(logging.Debug, "Creating container")
 	containerRoot := d.ContainerRoot
 	if containerRoot == "" {
@@ -283,9 +289,18 @@ func (d *Docker) createContainer(environment *pufferpanel.Environment, data puff
 		}
 	}
 
+	var stdinPort network.Port
+	var err error
+	if data.StdInConfig.Port != "" {
+		stdinPort, err = network.ParsePort(data.StdInConfig.Port + "/tcp")
+		if err != nil {
+			return err
+		}
+	}
+
 	imageName := utils.ReplaceTokens(d.ImageName, data.Variables, utils.PlainReplace)
 
-	err := pufferpanel.PullDockerImage(environment, ctx, imageName, false)
+	err = pufferpanel.PullDockerImage(environment, ctx, imageName, false)
 
 	if err != nil {
 		return err
@@ -367,7 +382,7 @@ func (d *Docker) createContainer(environment *pufferpanel.Environment, data puff
 	if containerMountSource != "" {
 		dir = filepath.Join(containerMountSource, "servers", environment.Server.Id())
 	} else {
-		dir = filepath.Join(environment.Server.GetFileServer().Prefix(), environment.Server.Id())
+		dir = environment.Server.GetFileServer().Prefix()
 	}
 
 	//convert root dir to a full path, so we can bind it
@@ -413,9 +428,9 @@ func (d *Docker) createContainer(environment *pufferpanel.Environment, data puff
 
 	hostConfig.PortBindings = network.PortMap{}
 	if data.StdInConfig.Port != "" {
-		if _, exists := hostConfig.PortBindings[network.MustParsePort(data.StdInConfig.Port+"/tcp")]; !exists {
+		if _, exists := hostConfig.PortBindings[stdinPort]; !exists {
 			//we have a port defined for stdin, we need to also export it
-			hostConfig.PortBindings[network.MustParsePort(data.StdInConfig.Port+"/tcp")] = []network.PortBinding{{
+			hostConfig.PortBindings[stdinPort] = []network.PortBinding{{
 				HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: data.StdInConfig.Port,
 			}}
 		}
@@ -447,7 +462,7 @@ func (d *Docker) createContainer(environment *pufferpanel.Environment, data puff
 	networkConfig := &network.NetworkingConfig{}
 
 	//for now, default to linux across the board. This resolves problems that Windows has when you use it and docker
-	_, err = d.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+	_, err = dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:           containerConfig,
 		HostConfig:       hostConfig,
 		NetworkingConfig: networkConfig,
@@ -490,7 +505,11 @@ func (d *Docker) GetGidImpl(environment *pufferpanel.Environment) int {
 	if user == "" {
 		return -1
 	}
-	return cast.ToInt(strings.Split(user, ":")[1])
+	parts := strings.Split(user, ":")
+	if len(parts) < 2 {
+		return -1
+	}
+	return cast.ToInt(parts[1])
 }
 
 func (d *Docker) handleClose(environment *pufferpanel.Environment, dc *client.Client, callback func(int)) {
@@ -524,7 +543,12 @@ func (d *Docker) handleClose(environment *pufferpanel.Environment, dc *client.Cl
 	})
 
 	_ = environment.Console.Close()
+
+	d.statLocker.Lock()
 	d.disableSpecialStats = false
+	d.lastStats = nil
+	d.lastStatTime = time.Time{}
+	d.statLocker.Unlock()
 
 	environment.Wait.Unlock()
 

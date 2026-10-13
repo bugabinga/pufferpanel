@@ -166,18 +166,18 @@ func doRestart(server *servers.Server, timeout time.Duration) error {
 	}
 	//server.RunningEnvironment.WaitForMainProcessFor(timeout)
 
-	done := false
-	time.AfterFunc(timeout, func() {
-		done = true
-	})
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
 	//wait for the timeout to be done or the server to not be running
-	for !done && server.IsIdle() != nil {
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if done {
-		return pufferpanel.ErrServerRunning
+	for server.IsIdle() != nil {
+		select {
+		case <-timer.C:
+			return pufferpanel.ErrServerRunning
+		case <-ticker.C:
+		}
 	}
 
 	return server.Start()

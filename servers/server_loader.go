@@ -109,6 +109,21 @@ func LoadFromData(id string, source []byte) (*Server, error) {
 	}
 	data.SetFileServer(fs)
 
+	if files.BackupFS == nil {
+		_ = fs.Close()
+		return nil, errors.New("backup filesystem is not initialized")
+	}
+	if err := files.BackupFS.MkdirAll(id, 0755); err != nil {
+		_ = fs.Close()
+		return nil, err
+	}
+	backupFS, err := files.NewFileServer(filepath.Join(files.BackupFS.Prefix(), id), data.RunningEnvironment.GetUid(), data.RunningEnvironment.GetGid(), false)
+	if err != nil {
+		_ = fs.Close()
+		return nil, err
+	}
+	data.backupServer = backupFS
+
 	data.Scheduler.Start()
 
 	return data, nil
@@ -190,6 +205,9 @@ func Delete(id string) (err error) {
 
 	program.Scheduler.Stop()
 	_ = program.GetFileServer().Close()
+	if program.backupServer != nil {
+		_ = program.backupServer.Close()
+	}
 
 	err = program.Destroy()
 	if err != nil {

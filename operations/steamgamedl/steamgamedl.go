@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mholt/archiver/v3"
+	"github.com/mholt/archives"
 	"github.com/pufferpanel/pufferpanel/v3"
 	"github.com/pufferpanel/pufferpanel/v3/config"
 	"github.com/pufferpanel/pufferpanel/v3/files"
@@ -171,7 +171,7 @@ func downloadMetadata(env *pufferpanel.Environment, fs files.FileServer) error {
 		return err
 	}
 
-	err = pufferpanel.HttpExtract(SteamMetadataServerLink+metadataName, fs, ".steam", archiver.DefaultZip)
+	err = pufferpanel.HttpExtract(SteamMetadataServerLink+metadataName, fs, ".steam", archives.Zip{})
 	if err != nil {
 		return err
 	}

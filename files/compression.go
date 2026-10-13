@@ -1,19 +1,36 @@
 package files
 
 import (
-	"archive/tar"
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/klauspost/compress/zip"
-	"github.com/mholt/archiver/v3"
+	"github.com/mholt/archives"
+	"github.com/nwaples/rardecode/v2"
 	"github.com/pufferpanel/pufferpanel/v3/utils"
 )
 
 const PathSeparator = "/"
+
+const (
+	// Archive limits are security defaults independent of host capacity.
+	maxArchiveBytes      int64 = 1 << 30
+	maxExtractedBytes    int64 = 4 << 30
+	maxExtractedFileSize int64 = 1 << 30
+	maxArchiveEntries          = 100000
+	maxArchivePathLength       = 4096
+	maxArchiveDuration         = 10 * time.Minute
+	maxRarDictionarySize int64 = 256 << 20
+)
+
+var ErrArchiveLimit = errors.New("archive exceeds extraction limit")
 
 type ExtractOptions struct {
 	FileServer   FileServer
@@ -21,147 +38,336 @@ type ExtractOptions struct {
 	TargetPath   string
 	Filter       string
 	SkipRoot     bool
-	ForcedWalker Walker
+	ForcedWalker archives.Extractor
 }
 
-func DetermineIfSingleRoot(sourceFile string) (bool, error) {
-	isSingleRoot := true
-
-	var rootName string
-
-	var desired = errors.New("not single root")
-
-	err := archiver.Walk(sourceFile, func(file archiver.File) error {
-		name := getCompressedItemName(file)
-
-		if name == "" || name == PathSeparator {
+func DetermineIfSingleRoot(sourceFS FileServer, sourceFile string) (bool, error) {
+	root := ""
+	entries := 0
+	err := eachArchiveFile(sourceFS, sourceFile, nil, func(_ context.Context, info archives.FileInfo) error {
+		entries++
+		if entries > maxArchiveEntries {
+			return ErrArchiveLimit
+		}
+		name, err := archivePath(info.NameInArchive)
+		if err != nil || name == "" {
+			return err
+		}
+		component := strings.Split(name, PathSeparator)[0]
+		if root == "" {
+			root = component
 			return nil
 		}
-		root := strings.Split(name, PathSeparator)[0]
-		if rootName == "" {
-			rootName = root
-			return nil
-		}
-		if root != rootName {
-			return desired
+		if component != root {
+			return errors.New("not single root")
 		}
 		return nil
 	})
-
-	if err != nil {
-		isSingleRoot = false
-	}
-
-	return isSingleRoot, err
+	return err == nil, err
 }
 
-func Extract(sourceFS FileServer, sourceFile string, targetFS FileServer, targetPath, filter string, skipRoot bool, forcedType Walker) error {
+func Extract(sourceFS FileServer, sourceFile string, targetFS FileServer, targetPath, filter string, skipRoot bool, forcedType archives.Extractor) error {
 	if targetFS == nil {
 		targetFS = sourceFS
 	}
-
-	sourceFile = filepath.Join(sourceFS.Prefix(), filepath.Clean("/"+sourceFile))
-
 	if skipRoot {
 		var err error
-		skipRoot, err = DetermineIfSingleRoot(sourceFile)
+		skipRoot, err = DetermineIfSingleRoot(sourceFS, sourceFile)
 		if err != nil {
 			return err
 		}
 	}
 
-	if forcedType != nil {
-		return forcedType.Walk(sourceFile, walker(targetFS, targetPath, filter, skipRoot))
-	}
-
-	return archiver.Walk(sourceFile, walker(targetFS, targetPath, filter, skipRoot))
-}
-
-func Compress(sourceFS FileServer, targetFS FileServer, targetFile string, files []string) error {
-	if len(files) == 0 {
-		return errors.New("no files to compress")
-	}
-
-	targetFile = filepath.Join(targetFS.Prefix(), filepath.Clean("/"+targetFile))
-	p := sourceFS.Prefix()
-
-	for k, v := range files {
-		v = filepath.Clean("/" + v)
-		files[k] = filepath.Join(p, v)
-	}
-	return archiver.Archive(files, targetFile)
-}
-
-func walker(fs FileServer, targetPath, filter string, skipRoot bool) archiver.WalkFunc {
-	return func(file archiver.File) (err error) {
-		path := getCompressedItemName(file)
-
-		if !utils.CompareWildcard(file.Name(), filter) {
-			return
+	var entries int
+	var extracted int64
+	return eachArchiveFile(sourceFS, sourceFile, forcedType, func(ctx context.Context, info archives.FileInfo) error {
+		entries++
+		if entries > maxArchiveEntries {
+			return ErrArchiveLimit
 		}
-
-		if skipRoot {
-			path = strings.Join(strings.Split(path, PathSeparator)[1:], PathSeparator)
+		entryPath, err := archivePath(info.NameInArchive)
+		if err != nil {
+			return err
 		}
-
-		parent := filepath.Join(targetPath, filepath.Dir(path))
-		path = filepath.Join(targetPath, path)
-
-		if file.Mode().IsDir() {
-			if err = fs.MkdirAll(path, 0755); err != nil {
-				return err
-			}
-		} else if file.Mode().IsRegular() {
-			if err = fs.MkdirAll(parent, 0755); err != nil {
-				return err
-			}
-			var outFile *os.File
-			outFile, err = fs.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, file.Mode()|0600)
-
-			if err != nil {
-				return err
-			}
-			defer utils.Close(outFile)
-			_, err = io.Copy(outFile, file.ReadCloser)
-		} else if file.Mode()&os.ModeSymlink != 0 {
+		if entryPath == "" {
 			return nil
 		}
-
-		return
-	}
-}
-
-// getCompressedItemName Resolves headers in the event the wrapped interface fails
-func getCompressedItemName(file archiver.File) string {
-	//For certain headers, the actual File interface uses the wrong value
-	//Example, ZIP gives the filename, not the full path
-
-	switch v := file.Header.(type) {
-	case zip.FileHeader:
-		return v.Name
-	case *tar.Header:
-		return v.Name
-	default:
-		return file.Name()
-	}
-}
-
-func getLinkTarget(file archiver.File) (string, error) {
-	switch v := file.Header.(type) {
-	case *tar.Header:
-		return v.Linkname, nil
-	case zip.FileHeader:
-		buffer := make([]byte, file.Size())
-		size, err := file.Read(buffer)
-		if err != nil {
-			return "", err
+		if skipRoot {
+			_, entryPath, _ = strings.Cut(entryPath, PathSeparator)
+			if entryPath == "" {
+				return nil
+			}
 		}
-		return string(buffer[:size]), nil
+		if !utils.CompareWildcard(info.Name(), filter) {
+			return nil
+		}
+		target, err := targetArchivePath(targetPath, entryPath)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return targetFS.MkdirAll(target, 0755)
+		}
+		if !info.Mode().IsRegular() || info.LinkTarget != "" {
+			return nil
+		}
+		if info.Size() > maxExtractedFileSize || (info.Size() >= 0 && info.Size() > maxExtractedBytes-extracted) {
+			return ErrArchiveLimit
+		}
+		if err := targetFS.MkdirAll(path.Dir(target), 0755); err != nil {
+			return err
+		}
+		in, err := info.Open()
+		if err != nil {
+			return err
+		}
+		out, err := targetFS.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode()|0600)
+		if err != nil {
+			_ = in.Close()
+			return err
+		}
+		remaining := maxExtractedBytes - extracted
+		limit := min(maxExtractedFileSize, remaining) + 1
+		n, copyErr := io.Copy(out, io.LimitReader(contextReader{Context: ctx, Reader: in}, limit))
+		closeOutErr := out.Close()
+		closeInErr := in.Close()
+		extracted += n
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeOutErr != nil {
+			return closeOutErr
+		}
+		if closeInErr != nil {
+			return closeInErr
+		}
+		if n > maxExtractedFileSize || n > remaining {
+			return ErrArchiveLimit
+		}
+		return ctx.Err()
+	})
+}
+
+type contextReader struct {
+	context.Context
+	io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
+}
+
+func eachArchiveFile(sourceFS FileServer, sourceFile string, forcedType archives.Extractor, handle archives.FileHandler) error {
+	source, err := sourceFS.Open(sourceFile)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() > maxArchiveBytes {
+		return ErrArchiveLimit
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), maxArchiveDuration)
+	defer cancel()
+	reader := io.Reader(source)
+	extractor := forcedType
+	if extractor == nil {
+		format, identified, err := archives.Identify(ctx, sourceFile, reader)
+		if err != nil {
+			return err
+		}
+		var ok bool
+		extractor, ok = format.(archives.Extractor)
+		if !ok {
+			return fmt.Errorf("%s is not an archive", sourceFile)
+		}
+		reader = identified
+	}
+	extractor, err = cappedRarExtractor(extractor)
+	if err != nil {
+		return err
+	}
+	return extractor.Extract(ctx, reader, handle)
+}
+
+func cappedRarExtractor(extractor archives.Extractor) (archives.Extractor, error) {
+	switch extractor := extractor.(type) {
+	case archives.Rar:
+		return newRarExtractor(extractor)
+	case *archives.Rar:
+		if extractor == nil {
+			return nil, errors.New("forced RAR extractor is nil")
+		}
+		return newRarExtractor(*extractor)
 	default:
-		return "", archiver.ErrFormatNotRecognized
+		return extractor, nil
 	}
 }
 
-type Walker interface {
-	Walk(archive string, walkFn archiver.WalkFunc) error
+// rarExtractor supplies rardecode's dictionary cap, which archives.Rar does not expose.
+type rarExtractor struct {
+	password string
+}
+
+func newRarExtractor(format archives.Rar) (rarExtractor, error) {
+	if format.ContinueOnError {
+		return rarExtractor{}, errors.New("forced RAR ContinueOnError is unsupported")
+	}
+	if format.Name != "" {
+		return rarExtractor{}, errors.New("forced RAR Name is unsupported")
+	}
+	if format.FS != nil {
+		return rarExtractor{}, errors.New("forced RAR FS is unsupported")
+	}
+	return rarExtractor{password: format.Password}, nil
+}
+
+func (extractor rarExtractor) Extract(ctx context.Context, source io.Reader, handle archives.FileHandler) error {
+	reader, err := rardecode.NewReader(source, rardecode.MaxDictionarySize(maxRarDictionarySize), rardecode.Password(extractor.password))
+	if err != nil {
+		return err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		info := rarFileInfo{header: header}
+		file := archives.FileInfo{
+			FileInfo:      info,
+			Header:        header,
+			NameInArchive: header.Name,
+			Open: func() (fs.File, error) {
+				return rarArchiveFile{Reader: reader, info: info}, nil
+			},
+		}
+		if err := handle(ctx, file); err != nil {
+			return err
+		}
+	}
+}
+
+type rarFileInfo struct {
+	header *rardecode.FileHeader
+}
+
+func (info rarFileInfo) Name() string       { return info.header.Name }
+func (info rarFileInfo) Size() int64        { return info.header.UnPackedSize }
+func (info rarFileInfo) Mode() os.FileMode  { return info.header.Mode() }
+func (info rarFileInfo) ModTime() time.Time { return info.header.ModificationTime }
+func (info rarFileInfo) IsDir() bool        { return info.header.IsDir }
+func (info rarFileInfo) Sys() any           { return nil }
+
+type rarArchiveFile struct {
+	io.Reader
+	info fs.FileInfo
+}
+
+func (file rarArchiveFile) Close() error               { return nil }
+func (file rarArchiveFile) Stat() (fs.FileInfo, error) { return file.info, nil }
+
+func Compress(sourceFS FileServer, targetFS FileServer, targetFile string, filenames []string) error {
+	if len(filenames) == 0 {
+		return errors.New("no files to compress")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), maxArchiveDuration)
+	defer cancel()
+	format, _, err := archives.Identify(ctx, targetFile, nil)
+	if err != nil {
+		return err
+	}
+	archiver, ok := format.(archives.Archiver)
+	if !ok {
+		return fmt.Errorf("%s is not an archive format", targetFile)
+	}
+	archiveFiles := make([]archives.FileInfo, 0)
+	for _, filename := range filenames {
+		name := strings.TrimPrefix(filepath.Clean("/"+filename), "/")
+		archiveName := filepath.Base(name)
+		if name == "" {
+			archiveName = filepath.Base(filepath.Clean(sourceFS.Prefix()))
+		}
+		files, err := archiveFilesFromFS(sourceFS, name, archiveName)
+		if err != nil {
+			return err
+		}
+		archiveFiles = append(archiveFiles, files...)
+	}
+	out, err := targetFS.OpenFile(targetFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	err = archiver.Archive(ctx, out, archiveFiles)
+	closeErr := out.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func archiveFilesFromFS(server FileServer, filename, archiveName string) ([]archives.FileInfo, error) {
+	info, err := server.Lstat(filename)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, ErrSymlinkNotSupported
+	}
+	file := archives.FileInfo{FileInfo: info, NameInArchive: filepath.ToSlash(archiveName)}
+	if !info.IsDir() {
+		file.Open = func() (fs.File, error) { return server.Open(filename) }
+		return []archives.FileInfo{file}, nil
+	}
+	entries := []archives.FileInfo{file}
+	children, err := server.ReadDir(filename)
+	if err != nil {
+		return nil, err
+	}
+	for _, child := range children {
+		childFiles, err := archiveFilesFromFS(server, filepath.Join(filename, child.Name()), path.Join(archiveName, child.Name()))
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, childFiles...)
+	}
+	return entries, nil
+}
+
+func archivePath(name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	if len(name) > maxArchivePathLength || strings.Contains(name, "\\") || strings.HasPrefix(name, "/") || filepath.IsAbs(name) || (len(name) >= 2 && name[1] == ':') {
+		return "", fmt.Errorf("invalid archive path %q", name)
+	}
+	for _, component := range strings.Split(name, PathSeparator) {
+		if component == ".." {
+			return "", fmt.Errorf("invalid archive path %q", name)
+		}
+	}
+	cleaned := path.Clean(name)
+	if cleaned == "." {
+		return "", nil
+	}
+	return cleaned, nil
+}
+
+func targetArchivePath(targetPath, entryPath string) (string, error) {
+	base, err := prepPath(targetPath)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(base, entryPath), nil
 }

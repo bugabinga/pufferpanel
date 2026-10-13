@@ -1,7 +1,7 @@
 package files
 
 import (
-	"github.com/pufferpanel/pufferpanel/v3/utils"
+	"errors"
 	"io/fs"
 	"os"
 )
@@ -42,20 +42,18 @@ func (m *MergedFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	seen := make(map[string]struct{})
 
 	for _, fss := range m.fileSystems {
-		if dirFs, ok := fss.(fs.ReadDirFS); ok {
-			secondary, err := dirFs.ReadDir(name)
-			if err != nil && !os.IsNotExist(err) {
-				return nil, err
-			}
+		secondary, err := fs.ReadDir(fss, name)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
 
-			for _, entry := range secondary {
-				name := entry.Name()
-				if _, exists := seen[name]; exists {
-					continue
-				}
-				seen[name] = struct{}{}
-				results = append(results, entry)
+		for _, entry := range secondary {
+			name := entry.Name()
+			if _, exists := seen[name]; exists {
+				continue
 			}
+			seen[name] = struct{}{}
+			results = append(results, entry)
 		}
 	}
 
@@ -64,38 +62,11 @@ func (m *MergedFS) ReadDir(name string) ([]fs.DirEntry, error) {
 
 func (m *MergedFS) ReadFile(name string) (data []byte, err error) {
 	for _, fss := range m.fileSystems {
-		if readFs, ok := fss.(fs.ReadFileFS); ok {
-			data, err = readFs.ReadFile(name)
-			if err == nil || !os.IsNotExist(err) {
-				return
-			}
-		} else {
-			//primary FS does not expose the read file endpoint. We must read it directly
-			data, err = read(fss, name)
-			if err == nil || !os.IsNotExist(err) {
-				return
-			}
+		data, err = fs.ReadFile(fss, name)
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return
 		}
 	}
 
 	return nil, os.ErrNotExist
-}
-
-func read(fss fs.FS, name string) ([]byte, error) {
-	f, err := fss.Open(name)
-	defer utils.Close(f)
-
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-
-	//to get the buffer... we have to make it the right size
-	var fi fs.FileInfo
-	fi, err = f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	data := make([]byte, fi.Size())
-	_, err = f.Read(data)
-	return data, err
 }

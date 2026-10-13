@@ -3,7 +3,7 @@ package models
 import (
 	"github.com/pufferpanel/pufferpanel/v3"
 	"golang.org/x/crypto/bcrypt"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
 	"time"
 )

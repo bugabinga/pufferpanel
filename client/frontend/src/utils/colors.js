@@ -44,7 +44,7 @@ export function rgb2hsl(rgb) {
   const max = Math.max(rgb[0], rgb[1], rgb[2])
   const min = Math.min(rgb[0], rgb[1], rgb[2])
   let h = (max + min) / 2
-  let s = h
+  let s
   let l = h
 
   if (max == min) {

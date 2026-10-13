@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid/v5"
-	"github.com/mholt/archiver/v3"
 	"github.com/pufferpanel/pufferpanel/v3"
 	"github.com/pufferpanel/pufferpanel/v3/conditions"
 	"github.com/pufferpanel/pufferpanel/v3/config"
@@ -36,12 +35,14 @@ type Server struct {
 	waitForConsole     sync.Locker
 	fileServer         files.FileServer
 	backupServer       files.FileServer
+	backupMu           sync.Mutex
 	backingUp          bool
 	restoring          bool
 	keepAlive          *time.Ticker
 	keepAliveChan      chan bool
 	isUnsafeRunning    *sync.Mutex
 	skipAutoRestart    bool
+	skipAutoRestartMu  sync.Mutex
 }
 
 var queue *list.List
@@ -51,11 +52,6 @@ var running = false
 
 var ErrServerTypeRequired = errors.New("server type is required")
 var ErrEnvironmentTypeRequired = errors.New("environment type is required")
-
-func init() {
-	archiver.DefaultZip.OverwriteExisting = true
-	archiver.DefaultTarGz.OverwriteExisting = true
-}
 
 func InitService() {
 	queue = list.New()
@@ -584,9 +580,10 @@ func (p *Server) afterExit(exitCode int) {
 
 	p.isUnsafeRunning.Unlock()
 
-	if p.skipAutoRestart {
-		p.skipAutoRestart = false
-	} else if graceful && p.Execution.AutoRestartFromGraceful {
+	if p.consumeSkipAutoRestart() {
+		return
+	}
+	if graceful && p.Execution.AutoRestartFromGraceful {
 		StartViaService(p)
 	} else if !graceful && p.Execution.AutoRestartFromCrash && p.CrashCounter < config.CrashLimit.Value() {
 		p.CrashCounter++
@@ -659,43 +656,28 @@ func (p *Server) Extract(source, destination string) error {
 }
 
 func (p *Server) StartBackup() (string, error) {
-	if err := p.IsIdle(); err != nil {
+	if err := p.claimBackupRestore(true); err != nil {
 		return "", err
 	}
 
-	p.backingUp = true
-	c := make(chan bool)
-	go func(d chan bool) {
-		r := <-d
-		p.backingUp = false
-		if r {
-			p.RunningEnvironment.DisplayToConsole(true, "Backup complete")
-		} else {
-			p.RunningEnvironment.DisplayToConsole(true, "Backup failed")
-		}
-	}(c)
-
+	backupID, err := uuid.NewV4()
+	if err != nil {
+		p.finishBackupRestore(true, false)
+		return "", err
+	}
+	backupFileName := backupID.String() + ".tar.gz"
 	p.RunningEnvironment.DisplayToConsole(true, "Backing up server")
 
-	backupId, err := uuid.NewV4()
-	if err != nil {
-		c <- false
-		return "", err
-	}
-	backupFileName := backupId.String() + ".tar.gz"
-
-	go func(file string, d chan bool) {
-		defer func() {
-			d <- true
-		}()
-		sourceFiles := []string{filepath.Join(p.GetFileServer().Prefix())}
-
-		err = files.Compress(p.GetFileServer(), p.backupServer, file, sourceFiles)
-		if err != nil {
+	go func(file string) {
+		success := false
+		defer func() { p.finishBackupRestore(true, success) }()
+		if err := files.Compress(p.GetFileServer(), p.backupServer, file, []string{"."}); err != nil {
 			p.Log(logging.Error, "Error creating backup file: %s", err)
 			p.RunningEnvironment.DisplayToConsole(true, "Failed to create backup file")
+			return
 		}
-	}(backupFileName, c)
+		success = true
+	}(backupFileName)
 
 	return backupFileName, nil
 }
@@ -712,77 +694,125 @@ func (p *Server) DeleteBackup(fileName string) error {
 }
 
 func (p *Server) StartRestore(fileName string) error {
-	if err := p.IsIdle(); err != nil {
+	info, err := p.backupServer.Stat(fileName)
+	if err != nil {
 		return err
 	}
-
-	p.restoring = true
-	c := make(chan bool)
-	go func(d chan bool) {
-		r := <-d
-		p.restoring = false
-		if r {
-			p.RunningEnvironment.DisplayToConsole(true, "Restore complete")
-		} else {
-			p.RunningEnvironment.DisplayToConsole(true, "Restore failed")
-		}
-	}(c)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("backup %q is not a regular file", fileName)
+	}
+	if err := p.claimBackupRestore(false); err != nil {
+		return err
+	}
 
 	p.RunningEnvironment.DisplayToConsole(true, "Restoring server")
+	go func(source string) {
+		success := false
+		defer func() { p.finishBackupRestore(false, success) }()
+		if err := p.restore(source); err != nil {
+			p.Log(logging.Error, "Error restoring files: %s", err)
+			p.RunningEnvironment.DisplayToConsole(true, "Failed to restore files: %s", err)
+			return
+		}
+		success = true
+	}(fileName)
+	return nil
+}
 
-	_, err := p.backupServer.Stat(fileName)
-	if err != nil && !os.IsNotExist(err) {
-		c <- false
+func (p *Server) restore(source string) error {
+	stagePath, err := os.MkdirTemp("", "pufferpanel-restore-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stagePath)
+	stage, err := files.NewFileServer(stagePath, -1, -1, false)
+	if err != nil {
+		return err
+	}
+	defer stage.Close()
+	if err := files.Extract(p.backupServer, source, stage, "/", "*", true, nil); err != nil {
 		return err
 	}
 
-	go func(source string, d chan bool) {
-		defer func() {
-			d <- true
-		}()
-
-		//TODO: FIX THIS TO USE CORRECT PATH
-		//WE NEED TO WRITE TO BACKUP FS
-
-		//Check if any files exist, as remove all errors if its empty
-		existingFiles, err := p.GetFileServer().Glob("*")
+	live := p.GetFileServer()
+	entries, err := live.ReadDir("")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		info, err := live.Lstat(entry.Name())
 		if err != nil {
-			p.Log(logging.Error, "Error globbing files: %s", err)
-			return
+			return err
 		}
-
-		for _, existingFile := range existingFiles {
-			file, err := p.GetFileServer().Stat(existingFile)
-			if err != nil {
-				p.Log(logging.Error, "Error deleting files: %s", err)
-				return
-			}
-
-			if file.IsDir() {
-				err = p.GetFileServer().RemoveAll(existingFile)
-			} else {
-				err = p.GetFileServer().Remove(existingFile)
-			}
-
-			if err != nil {
-				p.Log(logging.Error, "Error deleting files: %s", err)
-				return
-			}
+		if info.IsDir() {
+			err = live.RemoveAll(entry.Name())
+		} else {
+			err = live.Remove(entry.Name())
 		}
-
-		err = files.Extract(p.backupServer, source, p.GetFileServer(), "/", "*", true, nil)
 		if err != nil {
-			p.Log(logging.Error, "Error restoring files: %s", err)
-			p.RunningEnvironment.DisplayToConsole(true, "Failed to restore files: %s", err)
+			return err
 		}
-	}(fileName, c)
+	}
+	return copyRestoreTree(stage, live, "")
+}
 
+func copyRestoreTree(source, target files.FileServer, directory string) error {
+	entries, err := source.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := filepath.Join(directory, entry.Name())
+		info, err := source.Lstat(name)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := target.MkdirAll(name, info.Mode().Perm()); err != nil {
+				return err
+			}
+			if err := copyRestoreTree(source, target, name); err != nil {
+				return err
+			}
+			if err := target.Chmod(name, info.Mode().Perm()); err != nil {
+				return err
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("staged restore entry %q is not regular", name)
+		}
+		in, err := source.Open(name)
+		if err != nil {
+			return err
+		}
+		out, err := target.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+		if err != nil {
+			_ = in.Close()
+			return err
+		}
+		_, err = io.Copy(out, in)
+		closeOutErr := out.Close()
+		closeInErr := in.Close()
+		if err != nil {
+			return err
+		}
+		if closeOutErr != nil {
+			return closeOutErr
+		}
+		if closeInErr != nil {
+			return closeInErr
+		}
+		if err := target.Chmod(name, info.Mode().Perm()); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (p *Server) GetBackup(fileName string) (*FileData, error) {
 	info, err := p.backupServer.Stat(fileName)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil {
 		return nil, err
 	}
 	return &FileData{ContentLength: info.Size(), Name: info.Name()}, nil
@@ -796,6 +826,7 @@ func (p *Server) GetBackupFile(fileName string) (*FileData, error) {
 
 	info, err := file.Stat()
 	if err != nil {
+		_ = file.Close()
 		return nil, err
 	}
 
@@ -848,32 +879,93 @@ func (p *Server) SetFileServer(fs files.FileServer) {
 }
 
 func (p *Server) IsBackingUp() bool {
+	p.backupMu.Lock()
+	defer p.backupMu.Unlock()
 	return p.backingUp
 }
 
 func (p *Server) IsRestoring() bool {
+	p.backupMu.Lock()
+	defer p.backupMu.Unlock()
 	return p.restoring
 }
 
 func (p *Server) IsIdle() error {
-	if p.IsRestoring() || p.IsBackingUp() {
+	p.backupMu.Lock()
+	busy := p.restoring || p.backingUp
+	p.backupMu.Unlock()
+	if busy {
 		return pufferpanel.ErrBackupInProgress
 	}
 
-	r, _ := p.GetEnvironment().IsRunning()
-	if r {
+	r, err := p.GetEnvironment().IsRunning()
+	if err != nil {
+		return err
+	}
+	if r || p.GetEnvironment().IsInstalling() {
 		return pufferpanel.ErrServerRunning
 	}
-
-	if p.GetEnvironment().IsInstalling() {
-		return pufferpanel.ErrServerRunning
-	}
-
 	return nil
 }
 
+func (p *Server) claimBackupRestore(backup bool) error {
+	p.backupMu.Lock()
+	defer p.backupMu.Unlock()
+	if p.backingUp || p.restoring {
+		return pufferpanel.ErrBackupInProgress
+	}
+	running, err := p.GetEnvironment().IsRunning()
+	if err != nil {
+		return err
+	}
+	if running || p.GetEnvironment().IsInstalling() || !p.isUnsafeRunning.TryLock() {
+		return pufferpanel.ErrServerRunning
+	}
+	if backup {
+		p.backingUp = true
+	} else {
+		p.restoring = true
+	}
+	return nil
+}
+
+func (p *Server) finishBackupRestore(backup, success bool) {
+	defer func() {
+		p.backupMu.Lock()
+		if backup {
+			p.backingUp = false
+		} else {
+			p.restoring = false
+		}
+		p.isUnsafeRunning.Unlock()
+		p.backupMu.Unlock()
+	}()
+	if success {
+		if backup {
+			p.RunningEnvironment.DisplayToConsole(true, "Backup complete")
+		} else {
+			p.RunningEnvironment.DisplayToConsole(true, "Restore complete")
+		}
+	} else if backup {
+		p.RunningEnvironment.DisplayToConsole(true, "Backup failed")
+	} else {
+		p.RunningEnvironment.DisplayToConsole(true, "Restore failed")
+	}
+}
+
 func (p *Server) SkipAutoRestart() {
+	p.skipAutoRestartMu.Lock()
 	p.skipAutoRestart = true
+	p.skipAutoRestartMu.Unlock()
+}
+
+func (p *Server) consumeSkipAutoRestart() bool {
+	p.skipAutoRestartMu.Lock()
+	defer p.skipAutoRestartMu.Unlock()
+
+	skipAutoRestart := p.skipAutoRestart
+	p.skipAutoRestart = false
+	return skipAutoRestart
 }
 
 func (p *Server) GetRootDirectory() string {

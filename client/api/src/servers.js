@@ -186,21 +186,18 @@ export class ServerApi {
         return 'folder'
       }
     } catch (e) {
-      if (e.response.status === 404) return false
+      if (((e || {}).response || {}).status === 404) return false
       this._api._handleError(e)
     }
   }
 
   async uploadFile(id, path, content, onUploadProgress) {
     if (path.indexOf('/') === 0) path = path.substring(1)
-    let blob = null
-    if (content instanceof Blob || content instanceof File) {
-      blob = content
-    } else if (typeof content === 'string') {
-      blob = new Blob([content])
-    } else {
-      blob = new Blob([JSON.stringify(content)])
-    }
+    const blob = content instanceof Blob || content instanceof File
+      ? content
+      : typeof content === 'string'
+        ? new Blob([content])
+        : new Blob([JSON.stringify(content)])
 
     const data = new FormData()
     data.append('file', blob)
@@ -228,7 +225,7 @@ export class ServerApi {
   async archiveFile(id, destination, files) {
     if (destination.startsWith('/')) destination = destination.substring(1)
     if (!Array.isArray(files)) files = [files]
-    files.map(file => file.startsWith('/') ? file.substring(1) : file)
+    files = files.map(file => file.startsWith('/') ? file.substring(1) : file)
     await this._api.post(`/api/servers/${id}/archive/${destination}`, files)
     return true
   }
@@ -369,7 +366,6 @@ class Server {
     if (this._expectClose) {
       this._cleanup()
     } else {
-      // eslint-disable-next-line no-console
       console.warn('socket closed', e)
       if (this._connectionAttemptsFailed === this._connectionAttemptsMax) {
         // emit an error once after a certain number of failed retries
@@ -383,7 +379,6 @@ class Server {
   }
 
   _onError(e) {
-    // eslint-disable-next-line no-console
     console.error('SOCKET ERROR', e)
 
     this.readyState = this._socket.readyState

@@ -134,7 +134,7 @@ function tabChanged(newTab) {
           <variables v-model="template" />
         </tab>
         <tab id="install" :title="t('templates.Install')" icon="install" hotkey="t i">
-          <install v-model="template" />
+          <Install v-model="template" />
         </tab>
         <tab id="run" :title="t('templates.RunConfig')" icon="start" hotkey="t r">
           <run-config v-model="template" @valid="valid.run = $event" />

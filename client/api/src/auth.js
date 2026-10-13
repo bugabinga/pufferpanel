@@ -88,8 +88,8 @@ export class AuthApi {
         }
       })
 
-      attestation = await navigator.credentials.get(assertion)
-    } catch(_) {
+      attestation = await globalThis.navigator.credentials.get(assertion)
+    } catch {
       return false
     }
 

@@ -93,7 +93,7 @@ onMounted(async () => {
           <variables v-model="edit" />
         </tab>
         <tab id="install" :title="t('templates.Install')" icon="install" hotkey="t i">
-          <install v-model="edit" />
+          <Install v-model="edit" />
         </tab>
         <tab id="run" :title="t('templates.RunConfig')" icon="start" hotkey="t r">
           <run-config v-model="edit" />

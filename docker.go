@@ -5,20 +5,32 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/moby/moby/client"
 	"github.com/pufferpanel/pufferpanel/v3/logging"
 	"github.com/pufferpanel/pufferpanel/v3/utils"
 )
 
-var dockerClient *client.Client
+var (
+	dockerClient      *client.Client
+	dockerClientMutex sync.Mutex
+)
 
 func GetDockerClient() (*client.Client, error) {
-	var err error = nil
-	if dockerClient == nil {
-		dockerClient, err = client.New(client.FromEnv)
+	dockerClientMutex.Lock()
+	defer dockerClientMutex.Unlock()
+
+	if dockerClient != nil {
+		return dockerClient, nil
 	}
-	return dockerClient, err
+
+	client, err := client.New(client.FromEnv)
+	if err != nil {
+		return nil, err
+	}
+	dockerClient = client
+	return dockerClient, nil
 }
 
 func DoesContainerExist(id string, ctx context.Context) (bool, error) {

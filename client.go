@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 
 	"github.com/cavaliergopher/grab/v3"
-	"github.com/mholt/archiver/v3"
+	"github.com/mholt/archives"
 	"github.com/pufferpanel/pufferpanel/v3/files"
 )
 
@@ -19,7 +19,7 @@ func HttpGet(requestUrl string) (*http.Response, error) {
 	return httpClient.Get(requestUrl)
 }
 
-func HttpExtract(requestUrl string, fs files.FileServer, directory string, archiveType archiver.Walker) error {
+func HttpExtract(requestUrl string, fs files.FileServer, directory string, archiveType archives.Extractor) error {
 	//we will write this to temp so we can not keep so much in memory
 	response, err := grab.Get(fs.Prefix(), requestUrl)
 	if err != nil {

@@ -1,7 +1,10 @@
 package files
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -47,8 +50,9 @@ type FileServer interface {
 }
 
 type fileServer struct {
-	dir  string
-	root *os.File
+	dir      string
+	root     *os.File
+	confined *os.Root
 
 	symlinkSupport bool
 	uid            int
@@ -58,8 +62,13 @@ type fileServer struct {
 func NewFileServer(prefix string, uid, gid int, symlinkSupport bool) (FileServer, error) {
 	f := &fileServer{dir: prefix, uid: uid, gid: gid}
 	var err error
-	f.root, err = f.resolveRootFd()
+	f.confined, err = os.OpenRoot(prefix)
 	if err != nil {
+		return nil, err
+	}
+	f.root, err = f.confined.Open(".")
+	if err != nil {
+		_ = f.confined.Close()
 		return nil, err
 	}
 	f.symlinkSupport = symlinkSupport
@@ -123,14 +132,18 @@ func (sfp *fileServer) Glob(pattern string) ([]string, error) {
 }
 
 func (sfp *fileServer) Close() error {
-	return sfp.root.Close()
+	err := sfp.root.Close()
+	confinedErr := sfp.confined.Close()
+	if err != nil {
+		return err
+	}
+	return confinedErr
 }
 
 func (sfp *fileServer) OpenFile(path string, flags int, mode os.FileMode) (*os.File, error) {
-	path = prepPath(path)
-
-	if path == "" {
-		return os.Open(sfp.dir)
+	path, err := prepPath(path)
+	if err != nil {
+		return nil, err
 	}
 
 	//if this is not a create request, nuke mode
@@ -139,8 +152,9 @@ func (sfp *fileServer) OpenFile(path string, flags int, mode os.FileMode) (*os.F
 	}
 
 	var fd int
-	var err error
-	if utils.UseOpenat2() {
+	if path == "" {
+		fd, err = unix.Openat(getFd(sfp.root), ".", flags, sys.SyscallMode(mode))
+	} else if utils.UseOpenat2() {
 		//at this point, we are going to work on openat2
 		fd, err = unix.Openat2(getFd(sfp.root), path, &unix.OpenHow{
 			Flags:   uint64(flags),
@@ -177,7 +191,11 @@ func (sfp *fileServer) OpenFile(path string, flags int, mode os.FileMode) (*os.F
 		}
 	}
 
-	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if err != nil {
+		return nil, err
+	}
+
+	file := os.NewFile(uintptr(fd), path)
 	//if flags&os.O_CREATE == 1 && sfp.uid != -1 {
 	//	err = file.Chown(sfp.uid, sfp.gid)
 	//}
@@ -186,7 +204,11 @@ func (sfp *fileServer) OpenFile(path string, flags int, mode os.FileMode) (*os.F
 
 func (sfp *fileServer) MkdirAll(path string, mode os.FileMode) error {
 	//this is going to be recursive...
-	path = prepPath(path)
+	var err error
+	path, err = prepPath(path)
+	if err != nil {
+		return err
+	}
 
 	//now for each one, we just need to make each path, and hope this works
 	//in theory, the mkdir will be safe enough
@@ -196,7 +218,6 @@ func (sfp *fileServer) MkdirAll(path string, mode os.FileMode) error {
 		return nil
 	}
 
-	var err error
 	for i := range parts {
 		err = sfp.Mkdir(filepath.Join(parts[:i+1]...), mode)
 		if err != nil && !errors.Is(err, os.ErrExist) {
@@ -208,8 +229,14 @@ func (sfp *fileServer) MkdirAll(path string, mode os.FileMode) error {
 }
 
 func (sfp *fileServer) Rename(source, target string) error {
-	source = prepPath(source)
-	target = prepPath(target)
+	source, err := prepPath(source)
+	if err != nil {
+		return err
+	}
+	target, err = prepPath(target)
+	if err != nil {
+		return err
+	}
 
 	sourceParent := filepath.Dir(source)
 	targetParent := filepath.Dir(target)
@@ -234,12 +261,15 @@ func (sfp *fileServer) Rename(source, target string) error {
 }
 
 func (sfp *fileServer) Mkdir(path string, mode os.FileMode) error {
-	path = prepPath(path)
+	path, err := prepPath(path)
+	if err != nil {
+		return err
+	}
 	parent := filepath.Dir(path)
 	f := filepath.Base(path)
 
 	if parent == "" || parent == "." || parent == "/" {
-		err := unix.Mkdirat(getFd(sfp.root), f, sys.SyscallMode(mode))
+		err = unix.Mkdirat(getFd(sfp.root), f, sys.SyscallMode(mode))
 		if err != nil {
 			return err
 		}
@@ -266,9 +296,15 @@ func (sfp *fileServer) Mkdir(path string, mode os.FileMode) error {
 }
 
 func (sfp *fileServer) Remove(path string) error {
-	path = prepPath(path)
+	path, err := prepPath(path)
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return ErrInvalidAccess
+	}
 	parent := filepath.Dir(path)
-	f := filepath.Base(path)
+	name := filepath.Base(path)
 
 	folder, err := sfp.OpenFile(parent, os.O_RDONLY, 0644)
 	if err != nil {
@@ -276,21 +312,15 @@ func (sfp *fileServer) Remove(path string) error {
 	}
 	defer utils.Close(folder)
 
-	expected, err := sfp.OpenFile(path, os.O_RDONLY, 0644)
+	info, err := sfp.Lstat(path)
 	if err != nil {
 		return err
 	}
-	stat, err := expected.Stat()
-	utils.Close(expected)
-	if err != nil {
-		return err
+	flags := 0
+	if info.IsDir() {
+		flags = unix.AT_REMOVEDIR
 	}
-
-	if stat.IsDir() {
-		return unix.Unlinkat(getFd(folder), f, unix.AT_REMOVEDIR)
-	} else {
-		return unix.Unlinkat(getFd(folder), f, 0)
-	}
+	return unix.Unlinkat(getFd(folder), name, flags)
 }
 
 func (sfp *fileServer) RemoveAll(path string) (err error) {
@@ -300,7 +330,10 @@ func (sfp *fileServer) RemoveAll(path string) (err error) {
 		}
 	}()
 
-	path = prepPath(path)
+	path, err = prepPath(path)
+	if err != nil {
+		return err
+	}
 
 	var folder *os.File
 	folder, err = sfp.OpenFile(path, os.O_RDONLY, 0644)
@@ -335,13 +368,28 @@ func (sfp *fileServer) RemoveAll(path string) (err error) {
 }
 
 func (sfp *fileServer) Lstat(path string) (fs.FileInfo, error) {
-	//TODO: Revalidate this does not actually allow getting data about a symlink that isn't in the right path
-	return os.Lstat(filepath.Join(sfp.dir, prepPath(path)))
+	path, err := prepPath(path)
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		path = "."
+	}
+	return sfp.confined.Lstat(path)
 }
 
-func (sfp *fileServer) Chmod(path string, mode os.FileMode) error {
-	//TODO: Revalidate this does not actually allow changing a file that isn't in our path
-	return os.Chmod(filepath.Join(sfp.dir, prepPath(path)), mode)
+func (fp *fileServer) Chmod(path string, mode os.FileMode) error {
+	file, err := fp.OpenFile(path, unix.O_PATH, 0)
+	if err != nil {
+		return err
+	}
+	defer utils.Close(file)
+
+	err = unix.Fchmodat(getFd(file), "", sys.SyscallMode(mode), unix.AT_EMPTY_PATH)
+	if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EOPNOTSUPP) {
+		return err
+	}
+	return unix.Fchmodat(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", getFd(file)), sys.SyscallMode(mode), 0)
 }
 
 func (sfp *fileServer) Copy(sourceFileServer FileServer, sourcePath, targetPath string) error {
@@ -385,8 +433,29 @@ func (sfp *fileServer) WriteFile(name string, content []byte, mode os.FileMode) 
 }
 
 func (sfp *fileServer) CreateTemp(dir, pattern string) (*os.File, error) {
-	//TODO: Enforce security
-	return os.CreateTemp(dir, pattern)
+	dir, err := prepPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	if strings.ContainsRune(pattern, filepath.Separator) {
+		return nil, fmt.Errorf("%w: pattern contains path separator", fs.ErrInvalid)
+	}
+
+	prefix, suffix := pattern, ""
+	if i := strings.LastIndex(pattern, "*"); i >= 0 {
+		prefix, suffix = pattern[:i], pattern[i+1:]
+	}
+	for range 10000 {
+		random := make([]byte, 8)
+		if _, err := rand.Read(random); err != nil {
+			return nil, err
+		}
+		file, err := sfp.OpenFile(filepath.Join(dir, prefix+hex.EncodeToString(random)+suffix), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+		if !errors.Is(err, os.ErrExist) {
+			return file, err
+		}
+	}
+	return nil, os.ErrExist
 }
 
 func (sfp *fileServer) ReadFile(name string) ([]byte, error) {
@@ -403,39 +472,13 @@ func getFd(f *os.File) int {
 	return int(f.Fd())
 }
 
-func prepPath(path string) string {
-	path = filepath.Clean(path)
-	path = strings.TrimPrefix(path, "/")
-
-	if path == "." || path == "/" {
-		return ""
+func prepPath(path string) (string, error) {
+	path = strings.TrimPrefix(filepath.Clean(path), "/")
+	if path == "." {
+		return "", nil
 	}
-
-	return path
-}
-
-// shorten maps name, which should start with f.dir, back to the suffix after f.dir.
-func (sfp *fileServer) shorten(name string) (rel string, ok bool) {
-	if name == sfp.dir {
-		return ".", true
+	if path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+		return "", ErrInvalidAccess
 	}
-	if len(name) >= len(sfp.dir)+2 && name[len(sfp.dir)] == '/' && name[:len(sfp.dir)] == sfp.dir {
-		return name[len(sfp.dir)+1:], true
-	}
-	return "", false
-}
-
-// fixErr shortens any reported names in PathErrors by stripping f.dir.
-func (sfp *fileServer) fixErr(err error) error {
-	var e *fs.PathError
-	if errors.As(err, &e) {
-		if short, ok := sfp.shorten(e.Path); ok {
-			e.Path = short
-		}
-	}
-	return err
-}
-
-func (sfp *fileServer) resolveRootFd() (*os.File, error) {
-	return os.Open(sfp.dir)
+	return path, nil
 }

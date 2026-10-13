@@ -1,21 +1,18 @@
-const path = require('path')
-const { defineConfig } = require('vite')
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { defineConfig } from 'vite'
 
-module.exports = defineConfig({
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+export default defineConfig({
   build: {
     lib: {
       entry: path.resolve(__dirname, 'src/index.js'),
       name: 'PufferPanel',
-      fileName: (format) => {
-        if (format === 'es') {
-          return 'pufferpanel.mjs'
-        } else {
-          return 'pufferpanel.cjs'
-        }
-      }
+      fileName: (format) => format === 'es' ? 'pufferpanel.mjs' : 'pufferpanel.cjs'
     },
     minify: false,
-    rollupOptions: {
+    rolldownOptions: {
       external: ['axios'],
       output: {
         globals: {

@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Download assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           name: tool-binaries
           run-id: '${{ github.event.client_payload.run_id }}'
@@ -74,7 +74,7 @@ jobs:
           chmod +x pufferpanel_* templatetester_*
           rm -rf template-tester-rundir
           mkdir -p template-tester-rundir
-          ./templatetester_${{ matrix.arch }} --skip=* --require=${{ matrix.template }} --binary=$(pwd)/pufferpanel_${{ matrix.arch }} --workDir=$(pwd)/template-tester-rundir
+          ./templatetester_${{ matrix.arch }} --skip=* --require=${{ matrix.template }} --binary="$(pwd)/pufferpanel_${{ matrix.arch }}" --workDir="$(pwd)/template-tester-rundir"
 
       - name: Cleanup
         if: ${{ ! endsWith(matrix.template, '-docker') }}

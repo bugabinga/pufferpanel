@@ -127,7 +127,7 @@ func (c CurseForge) Run(args pufferpanel.RunOperatorArgs) pufferpanel.OperationR
 	logging.Debug.Printf("Extracting modpack from %s\n", serverZipPath)
 	env.DisplayToConsole(true, "Extracting modpack from %s", serverZipPath)
 
-	singleRoot, _ := files.DetermineIfSingleRoot(serverZipPath)
+	singleRoot, _ := files.DetermineIfSingleRoot(files.CacheFS, serverZipPath)
 
 	fs := args.Server.GetFileServer()
 

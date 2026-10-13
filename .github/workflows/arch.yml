@@ -24,13 +24,13 @@ jobs:
           pacman -Sy --needed --noconfirm sudo fakeroot debugedit git pacman-contrib openssh
           useradd builduser -m
           mkdir /pkgbuild
-          chown -R $(id -u builduser) /pkgbuild
+          chown -R "$(id -u builduser)" /pkgbuild
           passwd -d builduser
 
           mkdir /home/builduser/.ssh
           echo "${{ secrets.ARCH_SSH_KEY }}" > /home/builduser/.ssh/id_ed25519
           chmod 600 /home/builduser/.ssh/id_ed25519
-          chown -R $(id -u builduser):$(id -g builduser) /home/builduser/.ssh
+          chown -R "$(id -u builduser):$(id -g builduser)" /home/builduser/.ssh
 
           cd /pkgbuild
           su builduser sh -c "

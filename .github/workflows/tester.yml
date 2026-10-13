@@ -9,8 +9,7 @@ on:
         type: boolean
 
 env:
-  SWAG_VERSION: "1.16.4"
-  NODE_VERSION: "22"
+  NODE_VERSION: "26.10.0"
 
 jobs:
   build-tool:
@@ -22,38 +21,20 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'yarn'
           cache-dependency-path: 'client/yarn.lock'
 
-      - name: Restore Go BIN
-        id: restore-go-bin
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/bin
-          key: ${{ runner.os }}-swag-${{ env.SWAG_VERSION }}
-          restore-keys: |
-            ${{ runner.os }}-swag-
-
-      - name: Download Go Binaries
-        if: steps.restore-go-bin.outputs.cache-hit != 'true'
-        run: |
-          wget https://github.com/swaggo/swag/releases/download/v${{ env.SWAG_VERSION }}/swag_${{ env.SWAG_VERSION }}_Linux_x86_64.tar.gz
-          mkdir -p ~/go/bin
-          tar -zxf swag*.tar.gz -C ~/go/bin
-          rm -rf swag*.tar.gz
-          
       - name: Set CurseForge Key
         env:
           secret_set: ${{ secrets.CURSEFORGE_CODE }}
@@ -67,12 +48,14 @@ jobs:
 
       - name: Generate Swagger Docs
         run: |
-          ~/go/bin/swag init --pd --md . -o web/swagger -g web/loader.go
+          go tool swag init --pd --md . -o web/swagger -g web/loader.go
 
-      - name: yarn install, build
+      - name: yarn install, test, lint, build
         run: |
-          npm install -g yarn
-          yarn install
+          npm install --global --allow-scripts=yarn yarn@1.22.22
+          yarn install --frozen-lockfile
+          yarn test
+          yarn lint
           env VITE_CHECK_ENV="true" yarn build
         env:
           CI: true
@@ -110,7 +93,7 @@ jobs:
           CGO_ENABLED: 1
 
       - name: Generate job artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: tool-binaries
           path: build-artifacts/
@@ -123,7 +106,7 @@ jobs:
       - name: Trigger tests
         id: trigger
         if: ${{ ! inputs.no-run-tool }}
-        uses: peter-evans/repository-dispatch@v2
+        uses: peter-evans/repository-dispatch@v4.0.1
         with:
           event-type: template-tester
           client-payload: '{ "templates": [ ${{ env.TEMPLATES }} ], "run_id": "${{ github.run_id }}" }'

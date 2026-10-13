@@ -8,9 +8,9 @@
     runnerGroup: 'template-tester'
     runnerLabel: 'template-tester'
 
-    ghrunnerVersion: '2.328.0'
-    ghrunnerHash_x64: '01066fad3a2893e63e6ca880ae3a1fad5bf9329d60e77ee15f2b97c148c3cd4e'
-    ghrunnerHash_arm64: 'b801b9809c4d9301932bccadf57ca13533073b2aa9fa9b8e625a8db905b5d8eb'
+    ghrunnerVersion: '2.338.0'
+    ghrunnerHash_x64: 'af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32'
+    ghrunnerHash_arm64: '628b4a7258487b80c1d3c221095a7ded349f5ae0175fd3dfab708d07428f041b'
 
   tasks:
     - name: Set defaults

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/pufferpanel/pufferpanel/v3"
@@ -45,6 +46,34 @@ func TestProgram_valid(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSkipAutoRestart(t *testing.T) {
+	p := CreateProgram()
+
+	p.SkipAutoRestart()
+	assert.True(t, p.consumeSkipAutoRestart())
+	assert.False(t, p.consumeSkipAutoRestart())
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 1_000 {
+			p.SkipAutoRestart()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 1_000 {
+			p.consumeSkipAutoRestart()
+		}
+	}()
+	close(start)
+	wg.Wait()
 }
 
 func TestLoadFromFolder(t *testing.T) {
@@ -401,7 +430,13 @@ func TestLoadFromFolder(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	config.ServersFolder.Set(tmpDir, false)
+	backupDir := t.TempDir()
+	config.BackupsFolder.Set(backupDir, false)
 	files.ServerFS, err = files.NewFileServer(config.ServersFolder.Value(), 0, 0, false)
+	if !assert.NoError(t, err) {
+		return
+	}
+	files.BackupFS, err = files.NewFileServer(backupDir, 0, 0, false)
 	if !assert.NoError(t, err) {
 		return
 	}

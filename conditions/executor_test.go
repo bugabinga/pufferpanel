@@ -1,7 +1,7 @@
 package conditions
 
 import (
-	"github.com/google/cel-go/cel"
+	"cel.dev/cel-go/cel"
 	"runtime"
 	"testing"
 )

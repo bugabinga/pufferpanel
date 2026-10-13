@@ -175,6 +175,11 @@ func RegisterRoutes(e *gin.Engine) {
 			}
 			theme.StaticFS("", http.FS(f))
 		}
+		sw := e.Group("/")
+		{
+			sw.Use(setContentType("application/javascript"))
+			sw.StaticFileFS("sw.js", "sw.js", http.FS(clientFiles))
+		}
 		e.StaticFileFS("/favicon.png", "favicon.png", http.FS(clientFiles))
 		e.StaticFileFS("/favicon.ico", "favicon.ico", http.FS(clientFiles))
 		e.NoRoute(handle404)
@@ -182,6 +187,11 @@ func RegisterRoutes(e *gin.Engine) {
 }
 
 func handle404(c *gin.Context) {
+	if strings.HasSuffix(c.Request.URL.Path, ".js") {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
 	for _, v := range noHtmlRedirectOn404 {
 		if strings.HasPrefix(c.Request.URL.Path, v) {
 			c.AbortWithStatus(http.StatusNotFound)

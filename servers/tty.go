@@ -19,15 +19,16 @@ import (
 	"github.com/pufferpanel/pufferpanel/v3/config"
 	"github.com/pufferpanel/pufferpanel/v3/logging"
 	"github.com/pufferpanel/pufferpanel/v3/utils"
-	"github.com/shirou/gopsutil/process"
+	"github.com/shirou/gopsutil/v4/process"
 	"github.com/spf13/cast"
 )
 
 type tty struct {
-	mainProcess  *exec.Cmd
-	statLocker   sync.Mutex
-	lastStats    *pufferpanel.ServerStats
-	lastStatTime time.Time
+	lifecycleLocker sync.RWMutex
+	mainProcess     *exec.Cmd
+	statLocker      sync.Mutex
+	lastStats       *pufferpanel.ServerStats
+	lastStatTime    time.Time
 	//disableStdin        bool
 	disableSpecialStats bool
 
@@ -69,9 +70,24 @@ func (t *tty) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps puffe
 		pr.Env = append(pr.Env, fmt.Sprintf("%s=%s", k, v))
 	}
 
+	t.lifecycleLocker.Lock()
+	t.statLocker.Lock()
+	t.lastStats = nil
+	t.lastStatTime = time.Time{}
+	t.statLocker.Unlock()
 	t.mainProcess = pr
+	t.disableSpecialStats = steps.DisableStats
+	processTty, err := pty.Start(pr)
+	if err != nil {
+		t.mainProcess = nil
+		t.disableSpecialStats = false
+		t.lifecycleLocker.Unlock()
+		return err
+	}
+	t.lifecycleLocker.Unlock()
+
 	environment.DisplayToConsole(true, "Starting process: %s", steps.Command)
-	environment.Log(logging.Info, "Starting process in directory [%s]: %s", t.mainProcess.Dir, strings.Replace(strings.Join(t.mainProcess.Args, " "), "${PUFFERPANEL_SERVER_COMMAND}", steps.Command, 1))
+	environment.Log(logging.Info, "Starting process in directory [%s]: %s", pr.Dir, strings.Replace(strings.Join(pr.Args, " "), "${PUFFERPANEL_SERVER_COMMAND}", steps.Command, 1))
 
 	_ = environment.StatusTracker.WriteMessage(pufferpanel.Transmission{
 		Message: pufferpanel.ServerRunning{
@@ -80,14 +96,7 @@ func (t *tty) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps puffe
 		},
 		Type: pufferpanel.MessageTypeStatus,
 	})
-
-	t.disableSpecialStats = steps.DisableStats
 	//t.disableStdin = steps.DisableStdin
-
-	processTty, err := pty.Start(pr)
-	if err != nil {
-		return
-	}
 
 	//if !t.disableStdin {
 	//	environment.CreateConsoleStdinProxy(steps.StdInConfig, processTty)
@@ -100,27 +109,28 @@ func (t *tty) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps puffe
 		_, _ = io.Copy(proxy, processTty)
 	}(environment.Wrapper)
 
-	go t.handleClose(environment, steps.Callback)
+	go t.handleClose(environment, pr, steps.Callback)
 	return
 }
 
-func (t *tty) KillImpl(environment *pufferpanel.Environment) (err error) {
-	running, err := environment.IsRunning()
-	if err != nil {
-		return
+func (t *tty) KillImpl(*pufferpanel.Environment) error {
+	t.lifecycleLocker.RLock()
+	process := t.mainProcess
+	var osProcess *os.Process
+	if process != nil {
+		osProcess = process.Process
 	}
-	if !running {
-		return
+	t.lifecycleLocker.RUnlock()
+	if osProcess == nil {
+		return nil
 	}
-	return t.mainProcess.Process.Kill()
+	return osProcess.Kill()
 }
 
 func (t *tty) GetStatsImpl(environment *pufferpanel.Environment) (*pufferpanel.ServerStats, error) {
-	running, err := environment.IsRunning()
-	if err != nil {
-		return nil, err
-	}
-	if !running {
+	t.lifecycleLocker.RLock()
+	defer t.lifecycleLocker.RUnlock()
+	if t.mainProcess == nil || t.mainProcess.Process == nil {
 		stats := &pufferpanel.ServerStats{
 			Cpu:    0,
 			Memory: 0,
@@ -141,22 +151,31 @@ func (t *tty) GetStatsImpl(environment *pufferpanel.Environment) (*pufferpanel.S
 		return t.lastStats, nil
 	}
 
-	pr, err := process.NewProcess(int32(t.mainProcess.Process.Pid))
+	pid := t.mainProcess.Process.Pid
+	disableSpecialStats := t.disableSpecialStats
+	pr, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return nil, err
 	}
 
-	memMap, _ := pr.MemoryInfo()
-	cpu, _ := pr.Percent(time.Second * 1)
+	memMap, err := pr.MemoryInfo()
+	if err != nil {
+		return nil, err
+	}
+	cpu, err := pr.Percent(time.Second)
+	if err != nil {
+		return nil, err
+	}
 
 	stats := &pufferpanel.ServerStats{
 		Cpu:    cpu,
 		Memory: cast.ToFloat64(memMap.RSS),
 	}
 
-	if !t.disableSpecialStats && environment.Server.Get().Stats.Type == "jcmd" {
+	if !disableSpecialStats && environment.Server.Get().Stats.Type == "jcmd" {
 		var socket *net.UnixConn
-		if socket, err = t.initiateJCMD(); err == nil && socket != nil {
+		if socket, err = t.initiateJCMD(pid); err == nil && socket != nil {
+			defer socket.Close()
 			for _, s := range jcmdCommand {
 				_, err = socket.Write([]byte(s))
 				if err != nil {
@@ -181,18 +200,23 @@ func (t *tty) GetStatsImpl(environment *pufferpanel.Environment) (*pufferpanel.S
 	}
 
 	t.lastStats = stats
+	t.lastStatTime = time.Now()
 
 	return stats, nil
 }
 
-func (t *tty) SendCodeImpl(environment *pufferpanel.Environment, code int) error {
-	running, err := environment.IsRunning()
-
-	if err != nil || !running {
-		return err
+func (t *tty) SendCodeImpl(_ *pufferpanel.Environment, code int) error {
+	t.lifecycleLocker.RLock()
+	process := t.mainProcess
+	var osProcess *os.Process
+	if process != nil {
+		osProcess = process.Process
 	}
-
-	return t.mainProcess.Process.Signal(syscall.Signal(code))
+	t.lifecycleLocker.RUnlock()
+	if osProcess == nil {
+		return nil
+	}
+	return osProcess.Signal(syscall.Signal(code))
 }
 
 func (t *tty) GetUidImpl(*pufferpanel.Environment) int {
@@ -204,9 +228,16 @@ func (t *tty) GetGidImpl(*pufferpanel.Environment) int {
 }
 
 func (t *tty) IsRunningImpl(*pufferpanel.Environment) (isRunning bool, err error) {
-	isRunning = t.mainProcess != nil && t.mainProcess.Process != nil
+	t.lifecycleLocker.RLock()
+	process := t.mainProcess
+	var pid int
+	if process != nil && process.Process != nil {
+		pid = process.Process.Pid
+	}
+	t.lifecycleLocker.RUnlock()
+	isRunning = pid != 0
 	if isRunning {
-		pr, pErr := os.FindProcess(t.mainProcess.Process.Pid)
+		pr, pErr := os.FindProcess(pid)
 		if pr == nil || pErr != nil {
 			isRunning = false
 		} else if pr.Signal(syscall.Signal(0)) != nil {
@@ -216,13 +247,13 @@ func (t *tty) IsRunningImpl(*pufferpanel.Environment) (isRunning bool, err error
 	return
 }
 
-func (t *tty) handleClose(environment *pufferpanel.Environment, callback func(exitCode int)) {
-	err := t.mainProcess.Wait()
+func (t *tty) handleClose(environment *pufferpanel.Environment, process *exec.Cmd, callback func(exitCode int)) {
+	err := process.Wait()
 
 	_ = environment.Console.Close()
 
 	var exitCode int
-	if t.mainProcess.ProcessState == nil || err != nil {
+	if process.ProcessState == nil || err != nil {
 		var psErr *exec.ExitError
 		if errors.As(err, &psErr) {
 			exitCode = psErr.ExitCode()
@@ -230,7 +261,7 @@ func (t *tty) handleClose(environment *pufferpanel.Environment, callback func(ex
 			exitCode = 1
 		}
 	} else {
-		exitCode = t.mainProcess.ProcessState.ExitCode()
+		exitCode = process.ProcessState.ExitCode()
 	}
 	environment.LastExitCode = exitCode
 
@@ -238,26 +269,28 @@ func (t *tty) handleClose(environment *pufferpanel.Environment, callback func(ex
 		environment.Log(logging.Error, "Error waiting on process: %s\n", err)
 	}
 
-	if t.mainProcess != nil && t.mainProcess.ProcessState != nil {
-		environment.Log(logging.Debug, "%s\n", t.mainProcess.ProcessState.String())
+	if process.ProcessState != nil {
+		environment.Log(logging.Debug, "%s\n", process.ProcessState.String())
 	}
-
-	if t.mainProcess != nil && t.mainProcess.Process != nil {
-		_ = t.mainProcess.Process.Release()
-	}
-
-	t.statLocker.Lock()
-	t.statLocker.Unlock()
 
 	//if we are using unshare AND we're in tmp, we can nuke the workspace at this point
-	if !t.DisableUnshare && strings.HasPrefix(t.mainProcess.Dir, os.TempDir()) {
-		err = os.RemoveAll(t.mainProcess.Dir)
+	if !t.DisableUnshare && strings.HasPrefix(process.Dir, os.TempDir()) {
+		err = os.RemoveAll(process.Dir)
 		if err != nil {
-			logging.Debug.Printf("Failed to delete %s: %s", t.mainProcess.Dir, err.Error())
+			logging.Debug.Printf("Failed to delete %s: %s", process.Dir, err.Error())
 		}
 	}
 
-	t.mainProcess = nil
+	t.lifecycleLocker.Lock()
+	t.statLocker.Lock()
+	if t.mainProcess == process {
+		t.mainProcess = nil
+		t.disableSpecialStats = false
+		t.lastStats = nil
+		t.lastStatTime = time.Time{}
+	}
+	t.statLocker.Unlock()
+	t.lifecycleLocker.Unlock()
 
 	_ = environment.StatusTracker.WriteMessage(pufferpanel.Transmission{
 		Message: pufferpanel.ServerRunning{
@@ -268,7 +301,6 @@ func (t *tty) handleClose(environment *pufferpanel.Environment, callback func(ex
 	})
 
 	//t.disableStdin = false
-	t.disableSpecialStats = false
 
 	environment.Wait.Unlock()
 
@@ -321,8 +353,7 @@ func socketPath(pid int) string {
 	return fmt.Sprintf("/proc/%v/root/tmp/.java_pid%v", pid, pid)
 }
 
-func (t *tty) initiateJCMD() (*net.UnixConn, error) {
-	pid := t.mainProcess.Process.Pid
+func (t *tty) initiateJCMD(pid int) (*net.UnixConn, error) {
 	sock := socketPath(pid)
 
 	// Check if the UNIX socket is active

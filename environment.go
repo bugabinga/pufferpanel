@@ -32,16 +32,17 @@ type EnvironmentImpl interface {
 }
 
 type Environment struct {
-	Type            string          `json:"type"`
-	BackupDirectory string          `json:"-"`
-	ConsoleBuffer   *MemoryCache    `json:"-"`
-	Wait            *sync.Mutex     `json:"-"`
-	LastExitCode    int             `json:"-"`
-	Wrapper         io.Writer       `json:"-"` //our proxy back to the main
-	ConsoleTracker  *Tracker        `json:"-"`
-	StatusTracker   *Tracker        `json:"-"`
-	StatsTracker    *Tracker        `json:"-"`
-	Installing      bool            `json:"-"`
+	Type            string       `json:"type"`
+	BackupDirectory string       `json:"-"`
+	ConsoleBuffer   *MemoryCache `json:"-"`
+	Wait            *sync.Mutex  `json:"-"`
+	LastExitCode    int          `json:"-"`
+	Wrapper         io.Writer    `json:"-"` //our proxy back to the main
+	ConsoleTracker  *Tracker     `json:"-"`
+	StatusTracker   *Tracker     `json:"-"`
+	StatsTracker    *Tracker     `json:"-"`
+	Installing      bool         `json:"-"`
+	installingMu    sync.RWMutex
 	BackingUp       bool            `json:"-"`
 	Console         Console         `json:"-"`
 	Server          DaemonServer    `json:"-"`
@@ -191,11 +192,20 @@ func (e *Environment) WaitForMainProcessFor(timeout time.Duration) (err error) {
 		//but we then need to unlock it, so we can let whatever needs to run "run"
 		defer e.Wait.Unlock()
 		if timeout > 0 {
-			var timer = time.AfterFunc(timeout, func() {
-				err = e.Kill()
+			var killErr error
+			var timerDone sync.WaitGroup
+			timerDone.Add(1)
+			timer := time.AfterFunc(timeout, func() {
+				killErr = e.Kill()
+				timerDone.Done()
 			})
 			e.Wait.Lock()
-			timer.Stop()
+			if timer.Stop() {
+				timerDone.Done()
+			} else {
+				timerDone.Wait()
+				err = killErr
+			}
 		} else {
 			e.Wait.Lock()
 		}
@@ -226,11 +236,15 @@ func (e *Environment) Log(l *log.Logger, format string, obj ...interface{}) {
 }
 
 func (e *Environment) IsInstalling() bool {
+	e.installingMu.RLock()
+	defer e.installingMu.RUnlock()
 	return e.Installing
 }
 
 func (e *Environment) SetInstalling(flag bool) {
+	e.installingMu.Lock()
 	e.Installing = flag
+	e.installingMu.Unlock()
 	_ = e.StatusTracker.WriteMessage(Transmission{
 		Message: ServerRunning{
 			Installing: flag,

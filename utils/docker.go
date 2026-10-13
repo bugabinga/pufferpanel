@@ -20,6 +20,9 @@ func init() {
 }
 
 func CalculateDockerCPUPercent(v *container.StatsResponse) float64 {
+	if v.CPUStats.CPUUsage.TotalUsage < v.PreCPUStats.CPUUsage.TotalUsage || v.CPUStats.SystemUsage <= v.PreCPUStats.SystemUsage {
+		return 0
+	}
 	//this math is from https://docs.docker.com/reference/api/engine/version/v1.45/#tag/Container/operation/ContainerStats
 	cpuDelta := v.CPUStats.CPUUsage.TotalUsage - v.PreCPUStats.CPUUsage.TotalUsage
 	systemCpuDelta := v.CPUStats.SystemUsage - v.PreCPUStats.SystemUsage

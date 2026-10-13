@@ -9,7 +9,7 @@ import (
 	"github.com/pufferpanel/pufferpanel/v3/utils"
 
 	"github.com/pufferpanel/pufferpanel/v3/logging"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/go-playground/validator/v10"
 )
 
 var ErrUnknownError = CreateError("unknown error", "ErrUnknownError")

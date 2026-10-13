@@ -1,12 +1,12 @@
 import ax from 'axios'
-import { InMemorySessionStore } from './sessionStore'
-import { AuthApi } from './auth'
-import { SelfApi } from './self'
-import { UserApi } from './users'
-import { NodeApi } from './nodes'
-import { ServerApi } from './servers'
-import { TemplateApi } from './templates'
-import { SettingsApi } from './settings'
+import { InMemorySessionStore } from './sessionStore.js'
+import { AuthApi } from './auth.js'
+import { SelfApi } from './self.js'
+import { UserApi } from './users.js'
+import { NodeApi } from './nodes.js'
+import { ServerApi } from './servers.js'
+import { TemplateApi } from './templates.js'
+import { SettingsApi } from './settings.js'
 
 export class ApiClient {
   _axios = null
@@ -55,6 +55,15 @@ export class ApiClient {
     throw result
   }
 
+  _handleRequestError(e, options) {
+    if (typeof options.onError === 'function') {
+      const res = options.onError(e)
+      if (res) return res
+    }
+    const status = ((e || {}).response || {}).status
+    if (!Array.isArray(options.unhandledErrors) || options.unhandledErrors.indexOf(status) === -1) this._handleError(e)
+  }
+
   _enhanceHeaders(headers) {
     const token = this.auth.getToken()
     if (token) {
@@ -70,11 +79,7 @@ export class ApiClient {
     try {
       return await this._axios.head(this._host + url, { params, ...options, headers: this._enhanceHeaders(headers) })
     } catch (e) {
-      if (typeof options.onError === 'function') {
-        const res = options.onError(e)
-        if (res) return res
-      }
-      if (!Array.isArray(options.unhandledErrors) || options.unhandledErrors.indexOf(e.response.status) === -1) this._handleError(e)
+      return this._handleRequestError(e, options)
     }
   }
 
@@ -82,11 +87,7 @@ export class ApiClient {
     try {
       return await this._axios.get(this._host + url, { params, ...options, headers: this._enhanceHeaders(headers) })
     } catch (e) {
-      if (typeof options.onError === 'function') {
-        const res = options.onError(e)
-        if (res) return res
-      }
-      if (!Array.isArray(options.unhandledErrors) || options.unhandledErrors.indexOf(e.response.status) === -1) this._handleError(e)
+      return this._handleRequestError(e, options)
     }
   }
 
@@ -94,11 +95,7 @@ export class ApiClient {
     try {
       return await this._axios.post(this._host + url, data, { params, ...options, headers: this._enhanceHeaders(headers) })
     } catch (e) {
-      if (typeof options.onError === 'function') {
-        const res = options.onError(e)
-        if (res) return res
-      }
-      if (!Array.isArray(options.unhandledErrors) || options.unhandledErrors.indexOf(e.response.status) === -1) this._handleError(e)
+      return this._handleRequestError(e, options)
     }
   }
 
@@ -106,11 +103,7 @@ export class ApiClient {
     try {
       return await this._axios.put(this._host + url, data, { params, ...options, headers: this._enhanceHeaders(headers) })
     } catch (e) {
-      if (typeof options.onError === 'function') {
-        const res = options.onError(e)
-        if (res) return res
-      }
-      if (!Array.isArray(options.unhandledErrors) || options.unhandledErrors.indexOf(e.response.status) === -1) this._handleError(e)
+      return this._handleRequestError(e, options)
     }
   }
 
@@ -118,11 +111,7 @@ export class ApiClient {
     try {
       return await this._axios.delete(this._host + url, { params, ...options, headers: this._enhanceHeaders(headers) })
     } catch (e) {
-      if (typeof options.onError === 'function') {
-        const res = options.onError(e)
-        if (res) return res
-      }
-      if (!Array.isArray(options.unhandledErrors) || options.unhandledErrors.indexOf(e.response.status) === -1) this._handleError(e)
+      return this._handleRequestError(e, options)
     }
   }
 

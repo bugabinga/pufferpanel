@@ -12,7 +12,7 @@ import (
 	"github.com/pufferpanel/pufferpanel/v3/models"
 	"github.com/pufferpanel/pufferpanel/v3/response"
 	"github.com/pufferpanel/pufferpanel/v3/services"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/go-playground/validator/v10"
 )
 
 func RegisterPost(c *gin.Context) {

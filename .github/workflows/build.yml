@@ -16,8 +16,7 @@ on:
       - 'client/frontend/src/lang/**.json'
 
 env:
-  SWAG_VERSION: "1.16.4"
-  NODE_VERSION: "22"
+  NODE_VERSION: "26.10.0"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -35,34 +34,19 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'yarn'
           cache-dependency-path: 'client/yarn.lock'
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
-
-      - name: Restore Go BIN
-        id: restore-go-bin
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/bin
-          key: ${{ runner.os }}-swag-${{ env.SWAG_VERSION }}
-          restore-keys: |
-            ${{ runner.os }}-swag-
-
-      - name: Download Go Binaries
-        if: steps.restore-go-bin.outputs.cache-hit != 'true'
-        run: |
-          go install github.com/swaggo/swag/cmd/swag@latest
 
       - name: Download Go modules
         run: |
@@ -70,19 +54,21 @@ jobs:
 
       - name: Generate Swagger Docs
         run: |
-          ~/go/bin/swag init --pd --md . -o web/swagger -g web/loader.go
+          go tool swag init --pd --md . -o web/swagger -g web/loader.go
 
-      - name: yarn install, build
+      - name: yarn install, test, lint, build
         run: |
-          npm install -g yarn
-          yarn install
+          npm install --global --allow-scripts=yarn yarn@1.22.22
+          yarn install --frozen-lockfile
+          yarn test
+          yarn lint
           env VITE_CHECK_ENV="true" yarn build
         env:
           CI: true
         working-directory: client
 
       - name: Upload Swagger docs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel_swagger
           path: |
@@ -102,7 +88,7 @@ jobs:
           rm -rf .git .github web/swagger/swagger.json web/swagger/swagger.yaml build-artifacts/client/frontend/dist/*.map
 
       - name: Generate job artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel_build_artifact
           path: ${{ github.workspace }}
@@ -120,11 +106,11 @@ jobs:
 
     steps:
       - name: Get the version
-        run: echo "VERSION=0.0.${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+        run: echo "VERSION=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Get the version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> $GITHUB_ENV
+        run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> "$GITHUB_ENV"
 
       - name: Download APT packages
         run: |
@@ -135,12 +121,12 @@ jobs:
         run: |
           sudo apt-get install -y rpm
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: pufferpanel_build_artifact
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
 
@@ -220,19 +206,19 @@ jobs:
             libstdc++.i686
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel_${{ env.VERSION }}_linux_amd64
           path: build-artifacts/
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel_${{ env.VERSION }}_amd64.deb
           path: pufferpanel_${{ env.VERSION }}_amd64.deb
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel-${{ env.VERSION }}-1.x86_64.rpm
           path: ${{ steps.rpmamd64.outputs.file }}
@@ -248,18 +234,18 @@ jobs:
 
     steps:
       - name: Get the version
-        run: echo "VERSION=0.0.${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+        run: echo "VERSION=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Get the version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> $GITHUB_ENV
+        run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> "$GITHUB_ENV"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: pufferpanel_build_artifact
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
 
@@ -344,19 +330,19 @@ jobs:
             /etc/pufferpanel/config.json:noreplace
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel_${{ env.VERSION }}_linux_arm64
           path: build-artifacts
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel_${{ env.VERSION }}_arm64.deb
           path: pufferpanel_${{ env.VERSION }}_arm64.deb
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pufferpanel-${{ env.VERSION }}-1.aarch64.rpm
           path: ${{ steps.rpmarm64.outputs.file }}
@@ -371,7 +357,7 @@ jobs:
 
     steps:
       - name: Delete artifacts
-        uses: geekyeggo/delete-artifact@v5
+        uses: geekyeggo/delete-artifact@v6.0.0
         with:
           name: pufferpanel_build_artifact
 
@@ -394,11 +380,11 @@ jobs:
 
     steps:
       - name: Get the version
-        run: echo "VERSION=0.0.${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+        run: echo "VERSION=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Get the version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> $GITHUB_ENV
+        run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> "$GITHUB_ENV"
 
       - name: Ensure mask
         id: values
@@ -407,11 +393,11 @@ jobs:
           echo "::add-mask::$REGISTRY_PASSWORD"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Login to DockerHub
         if: env.REGISTRY_USERNAME != '' && env.REGISTRY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ env.REGISTRY_USERNAME }}
@@ -419,14 +405,14 @@ jobs:
 
       - name: Login to DockerHub
         if: env.REGISTRY_USERNAME != '' && env.REGISTRY == ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.6.0
         with:
           username: ${{ env.REGISTRY_USERNAME }}
           password: ${{ env.REGISTRY_PASSWORD }}
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6.2.0
         with:
           images: |
             name=${{ vars.REGISTRY != 'docker.com' && format('{0}/', env.REGISTRY) || '' }}${{ env.IMAGE_NAME }},enable=${{ vars.REGISTRY != 'docker.com' }}
@@ -436,11 +422,11 @@ jobs:
             type=semver,pattern={{version}}
 
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -468,19 +454,19 @@ jobs:
     if: "github.event_name != 'pull_request'"
 
     steps:
-      - uses: ruby/setup-ruby@v1
+      - uses: ruby/setup-ruby@v1.329.0
         with:
-          ruby-version: '3.3'
+          ruby-version: '4.0.7'
 
       - name: Install gems
         run: |
           gem install --no-doc package_cloud
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: pufferpanel_*
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: pufferpanel-*.rpm
 
@@ -488,14 +474,14 @@ jobs:
         env:
           PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
         run: |
-          package_cloud push ${{ vars.PACKAGECLOUD_REPO }}/any/any */pufferpanel_*_amd64.deb 
-          package_cloud push ${{ vars.PACKAGECLOUD_REPO }}/any/any */pufferpanel_*_arm64.deb 
-          package_cloud push ${{ vars.PACKAGECLOUD_REPO }}/rpm_any/rpm_any */pufferpanel-*.x86_64.rpm 
+          package_cloud push ${{ vars.PACKAGECLOUD_REPO }}/any/any ./*/pufferpanel_*_amd64.deb
+          package_cloud push ${{ vars.PACKAGECLOUD_REPO }}/any/any ./*/pufferpanel_*_arm64.deb
+          package_cloud push ${{ vars.PACKAGECLOUD_REPO }}/rpm_any/rpm_any ./*/pufferpanel-*.x86_64.rpm
 
       - name: Create Release
         id: create_release
         if: "startsWith(github.ref, 'refs/tags/v')"
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}

@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/mholt/archiver/v3"
+	"github.com/mholt/archives"
 	"github.com/pufferpanel/pufferpanel/v3"
 	"github.com/pufferpanel/pufferpanel/v3/files"
 	"github.com/pufferpanel/pufferpanel/v3/utils"
@@ -45,7 +45,7 @@ func downloadDD(rootBinaryFolder string, version string) error {
 		link = strings.Replace(link, "${arch}", arch, 1)
 	}
 
-	err = pufferpanel.HttpExtract(link, files.BinaryFS, "depotdownloader", archiver.DefaultZip)
+	err = pufferpanel.HttpExtract(link, files.BinaryFS, "depotdownloader", archives.Zip{})
 	if err != nil {
 		return err
 	}

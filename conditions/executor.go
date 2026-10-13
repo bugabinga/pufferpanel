@@ -1,8 +1,8 @@
 package conditions
 
 import (
+	"cel.dev/cel-go/cel"
 	"fmt"
-	"github.com/google/cel-go/cel"
 	"reflect"
 	"regexp"
 	"runtime"

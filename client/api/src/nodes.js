@@ -39,7 +39,7 @@ export class NodeApi {
     try {
       const nodes = await this.list()
       return nodes.find(n => n.name === node.name).id
-    } catch (e) {
+    } catch {
       return -1
     }
   }

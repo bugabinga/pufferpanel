@@ -62,7 +62,7 @@ export class SelfApi {
 
   async enrollPasskey(name) {
     let creation = await this._api.self.startPasskeyEnroll(name)
-    const attestation = await navigator.credentials.create(creation)
+    const attestation = await globalThis.navigator.credentials.create(creation)
     return await this._api.self.validatePasskeyEnroll(attestation)
   }
 

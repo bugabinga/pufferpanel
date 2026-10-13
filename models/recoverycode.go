@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"github.com/pufferpanel/pufferpanel/v3"
 	"golang.org/x/crypto/blake2b"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
 )
 

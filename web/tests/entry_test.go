@@ -26,9 +26,18 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	_ = os.RemoveAll("test-dir")
-	err := os.Mkdir("test-dir", 0755)
-	os.Chdir("test-dir")
+	originalWorkingDir, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	testRoot, err := os.MkdirTemp("", "pufferpanel-web-tests-")
+	if err != nil {
+		panic(err)
+	}
+	if err = os.Chdir(testRoot); err != nil {
+		_ = os.RemoveAll(testRoot)
+		panic(err)
+	}
 
 	var exitCode = 1
 
@@ -127,6 +136,8 @@ func TestMain(m *testing.M) {
 	_ = os.RemoveAll("servers")
 	_ = os.RemoveAll("binaries")
 	_ = os.RemoveAll("backups")
+	_ = os.Chdir(originalWorkingDir)
+	_ = os.RemoveAll(testRoot)
 
 	os.Exit(exitCode)
 }
