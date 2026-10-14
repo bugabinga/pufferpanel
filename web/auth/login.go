@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/pufferpanel/pufferpanel/v3"
+	"github.com/pufferpanel/pufferpanel/v3/config"
 	"github.com/pufferpanel/pufferpanel/v3/middleware"
 	"github.com/pufferpanel/pufferpanel/v3/models"
 	"github.com/pufferpanel/pufferpanel/v3/response"
@@ -177,10 +178,7 @@ func createSession(c *gin.Context, user *models.User) {
 	data := &LoginResponse{}
 	data.Scopes = perms.Scopes
 
-	secure := false
-	if c.Request.TLS != nil {
-		secure = true
-	}
+	secure := config.PanelWebCookiesSecure.Value() || c.Request.TLS != nil
 
 	maxAge := int(time.Hour / time.Second)
 

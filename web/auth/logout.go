@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"github.com/gin-gonic/gin"
+	"github.com/pufferpanel/pufferpanel/v3/config"
 	"github.com/pufferpanel/pufferpanel/v3/middleware"
 	"github.com/pufferpanel/pufferpanel/v3/services"
 	"net/http"
@@ -24,12 +25,9 @@ func LogoutPost(c *gin.Context) {
 
 	_ = ss.Expire(cookie)
 
-	secure := false
-	if c.Request.TLS != nil {
-		secure = true
-	}
+	secure := config.PanelWebCookiesSecure.Value() || c.Request.TLS != nil
 
-	c.SetCookie("puffer_auth", "", 0, "/", "", secure, true)
-	c.SetCookie("puffer_auth_expires", "", 0, "/", "", secure, false)
+	c.SetCookie("puffer_auth", "", -1, "/", "", secure, true)
+	c.SetCookie("puffer_auth_expires", "", -1, "/", "", secure, false)
 	c.Status(http.StatusNoContent)
 }
