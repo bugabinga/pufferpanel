@@ -2,26 +2,32 @@ name: honest_annie
 
 on:
   schedule:
+    - cron: '7,37 * * * *'
     - cron: '17 4 * * *'
+  workflow_run:
+    workflows: [Annie PR wake]
+    types: [completed]
+  issues:
+    types: [opened, edited, reopened, closed]
   workflow_dispatch:
     inputs:
       mode:
-        description: 'check: offline CI only; maintain: paid maintenance and verified release'
+        description: 'check: offline unpaid; observe/sweep: read-only unpaid; maintain: bounded paid admission'
         type: choice
         default: check
-        options: [check, maintain]
+        options: [check, observe, sweep, maintain]
+      bootstrap:
+        description: 'Explicit initial empty-ledger bootstrap only; never recover missing prior state this way'
+        type: boolean
+        default: false
   push:
     branches: [trunk]
-    paths: ['tools/maintainer/**', '.github/workflows/honest-annie.yml']
-  pull_request:
-    branches: [trunk]
-    paths: ['tools/maintainer/**', '.github/workflows/honest-annie.yml']
 
 permissions:
   contents: read
 
 concurrency:
-  group: honest-annie-${{ github.event_name == 'pull_request' && github.ref || 'trunk' }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'check' && format('annie-check-{0}', github.run_id) || 'honest-annie-trusted' }}
   cancel-in-progress: false
 
 jobs:
@@ -31,41 +37,102 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26.10.0'
-      - name: Install pinned harness dependencies
-        run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts
         working-directory: tools/maintainer
-      - name: Test honest_annie without model requests or publication
+      - name: Offline tests, no observations or credentials
         run: |
           npm test
-          bash -n ci.sh gate.sh publish.sh run.sh
+          bash -n ci.sh gate.sh publish.sh run.sh podman.sh
         working-directory: tools/maintainer
 
-  maintain:
+  observe:
     needs: check
     if: >-
       github.repository == 'bugabinga/pufferpanel' && github.ref == 'refs/heads/trunk' &&
-      vars.HONEST_ANNIE_ENABLED == 'true' &&
-      (github.event_name == 'schedule' ||
-       (github.event_name == 'workflow_dispatch' && inputs.mode == 'maintain'))
+      !(github.event_name == 'workflow_dispatch' && inputs.mode == 'check')
     runs-on: ubuntu-24.04
-    timeout-minutes: 125
-    environment: honest-annie-model
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+      pull-requests: read
+      checks: read
+      statuses: read
     outputs:
-      candidate: ${{ steps.candidate.outputs.candidate }}
-    env:
-      PUFFER_MAINT_DEFER_PUBLISH: '1'
+      paid: ${{ steps.observe.outputs.paid }}
+      task: ${{ steps.observe.outputs.task }}
+      lease: ${{ steps.observe.outputs.lease }}
+      retry: ${{ steps.observe.outputs.retry }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - name: Rediscover, verify ledger, select useful work
+        id: observe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANNIE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'maintain' }}
+          HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
+          ANNIE_BOOTSTRAP: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap && github.run_id || '' }}
+          ANNIE_CONFIG_REVISION: ${{ vars.ANNIE_CONFIG_REVISION }}
+          ANNIE_OUTPUT_DIR: ${{ runner.temp }}/annie-observer
+        run: node tools/maintainer/controller.mjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && github.run_attempt == 1
+        with:
+          name: annie-checkpoint-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/annie-observer/checkpoint.json
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: annie-observer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/annie-observer/observer.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  maintain:
+    needs: [check, observe]
+    if: >-
+      github.repository == 'bugabinga/pufferpanel' && github.ref == 'refs/heads/trunk' &&
+      vars.HONEST_ANNIE_ENABLED == 'true' && github.run_attempt == 1 && needs.observe.outputs.paid == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 125
+    environment: honest-annie-model
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    outputs:
+      candidate: ${{ steps.candidate.outputs.candidate }}
+      management: ${{ steps.candidate.outputs.management }}
+      feedback: ${{ steps.candidate.outputs.feedback }}
+    env:
+      PUFFER_MAINT_DEFER_PUBLISH: '1'
+      PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(needs.observe.outputs.task).base }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Configure runner-temporary paths
-        run: bash tools/maintainer/ci.sh init
+      - run: bash tools/maintainer/ci.sh init
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26.10.0'
@@ -76,89 +143,192 @@ jobs:
             sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
           fi
           podman info
-      - name: Install pinned harness dependencies
-        run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts
         working-directory: tools/maintainer
-      - name: Configure isolated honest_annie runtime
-        run: bash tools/maintainer/ci.sh prepare
-      - name: Maintain, independently review, run fixed gates, commit locally
+      - run: bash tools/maintainer/ci.sh prepare
+      - name: Validate private Podman store before model runtime and credentials
+        run: bash tools/maintainer/ci.sh preflight
+      - name: Freeze prepaid lease before first provider dispatch
+        env:
+          ANNIE_LEASE_JSON: ${{ needs.observe.outputs.lease }}
+        run: |
+          node --input-type=module -e 'import {mkdir,writeFile} from "node:fs/promises"; import {dirname} from "node:path"; import {verifyLease} from "./tools/maintainer/controller.mjs"; const lease=verifyLease(JSON.parse(process.env.ANNIE_LEASE_JSON),{env:process.env,task:JSON.parse(process.env.PUFFER_MAINT_TASK)}); if(Date.now()>=lease.deadline-90000)throw Error("lease expired"); await mkdir(dirname(process.env.PUFFER_MAINT_LEASE),{recursive:true}); await writeFile(process.env.PUFFER_MAINT_LEASE,JSON.stringify(lease));'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: prepaid
+        with:
+          name: annie-lease-${{ github.run_id }}-1
+          path: ${{ env.PUFFER_MAINT_LEASE }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Verify immutable prepaid upload by ID and digest before models
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANNIE_LEASE_ARTIFACT_ID: ${{ steps.prepaid.outputs.artifact-id }}
+          ANNIE_LEASE_ARTIFACT_DIGEST: ${{ steps.prepaid.outputs.artifact-digest }}
+        run: node tools/maintainer/controller.mjs verify-upload
+      - name: Validate selected model key configuration
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: test -n "$ZAI_API_KEY" || { echo 'Set ZAI_API_KEY in honest-annie-model environment' >&2; exit 1; }
+      - name: Maintain or review selected task
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/maintainer/run.sh
+      - name: Export only approved candidates or valid rejection feedback
+        id: candidate
+        if: always()
+        run: bash tools/maintainer/ci.sh export
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && (steps.candidate.outputs.candidate == 'true' || steps.candidate.outputs.management == 'true' || steps.candidate.outputs.feedback == 'true')
+        with:
+          name: honest-annie-candidate-${{ github.run_id }}-1
+          path: ${{ env.HONEST_ANNIE_ARTIFACT }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Collect sanitized maintenance report
+        if: always()
         env:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
         run: |
-          test -n "$ZAI_API_KEY" || { echo 'Set ZAI_API_KEY in honest-annie-model environment' >&2; exit 1; }
-          bash tools/maintainer/run.sh
-      - name: Export only reviewed source and exact-tree gate receipt
-        id: candidate
-        run: bash tools/maintainer/ci.sh export
+          day=$(node -p 'JSON.parse(process.env.PUFFER_MAINT_TASK).day')
+          node tools/maintainer/report.mjs collect --report "$PUFFER_MAINT_RESULT" --reportdir "$RUNNER_TEMP/honest-annie-report" --gate-events "$PUFFER_MAINT_STATE/runs/$day/gate-events.jsonl"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: steps.candidate.outputs.candidate == 'true'
+        if: always()
         with:
-          name: honest-annie-candidate
-          path: ${{ env.HONEST_ANNIE_ARTIFACT }}
-          if-no-files-found: error
-          retention-days: 7
-      - name: Show failed gate diagnostics, not model transcripts
-        if: failure()
-        run: |
-          if test -d "$PUFFER_MAINT_STATE/runs"; then
-            find "$PUFFER_MAINT_STATE/runs" -type f -name '*.log' -exec tail -n 80 {} +
-          fi
+          name: honest-annie-model-report-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/honest-annie-report/report.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Clean private Podman runroot
+        if: always()
+        run: bash tools/maintainer/ci.sh cleanup
 
   release:
-    needs: maintain
-    if: needs.maintain.outputs.candidate == 'true'
+    name: Annie effects (model-free)
+    needs: [observe, maintain]
+    if: >-
+      always() && vars.HONEST_ANNIE_ENABLED == 'true' &&
+      (needs.maintain.outputs.candidate == 'true' || needs.maintain.outputs.management == 'true' || needs.maintain.outputs.feedback == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     environment: honest-annie-release
     permissions:
       contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
     env:
+      PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
       PUFFER_MAINT_REGISTRY: registry.bugabinga.net/pufferpanel
+      HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ fromJSON(needs.observe.outputs.task).base }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Configure runner-temporary paths
-        run: bash tools/maintainer/ci.sh init
+      - name: Recheck effects enablement
+        run: test "$HONEST_ANNIE_ENABLED" = true
+      - run: bash tools/maintainer/ci.sh init
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26.10.0'
       - name: Ensure rootless container tools
+        if: needs.maintain.outputs.candidate == 'true'
         run: |
           if ! command -v podman; then
             sudo apt-get update
             sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
           fi
           podman info
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: honest-annie-candidate
+          name: honest-annie-candidate-${{ github.run_id }}-1
           path: ${{ env.HONEST_ANNIE_ARTIFACT }}
       - name: Verify candidate identity, immutable CI, and gate receipt
+        if: needs.maintain.outputs.candidate == 'true'
         run: bash tools/maintainer/ci.sh import
       - name: Independently rerun fixed gates before release credentials
+        if: needs.maintain.outputs.candidate == 'true'
         run: bash tools/maintainer/ci.sh gate
-      - name: Authenticate publisher only
-        env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-        run: |
-          test -n "$REGISTRY_USERNAME" && test -n "$REGISTRY_PASSWORD" || { echo 'Set registry secrets in honest-annie-release environment' >&2; exit 1; }
-          printf '%s' "$REGISTRY_PASSWORD" | podman login --authfile "$REGISTRY_AUTH_FILE" --username "$REGISTRY_USERNAME" --password-stdin registry.bugabinga.net
-      - name: Persist reviewed commit without overwriting newer trunk
+      - name: Persist source before management or registry auth
+        if: needs.maintain.outputs.candidate == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/ci.sh push
+      - name: Validate approved management permission class without admin credentials
+        if: needs.maintain.outputs.management == 'true'
+        id: management-policy
+        run: bash tools/maintainer/ci.sh management-check
+      - name: Apply ordinary reviewed management with native token only
+        if: needs.maintain.outputs.management == 'true' && steps.management-policy.outputs.adminAction != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/maintainer/ci.sh management
+      - name: Apply explicitly reviewed enable-issues with isolated admin capability
+        if: needs.maintain.outputs.management == 'true' && steps.management-policy.outputs.adminAction == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANNIE_GH_TOKEN: ${{ secrets.ANNIE_GH_TOKEN }}
+        run: bash tools/maintainer/ci.sh management
+      - name: Host substantive rejection COMMENT at exact H
+        if: needs.maintain.outputs.feedback == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/maintainer/ci.sh feedback
+      - name: Authenticate publisher only after source persistence
+        if: needs.maintain.outputs.candidate == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: bash tools/maintainer/ci.sh registry-login
       - name: Publish immutable numbered image, verify, promote latest
+        if: needs.maintain.outputs.candidate == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/ci.sh publish
-      - name: Show failed publication diagnostics
-        if: failure()
-        run: |
-          if test -d "$PUFFER_MAINT_STATE/runs"; then
-            find "$PUFFER_MAINT_STATE/runs" -type f -name '*.log' -exec tail -n 80 {} +
-          fi
-      - name: Remove registry credentials
+      - name: Collect sanitized release report and actual receipts
         if: always()
-        run: rm -f "$REGISTRY_AUTH_FILE"
+        run: |
+          day=$(node -p 'JSON.parse(process.env.PUFFER_MAINT_TASK).day')
+          node tools/maintainer/report.mjs collect --report "$HONEST_ANNIE_ARTIFACT/result.json" --reportdir "$RUNNER_TEMP/honest-annie-report" --gate-events "$PUFFER_MAINT_STATE/runs/$day/gate-events.jsonl" --source-receipt "$PUFFER_MAINT_STATE/runs/$day/source.ok" --action-receipts "$PUFFER_MAINT_STATE/runs/$day/action-receipts.json" --published "$PUFFER_MAINT_STATE/runs/$day/publish.ok"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: honest-annie-release-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/honest-annie-report/report.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Clean private Podman runroot and registry auth
+        if: always()
+        run: bash tools/maintainer/ci.sh cleanup
+
+  retry-effects:
+    needs: observe
+    if: needs.observe.outputs.retry != '' && vars.HONEST_ANNIE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - name: Retry only known model-free effects job, never rerun-all or rerun-failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
+          ANNIE_RETRY: ${{ needs.observe.outputs.retry }}
+        run: node tools/maintainer/controller.mjs retry

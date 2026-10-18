@@ -1,0 +1,17 @@
+name: Annie PR wake
+
+on:
+  pull_request:
+    branches: [trunk]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, closed, edited]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  wake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: printf '%s\n' '🌻 PR changed; trusted observer independently rediscovers current work.'

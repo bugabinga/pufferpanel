@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -28,7 +28,7 @@ function fixture(t, protectedEdit = false) {
   writeFileSync(result, JSON.stringify({ phase: 'publishing', day: '2026-04-03', version: '2026.4.3', base, tree, commit }));
   const bin = join(dir, 'bin'); mkdirSync(bin);
   writeFileSync(join(bin, 'podman'), '#!/usr/bin/env bash\nexit 0\n'); chmodSync(join(bin, 'podman'), 0o755);
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, PUFFER_MAINT_SOURCE: source, PUFFER_MAINT_STATE: state, HONEST_ANNIE_ARTIFACT: artifact, PUFFER_MAINT_RESULT: result, GITHUB_SHA: base, GITHUB_OUTPUT: output };
+  const env = { ...process.env, GITHUB_ACTIONS: 'false', PATH: `${bin}:${process.env.PATH}`, PUFFER_MAINT_SOURCE: source, PUFFER_MAINT_STATE: state, HONEST_ANNIE_ARTIFACT: artifact, PUFFER_MAINT_RESULT: result, GITHUB_SHA: base, GITHUB_OUTPUT: output };
   const command = (action, extra = {}) => spawnSync('bash', [join(moduleDir, 'ci.sh'), action], { env: { ...env, ...extra }, encoding: 'utf8' });
   const imported = { PUFFER_MAINT_STATE: join(dir, 'release-state') };
   return { dir, source, state, artifact, base, commit, tree, result, output, git, command, imported, origin };
@@ -56,6 +56,26 @@ test('CI initialization confines runtime paths to runner temp and prepare sets b
   assert.equal(JSON.parse(readFileSync(join(agent, 'settings.json'))).defaultProvider, 'zai');
   assert.equal(existsSync(join(agent, 'auth.json')), false);
 });
+test('CI allocates a short private runroot and cleanup refuses arbitrary paths', t => {
+  const f = fixture(t); const envFile = join(f.dir, 'github-env');
+  let result = f.command('init', { RUNNER_TEMP: f.dir, GITHUB_WORKSPACE: f.source, GITHUB_ENV: envFile });
+  assert.equal(result.status, 0, result.stderr);
+  const paths = Object.fromEntries(readFileSync(envFile, 'utf8').trim().split('\n').map(line => line.split('=')));
+  assert.ok(Buffer.byteLength(paths.PUFFER_MAINT_RUNROOT) <= 50);
+  assert.equal(statSync(paths.PUFFER_MAINT_RUNROOT).mode & 0o777, 0o700);
+  const arbitrary = join(f.dir, 'arbitrary'); mkdirSync(arbitrary, { mode: 0o700 }); chmodSync(arbitrary, 0o700);
+  result = f.command('cleanup', { PUFFER_MAINT_RUNROOT: arbitrary, PUFFER_MAINT_RUNROOT_PREFIX: `${f.dir}/pufferpanel-podman.` });
+  assert.equal(result.status, 64); assert.equal(existsSync(arbitrary), true);
+  result = f.command('cleanup', paths); assert.equal(result.status, 0, result.stderr);
+  assert.equal(existsSync(paths.PUFFER_MAINT_RUNROOT), false);
+});
+test('CI preflight rejects invalid explicit runroot before Podman', t => {
+  const f = fixture(t); const calls = join(f.dir, 'podman-calls');
+  writeFileSync(join(f.dir, 'bin', 'podman'), `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >>${JSON.stringify(calls)}\n`); chmodSync(join(f.dir, 'bin', 'podman'), 0o755);
+  const long = '/' + 'x'.repeat(51);
+  const result = f.command('preflight', { PUFFER_MAINT_RUNROOT: long });
+  assert.equal(result.status, 64); assert.equal(existsSync(calls), false);
+});
 test('workflow confines secrets and paid jobs to trusted trunk; actions use full SHA pins', () => {
   const workflow = readFileSync(join(moduleDir, '../../.github/workflows/honest-annie.yml'), 'utf8');
   const check = workflow.slice(workflow.indexOf('  check:'), workflow.indexOf('  maintain:'));
@@ -64,10 +84,12 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   assert.doesNotMatch(check, /secrets\.|contents: write/);
   assert.match(maintain, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(maintain, /github\.ref == 'refs\/heads\/trunk'/);
   assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(maintain, /secrets\.ZAI_API_KEY/);
-  assert.doesNotMatch(maintain, /REGISTRY_PASSWORD|GH_TOKEN|contents: write/);
+  assert.doesNotMatch(maintain, /REGISTRY_PASSWORD|ANNIE_GH_TOKEN|contents: write|issues: write|pull-requests: write/);
+  assert.match(maintain, /GH_TOKEN: \$\{\{ github.token \}\}/); // Native read-only preparation only.
+  assert.match(maintain, /github.run_attempt == 1/);
   assert.match(release, /contents: write/); assert.doesNotMatch(release, /ZAI_API_KEY/);
   assert.ok(release.indexOf('ci.sh gate') < release.indexOf('secrets.REGISTRY_PASSWORD'));
-  for (const [, ref] of workflow.matchAll(/uses: ([^\s]+)/g)) assert.match(ref, /@[a-f0-9]{40}$/);
+  for (const [, ref] of workflow.matchAll(/^\s*- uses: ([^\s]+)/gm)) assert.match(ref, /@[a-f0-9]{40}$/);
 });
 test('reviewed CI bundle imports exact commit, pushes once, and safely retries', t => {
   const f = fixture(t);

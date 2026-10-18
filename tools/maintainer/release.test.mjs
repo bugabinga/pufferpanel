@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -43,6 +43,20 @@ if(name==='curl'){
   const publish = () => command('bash', [join(moduleDir, 'publish.sh'), repo, '2026.4.3', run], { env });
   return { root, repo, run, env, git, load, update, publish };
 }
+test('preflight, gate, publisher use identical private Podman arguments and emit gate events', t => {
+  const f = fixture(t); const runroot = join(f.root, 'rr'); mkdirSync(runroot, { mode: 0o700 }); chmodSync(runroot, 0o700);
+  const common = { ...f.env, PUFFER_MAINT_STATE: join(f.root, 'state'), PUFFER_MAINT_RUNROOT: runroot, PUFFER_MAINT_SOURCE: f.repo, HONEST_ANNIE_ARTIFACT: join(f.root, 'artifact'), GITHUB_SHA: f.git('rev-parse', 'HEAD') };
+  const preflight = command('bash', [join(moduleDir, 'ci.sh'), 'preflight'], { env: common }); assert.equal(preflight.status, 0, preflight.stderr);
+  const gate = command('bash', [join(moduleDir, 'gate.sh'), f.repo, f.run], { env: common }); assert.equal(gate.status, 0, gate.stderr);
+  const publish = command('bash', [join(moduleDir, 'publish.sh'), f.repo, '2026.4.3', f.run], { env: common }); assert.equal(publish.status, 0, publish.stderr);
+  const podman = f.load().commands.filter(value => value.startsWith('podman '));
+  const args = podman.map(value => value.split(' ').slice(0, 7).join(' '));
+  assert.ok(args.every(value => value === args[0]), args.join('\n'));
+  const events = readFileSync(join(f.run, 'gate-events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(events.some(event => event.name === 'whitespace'));
+  assert.ok(events.some(event => event.name === 'publish-podman'));
+  assert.ok(events.every(event => Number.isInteger(event.durationMs) && Number.isInteger(event.exitCode)));
+});
 test('gate fails closed and removes stale success marker', t => {
   const f = fixture(t); f.update({ failGate: true });
   const result = command('bash', [join(moduleDir, 'gate.sh'), f.repo, f.run], { env: f.env });

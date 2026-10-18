@@ -6,11 +6,14 @@ worktree=$(realpath -e "$1")
 run_dir=$(realpath -e "$2")
 case "$run_dir" in "$worktree"|"$worktree"/*) echo 'run directory must be outside worktree' >&2; exit 64;; esac
 state_dir=$(dirname "$(dirname "$run_dir")")
-mkdir -p "$state_dir/podman/root" "$state_dir/podman/runroot" "$run_dir/logs"
+module=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$module/podman.sh"
+mkdir -p "$run_dir/logs"
 rm -f "$run_dir/gate.ok"
-podman=(podman --root "$state_dir/podman/root" --runroot "$state_dir/podman/runroot" --storage-driver "${PUFFER_MAINT_STORAGE_DRIVER:-overlay}")
+puffer_podman_init "$state_dir"
+podman=("${PUFFER_MAINT_PODMAN[@]}")
 case $(uname -m) in x86_64) platform=linux/amd64;; aarch64) platform=linux/arm64;; *) echo 'unsupported native architecture' >&2; exit 1;; esac
-run() { local name=$1; shift; "$@" >"$run_dir/logs/$name.log" 2>&1; }
+run() { local name=$1; shift; puffer_timed "$run_dir" "$name" "$run_dir/logs/$name.log" "$@"; }
 cd "$worktree"
 git rev-parse --is-inside-work-tree >/dev/null
 if ! git diff --quiet HEAD -- tools/maintainer .github || [[ -n $(git ls-files --others --exclude-standard -- tools/maintainer .github) ]]; then

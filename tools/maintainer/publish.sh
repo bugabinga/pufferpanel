@@ -8,15 +8,18 @@ worktree=$(realpath -e "$1"); version=$2; run_dir=$(realpath -e "$3")
 [[ -z $(git -C "$worktree" status --porcelain) ]] || { echo 'worktree must be clean' >&2; exit 1; }
 sha=$(git -C "$worktree" rev-parse HEAD)
 state_dir=$(dirname "$(dirname "$run_dir")")
-mkdir -p "$state_dir/podman/root" "$state_dir/podman/runroot" "$run_dir/logs"
-podman=(podman --root "$state_dir/podman/root" --runroot "$state_dir/podman/runroot" --storage-driver "${PUFFER_MAINT_STORAGE_DRIVER:-overlay}")
+module=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$module/podman.sh"
+mkdir -p "$run_dir/logs"
+puffer_podman_init "$state_dir"
+podman=("${PUFFER_MAINT_PODMAN[@]}")
 case $(uname -m) in x86_64) platform=linux/amd64;; aarch64) platform=linux/arm64;; *) echo 'unsupported native architecture' >&2; exit 1;; esac
 registry=${PUFFER_MAINT_REGISTRY:-registry.bugabinga.net/pufferpanel}
 [[ "$registry" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?/[a-z0-9/_.-]+$ ]] || { echo 'invalid registry image name' >&2; exit 64; }
 host=${registry%%/*}; repository=${registry#*/}
 image="$registry:$version"; latest="$registry:latest"
 accept='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
-log() { "$@" >>"$run_dir/logs/publish.log" 2>&1; }
+log() { puffer_timed_append "$run_dir" publish-podman "$run_dir/logs/publish.log" "$@"; }
 local_id() {
   local value
   value=$("${podman[@]}" image inspect "$image" --format '{{.Id}}')

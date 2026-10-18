@@ -12,6 +12,7 @@ import { CodingTools } from '@earendil-works/pi-durable/tools';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels } from './maintain.mjs';
+import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
 async function scratch(t) { const dir = await mkdtemp(join(tmpdir(), 'maintainer-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
@@ -34,12 +35,28 @@ test('actual SQLite resumes old run without duplicate admission', async t => {
   assert.equal(run.day, '2026-04-03'); assert.equal(run.phase, 'published'); assert.equal(resumed.state.admitted, 0);
   await second.harness.close(ctx);
 });
+test('deterministic PR source refusal is classified before admission; stale/network errors are not cached', async t => {
+  for (const [message, rejection] of [['unsupported PR merge history', 'unsupported-history'], ['PR introduced trusted harness or CI changes', 'protected-history'], ['PR base not ancestor of head', 'non-descendant'], ['GitHub read unavailable', null], ['fetched PR head changed', null]]) {
+    const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
+    const h = hooks({ prepare: async () => { throw Error(message); }, execute: () => assert.fail('source refused before any model') });
+    await assert.rejects(advance(root, { ...h, day: '2026-04-03' }));
+    assert.equal((await getRun(root, harness)).sourceRejection, rejection); assert.equal(h.state.admitted, 0);
+    await harness.close(ctx);
+  }
+});
 test('no-op is idempotent today and starts a fresh run tomorrow', async t => {
   const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
   const h = hooks({ execute: async () => ({ base: 'c1', head: 'c1', tree: 't1', diff: '', changed: false, cost: 0 }) });
   await advance(root, { ...h, day: '2026-04-03' }); await advance(root, { ...h, day: '2026-04-03' });
   assert.equal(h.state.admitted, 1); assert.equal(h.state.gate + h.state.publish, 0);
   await advance(root, { ...h, day: '2026-04-04' }); assert.equal(h.state.admitted, 2);
+  await harness.close(ctx);
+});
+test('approved management-only run defers gates, commit, and publication', async t => {
+  const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
+  const h = hooks({ execute: async () => ({ base: 'c1', head: 'c1', tree: 't1', diff: '', changed: false, management: true, cost: 0 }), inspect: async () => ({ head: 'c1', tree: 't1', diff: '', protected: false }) });
+  const run = await advance(root, { ...h, day: '2026-04-03' });
+  assert.equal(run.phase, 'managing'); assert.equal(h.state.gate + h.state.publish, 0);
   await harness.close(ctx);
 });
 test('malformed, rejecting, and contradictory reviews never reach gate', async t => {
@@ -49,6 +66,21 @@ test('malformed, rejecting, and contradictory reviews never reach gate', async t
     assert.equal((await advance(root, { ...h, day: '2026-04-03' })).phase, 'rejected');
     assert.equal(h.state.gate + h.state.publish, 0); await harness.close(ctx);
   }
+});
+test('review checkpoint distinguishes invalid output from findings and retains findings without gates', async t => {
+  for (const [answer, reason, findings] of [['not json', 'invalid-review', []], ['{"approve":false,"findings":["unsafe change"]}', 'review-rejected', ['unsafe change']], ['{"approve":true,"findings":["unsafe change"]}', 'contradictory-review', ['unsafe change']]]) {
+    const { harness, root } = await open(join(await scratch(t), 'run.sqlite')); const h = hooks({ review: async () => ({ answer, cost: 1 }) });
+    const run = await advance(root, { ...h, day: '2026-04-03' });
+    assert.equal(run.phase, 'rejected'); assert.equal(run.review.reason, reason); assert.deepEqual(run.review.findings, findings); assert.equal(run.modelPhaseCost.reviewing.cost, 1); assert.equal(h.state.gate, 0);
+    await harness.close(ctx);
+  }
+});
+test('failed model phase accounts durable reported usage instead of claiming zero', async t => {
+  const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
+  const h = hooks({ execute: async () => { throw Error('model request failed'); }, reportedUsage: async () => 2 });
+  await assert.rejects(advance(root, { ...h, day: '2026-04-03' }), /model request failed/);
+  const run = await getRun(root, harness); assert.equal(run.phase, 'failed'); assert.equal(run.spent, 2); assert.deepEqual(run.modelPhaseCost.executing, { cost: 2, status: 'known' });
+  await harness.close(ctx);
 });
 test('protected edits, unknown cost, budget and deadline block effects', async t => {
   for (const override of [
@@ -97,23 +129,37 @@ test('real faux coding/reviewer turns, host commit, and SQLite daily idempotency
   await writeFile(join(source, 'value.txt'), 'before'); git('add', '.'); git('commit', '-qm', 'initial'); git('remote', 'add', 'upstream', source);
   const state = join(dir, 'state'); await mkdir(state); const worktree = await ensureWorktree(source, state);
   const faux = fauxProvider(); const models = createModels(); models.setProvider(faux.provider);
+  const savedSecrets = Object.fromEntries(['GH_TOKEN', 'ANNIE_GH_TOKEN', 'ZAI_API_KEY', 'REGISTRY_PASSWORD', 'GITHUB_ACTIONS'].map(key => [key, process.env[key]]));
+  delete process.env.GITHUB_ACTIONS; // Local faux runtime, including when this test runs on Actions.
+  Object.assign(process.env, { GH_TOKEN: 'gh-sentinel', ANNIE_GH_TOKEN: 'annie-sentinel', ZAI_API_KEY: 'zai-sentinel', REGISTRY_PASSWORD: 'registry-sentinel' });
+  t.after(() => { for (const [key, value] of Object.entries(savedSecrets)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
   faux.setResponses([
+    fauxAssistantMessage(fauxToolCall('bash', { command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$ZAI_API_KEY$REGISTRY_PASSWORD" && test -n "$PATH$HOME$TMPDIR" && test -n "$PUFFER_MAINT_INTAKE"' }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('write', { path: 'value.txt', content: 'after' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('propose_github', { actions: [{ kind: 'create-issue', title: 'Track fixture', body: 'Known body' }] }), { stopReason: 'toolUse' }),
     fauxAssistantMessage('Fixed value.'),
+    fauxAssistantMessage(fauxToolCall('read_github_plans', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('diff', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage('{"approve":true,"findings":[]}'),
   ]);
   const registry = createRegistry(); registry.install(CodingTools); const reviewerExtension = installReviewer(registry, worktree);
   const policy = {};
-  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(models, policy), registry, settings: { extensions: [CodingTools] }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
+  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(new Proxy(models, { get(target, key) {
+    if (key === 'streamSimple') return (model, transcript, options) => { options.onProviderStreamEvent({ usage: { prompt_tokens: 0, completion_tokens: 0 } }, model); return target.streamSimple(model, transcript, options); };
+    const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+  } }), policy), registry, settings: { extensions: [CodingTools] }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
   const root = await harness.root(ctx); Object.assign(policy, { root, harness });
+  const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc }); const githubPlanReader = installGitHubPlanReader(registry, root);
   const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: 'faux', modelId: 'faux-1' } };
-  const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, instructions: 'Test coding fixture.' });
+  const fixtureFetch = async url => ({ ok: true, status: 200, headers: new Headers(), json: async () => url.includes('/git/ref/') ? { object: { sha: git('rev-parse', 'HEAD') } } : url.includes('/repos/') && !url.includes('/issues') && !url.includes('/pulls') ? { default_branch: 'main' } : [] });
+  const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, policy, instructions: 'Test coding fixture.', snapshotHttp: fixtureFetch, upstreamUrl: source });
   let gated = 0, published = 0;
   host.gate = async () => { gated++; }; host.publish = async () => { published++; };
   const run = await advance(root, { harness, ...host, day: '2026-04-03' });
   assert.equal(run.phase, 'published'); assert.equal(gated, 1); assert.equal(published, 1); assert.ok(run.reviewer);
+  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 7);
   assert.equal(await readFile(join(worktree, 'value.txt'), 'utf8'), 'after'); assert.equal(await readFile(join(source, 'value.txt'), 'utf8'), 'before');
+  assert.equal((await harness.snapshot(GitHubPlansDoc, root.id, ctx)).plans.length, 1);
   assert.equal(await reconcileCommit(worktree, { ...run, head: run.base }), run.commit);
   await advance(root, { harness, ...host, day: '2026-04-03' }); assert.equal(published, 1);
   await harness.close(ctx);
