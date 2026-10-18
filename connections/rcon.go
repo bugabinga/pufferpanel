@@ -2,12 +2,13 @@ package connections
 
 import (
 	"errors"
-	"fmt"
+	"io"
+	"net"
+	"time"
+
 	"github.com/gorcon/rcon"
 	"github.com/pufferpanel/pufferpanel/v3/logging"
 	"github.com/pufferpanel/pufferpanel/v3/utils"
-	"io"
-	"time"
 )
 
 type RCONConnection struct {
@@ -74,7 +75,8 @@ func (tc *RCONConnection) recon(init bool) {
 	}
 
 	var err error
-	tc.connection, err = rcon.Dial(fmt.Sprintf("%s:%s", tc.IP, tc.Port), tc.Password)
+	// IPv6 literals must be bracketed or the dial target is invalid; see the matching nodeHostPort fix in services
+	tc.connection, err = rcon.Dial(net.JoinHostPort(tc.IP, tc.Port), tc.Password)
 	if err != nil {
 		logging.Debug.Printf("Error connecting to RCON: %s", err.Error())
 		return

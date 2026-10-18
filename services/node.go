@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/websocket"
@@ -184,6 +186,20 @@ func (ns *Node) CallNode(node *models.Node, method string, path string, body io.
 	return response, err
 }
 
+// nodeHostPort renders a node host and port as a dial-style address.
+// IPv6 literals are bracketed, so a host like fc00::1 no longer produces the
+// invalid dial address fc00::1:5656 ("too many colons in address") when the
+// panel proxies to a node, see upstream issue #1478. Hosts that operators
+// stored already bracketed, the workaround that issue documents, pass through
+// unchanged instead of being wrapped twice.
+func nodeHostPort(host string, port uint16) string {
+	portString := strconv.FormatUint(uint64(port), 10)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host + ":" + portString
+	}
+	return net.JoinHostPort(host, portString)
+}
+
 func (ns *Node) OpenSocket(node *models.Node, path string, writer http.ResponseWriter, request *http.Request) error {
 	conn, err := wsupgrader.Upgrade(writer, request, nil)
 	if err != nil {
@@ -199,9 +215,7 @@ func (ns *Node) OpenSocket(node *models.Node, path string, writer http.ResponseW
 	if ssl {
 		scheme = "wss"
 	}
-	addr := fmt.Sprintf("%s:%d", node.PrivateHost, node.PrivatePort)
-
-	u := fmt.Sprintf("%s://%s%s", scheme, addr, path)
+	u := fmt.Sprintf("%s://%s%s", scheme, nodeHostPort(node.PrivateHost, node.PrivatePort), path)
 	logging.Debug.Printf("Proxying connection to %s", u)
 
 	ts, err := NewTokenService()
@@ -247,7 +261,7 @@ func doesDaemonUseSSL(node *models.Node) (bool, error) {
 		return false, nil
 	}
 
-	path := fmt.Sprintf("://%s:%d/daemon", node.PrivateHost, node.PrivatePort)
+	path := "://" + nodeHostPort(node.PrivateHost, node.PrivatePort) + "/daemon"
 
 	//we want to do options so we can avoid auth
 	u, err := url.Parse("https" + path)
@@ -286,7 +300,7 @@ func createNodeURL(node *models.Node, path string) (string, error) {
 		protocol = "https"
 	}
 
-	return fmt.Sprintf("%s://%s:%d/%s", protocol, node.PrivateHost, node.PrivatePort, path), nil
+	return fmt.Sprintf("%s://%s/%s", protocol, nodeHostPort(node.PrivateHost, node.PrivatePort), path), nil
 }
 
 func proxyRead(source, dest *websocket.Conn, ch chan error) {
