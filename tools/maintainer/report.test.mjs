@@ -77,6 +77,17 @@ test('management kind survives serialization and hash-shaped known secrets never
   assert.equal(masked.day, null); assert.equal(masked.fingerprint, null); assert.equal(masked.sourceIdentity.diffHash, null);
   assert.equal(JSON.stringify(masked).includes(key), false);
 });
+test('sarcastic voice keeps no-op and failed outcomes explicit', async t => {
+  const dir = await scratch(t); const input = join(dir, 'input.json'); const summary = join(dir, 'summary.md');
+  await writeFile(input, JSON.stringify({ phase: 'published', commit: null, spent: 0, reportedUsage: 0 }));
+  await collect({ reportPath: input, reportDir: join(dir, 'noop'), summaryPath: summary });
+  const noop = await readFile(summary, 'utf8');
+  assert.match(noop, /incident ledger/); assert.match(noop, /do not breed commits for sport/); assert.match(noop, /no-op, not released/);
+  await writeFile(input, JSON.stringify({ phase: 'failed', reason: 'budget-or-deadline', spent: 1 }));
+  await collect({ reportPath: input, reportDir: join(dir, 'failed'), summaryPath: summary });
+  const failed = await readFile(summary, 'utf8');
+  assert.match(failed, /Optimism has been escorted off/); assert.match(failed, /Outcome: \*\*failed\*\*/); assert.match(failed, /budget-or-deadline/);
+});
 test('missing report creates truthful interrupted fallback only in explicit artifact directory', async t => {
   const dir = await scratch(t); const out = join(dir, 'artifact');
   const result = await collect({ reportPath: join(dir, 'missing.json'), reportDir: out });

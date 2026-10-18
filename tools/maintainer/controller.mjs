@@ -402,7 +402,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state);
   const summary = { state, mode, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint };
   await writeFile(join(dir, 'observer.json'), JSON.stringify(summary));
-  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## 🌻 Annie: ${state}\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}.\n`, { flag: 'a' });
+  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}.\n`, { flag: 'a' });
   return summary;
 }
 export async function verifyUploadedLease({ env = process.env, fetchImpl = fetch, now = Date.now() } = {}) {
@@ -429,7 +429,7 @@ export async function retryEffects({ env = process.env, fetchImpl = fetch, now =
   const job = jobs.find(job => job.id === plan.jobId);
   if (job?.name !== 'Annie effects (model-free)' || !['failure', 'cancelled', 'timed_out'].includes(job.conclusion)) fail('not an isolated effects job');
   await api.request(`/repos/${OWN}/actions/jobs/${plan.jobId}/rerun`, { method: 'POST' });
-  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## 🌻 Annie: model-free retry dispatched\n\nOriginal run: ${plan.runId}; effects job: ${plan.jobId}; no model lease.\n`, { flag: 'a' });
+  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: model-free retry dispatched\n\nOriginal run: ${plan.runId}; effects job: ${plan.jobId}; no model lease.\n`, { flag: 'a' });
   return { state: 'effects-retry-dispatched', runId: plan.runId, jobId: plan.jobId };
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) (process.argv[2] === 'retry' ? retryEffects() : process.argv[2] === 'verify-upload' ? verifyUploadedLease() : controller()).then(value => console.log(JSON.stringify(value))).catch(async error => {
@@ -439,5 +439,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     await mkdir(process.env.ANNIE_OUTPUT_DIR, { recursive: true, mode: 0o700 });
     await writeFile(join(process.env.ANNIE_OUTPUT_DIR, 'observer.json'), JSON.stringify({ state: 'blocked', paid: false, reason }));
   }
-  if (process.env.GITHUB_STEP_SUMMARY) await writeFile(process.env.GITHUB_STEP_SUMMARY, `## 🌻 Annie: blocked, unpaid\n\n${reason}.\n`, { flag: 'a' });
+  if (process.env.GITHUB_STEP_SUMMARY) await writeFile(process.env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: blocked, unpaid\n\nEven I cannot bully missing evidence into existence.\n${reason}.\n`, { flag: 'a' });
 });

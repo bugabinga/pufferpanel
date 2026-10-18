@@ -21,7 +21,7 @@ export function validatePlan(plan, run) {
   if (JSON.stringify(actions) !== JSON.stringify(plan.actions) || actions.some(a => a.kind === 'enable-issues') && plan.taskKind !== 'management') throw Error('management artifact not sanitized or authorized');
   return actions;
 }
-const footer = '\n\n🌻 Annie, automated maintainer.';
+const footer = '\n\n☠️ Annie, automated maintainer. I tidy up what optimism leaves behind.';
 export async function executePlan(plan, run, { fetchImpl = fetch, token = process.env.GH_TOKEN, adminToken = process.env.ANNIE_GH_TOKEN } = {}) {
   const actions = validatePlan(plan, run);
   const receipts = [];

@@ -19,7 +19,7 @@ export async function reviewFeedback(run, task, { fetchImpl = fetch, token = pro
   if (!Array.isArray(reviews)) throw Error('feedback idempotence coverage unknown');
   if (reviews.some(review => review.commit_id === task.head && review.body?.includes(marker))) return { kind: 'review-comment', number: task.number, status: 'skipped', reason: 'already-applied' };
   await current();
-  const body = `🌻 Automated read-only review found blockers:\n${findings.map(finding => `* ${finding}`).join('\n')}\n\nAnnie, automated maintainer.\n${marker}`;
+  const body = `☠️ Automated read-only review: blockers found. Confidence is not a test suite.\n${findings.map(finding => `* ${finding}`).join('\n')}\n\nAnnie, automated maintainer. Fix the evidence, not the verdict.\n${marker}`;
   let response;
   try { response = await fetchImpl(`https://api.github.com/repos/${OWN}/pulls/${task.number}/reviews`, { method: 'POST', headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'honest-annie', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ commit_id: task.head, event: 'COMMENT', body }), signal: AbortSignal.timeout(10000) }); } catch { throw Error('feedback unavailable'); }
   if (!response.ok) throw Error(`feedback http-${response.status}`);
