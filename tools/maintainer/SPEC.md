@@ -45,6 +45,8 @@ A failed or rejected candidate cannot release.
 Actions summaries and explicitly selected sanitized artifacts are the reporting surface.
 Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, and verified release.
 Require a complete reviewer response matching the strict JSON verdict schema.
+Allow reviewer responses up to 32,768 output tokens, clamped to the selected model's limit; executor responses remain capped at 4,000 tokens.
+Reserve the full phase-specific output ceiling before dispatch, inside the unchanged shared budget and original deadline.
 Permit at most one same-reviewer format correction for malformed or incomplete output, within the original paid budget and deadline; never retry substantive rejection or contradictory findings as formatting.
 Retain bounded stop-reason, text-length, and verdict diagnostics, not raw reviewer answers.
 Recognizable substantive or contradictory rejection remains terminal even when the provider marks that response truncated.

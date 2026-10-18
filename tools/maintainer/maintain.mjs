@@ -241,7 +241,9 @@ export function budgetModels(runtime, state) {
           run = await getRun(state.root, state.harness);
           const spent = (await nativeUsage(state.harness, state.root, run)).held;
           if (!model.cost || !['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isFinite(model.cost[key]) && model.cost[key] >= 0)) fail('provider pricing unknown');
-          const estimate = (model.contextWindow * Math.max(model.cost.input, model.cost.cacheRead, model.cost.cacheWrite) + 4000 * model.cost.output) / 1_000_000;
+          const maxTokens = Math.min(model.maxTokens ?? 32768, run.phase === 'reviewing' ? 32768 : 4000);
+          if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) fail('provider output limit unknown');
+          const estimate = (model.contextWindow * Math.max(model.cost.input, model.cost.cacheRead, model.cost.cacheWrite) + maxTokens * model.cost.output) / 1_000_000;
           withinBudget({ ...run, spent }, Date.now(), reserved + estimate);
           if (process.env.GITHUB_ACTIONS === 'true' && (process.env.GITHUB_RUN_ATTEMPT !== '1' || !run.ledgerReservation)) fail('paid attempt requires original prepaid lease');
           reserved += estimate; reservation = estimate;
@@ -266,7 +268,7 @@ export function budgetModels(runtime, state) {
             }
             await options.onProviderStreamEvent?.(chunk, providerModel);
           };
-          for await (const event of target.streamSimple(model, transcript, { ...options, maxRetries: 0, maxTokens: 4000, onProviderStreamEvent })) {
+          for await (const event of target.streamSimple(model, transcript, { ...options, maxRetries: 0, maxTokens, onProviderStreamEvent })) {
             if (event.type === 'error' || options.signal?.aborted) invalid = true;
             if (event.type === 'error') await state.root.commit(async tx => { const doc = await tx.doc(CallsDoc, state.root.id); if (doc.requestId === run.requestId && doc.calls[callId]) doc.calls[callId].failure = modelFailureKind(event.error?.errorMessage); }, ctx);
             if (event.type === 'done') {

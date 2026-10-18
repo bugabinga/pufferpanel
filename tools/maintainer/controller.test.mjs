@@ -199,6 +199,21 @@ async function modelFixture(t, behavior, extra = {}, selectedModel = null) {
 }
 const goodMessage = { role: 'assistant', content: [], stopReason: 'stop', usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 200, cost: { total: 0.0002 } } };
 function stream(events) { const result = createAssistantMessageEventStream(); queueMicrotask(() => { for (const event of events) result.push(event); result.end(); }); return result; }
+test('review reasoning capacity reserves full phase-specific output cost before dispatch', async t => {
+  for (const [phase, ceiling, expected] of [['executing', 65536, 4000], ['reviewing', 65536, 32768], ['reviewing', 8192, 8192]]) {
+    const model = { api: 'test', provider: 'test', id: 'test', contextWindow: 1000, maxTokens: ceiling, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } };
+    const fixture = await modelFixture(t, (selected, transcript, options) => {
+      assert.equal(options.maxTokens, expected); assert.equal(options.maxRetries, 0);
+      options.onProviderStreamEvent({ usage: { prompt_tokens: 100, completion_tokens: 100 } }, selected);
+      return stream([{ type: 'done', reason: 'stop', message: goodMessage }]);
+    }, { phase }, model);
+    assert.equal((await fixture.execute()).called, 1);
+    const calls = await fixture.harness.snapshot(CallsDoc, fixture.root.id, ctx);
+    assert.equal(calls.calls[0].cap, (1000 + expected) / 1_000_000);
+  }
+  const insufficient = await modelFixture(t, () => assert.fail('full reviewer reservation exceeds remainder'), { phase: 'reviewing', budgetCap: 0.01 });
+  const blocked = await insufficient.execute(); assert.equal(blocked.called, 0); assert.match(blocked.result.errorMessage, /budget/);
+});
 test('durable provider accounting settles real done; synthetic zero failed SSE stays unknown', async t => {
   const good = await modelFixture(t, (model, transcript, options) => { options.onProviderStreamEvent({ usage: { prompt_tokens: 100, completion_tokens: 100 } }, model); return stream([{ type: 'done', reason: 'stop', message: goodMessage }]); });
   const done = await good.execute(); assert.equal(done.usage.usageComplete, true); assert.equal(done.usage.cost, 0.0002); assert.equal(done.called, 1);
