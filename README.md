@@ -1,34 +1,25 @@
-# PufferPanel [![Release](https://img.shields.io/github/release/PufferPanel/PufferPanel.svg?maxAge=3600)](https://github.com/PufferPanel/PufferPanel/releases) [![Downloads](https://img.shields.io/github/downloads/PufferPanel/PufferPanel/total.svg?maxAge=3600)](https://github.com/PufferPanel/PufferPanel/releases) ![Build](https://github.com/PufferPanel/PufferPanel/workflows/Build/badge.svg)
+# PufferPanel · bugabinga fork
 
-[![PufferPanel logo](https://raw.githubusercontent.com/pufferpanel/www/master/logo-alt.png "PufferPanel")](https://pufferpanel.com)
+Personal fork of [PufferPanel](https://github.com/pufferpanel/pufferpanel), a web-based game server management panel.
 
-[Website](https://pufferpanel.com) |
-[Discord](https://discord.gg/v8dz49e) |
-[Documentation](https://docs.pufferpanel.com/) |
-[Translations](https://crowdin.com/project/pufferpanel)
+## Use
 
-## What is PufferPanel?
-PufferPanel is a web-based Game Server Management System. PufferPanel allows you to manage multiple different game servers all from one central location. You can give other users their own servers or allow them to access to your servers.
+Container image: `registry.bugabinga.net/pufferpanel:latest`.
+Dated releases use `Y.M.D` tags; pin a digest for reproducible deployments.
 
-## Installation
-Please follow the installation guide for PufferPanel located [here](https://docs.pufferpanel.com/en/latest/installing.html).
+[Upstream documentation](https://docs.pufferpanel.com/) covers installation and configuration.
+[Annie](tools/maintainer/README.md) handles this fork's automated maintenance through independent review, tests, and gated publication.
 
-### What's different about PufferPanel?
-In addition to being a free and open source project, PufferPanel provides an easy-to-use interface for everyone from individual users to large networks. We strive to create a friendly community, and we would love for you to join us.
+## Contributions
 
-## Having issues or want to help?
-If you need help with PufferPanel, or you'd like to help out, you can contact us on [Discord](https://discord.gg/v8dz49e). Check out our [Documentation](https://docs.pufferpanel.com/) for guides on how to install, update, and manage PufferPanel.
+AI-assisted contributions are welcome here.
+Changes need clear reasoning, appropriate tests, and compatible licensing, regardless of how they were written.
+Contributors remain responsible for their submissions.
 
-## Copyright Notices
-Some Javascript and CSS used is licensed under a MIT, Apache 2.0, or GPL license. Please check their header files for information.
+This policy applies only to this fork.
+Respect upstream's contribution policy when submitting work there.
 
-Some images used within PufferPanel are Copyright (c) their respective owners.
+## License
 
-## Water Provided By
-
-Repositories hosted by [packagecloud](https://packagecloud.io)
-
-## AI Generated Content
-
-We do not accept AI generated content in any form. If we suspect something was done by AI, we will reject it. This includes PR requests,
-security advisories, and issues.
+[Apache 2.0](LICENSE).
+Third-party JavaScript, CSS, and images retain their respective licenses and copyright notices.
