@@ -108,6 +108,7 @@ export async function advance(root, options) {
   }
   if (run && !terminal(run) && !['committing', 'publishing'].includes(run.phase) && now() - run.startedAt > 7_200_000) {
     await root.abort(ctx);
+    run.usageComplete = false; run.reportedUsage = null;
     setPhase(run, 'failed', now()); run.reason = 'two-hour-deadline-exceeded';
     await putRun(root, run);
   }
@@ -131,6 +132,7 @@ export async function advance(root, options) {
       setPhase(run, 'executing', now()); await putRun(root, run);
     }
     if (run.phase === 'executing') {
+      run.usageComplete = false; run.reportedUsage = null; await putRun(root, run);
       const result = await options.execute(run);
       withinBudget(run, now(), result.cost);
       run.spent += result.cost; phaseCost(run, 'executing', result.cost);
@@ -139,6 +141,7 @@ export async function advance(root, options) {
       if (!run.changed && !run.management) { await updateReportedUsage(run, options); await putRun(root, run); return run; }
     }
     if (run.phase === 'reviewing') {
+      run.usageComplete = false; run.reportedUsage = null; await putRun(root, run);
       const current = await options.inspect();
       if (current.head !== run.head || hash(current.diff ?? '') !== run.diffHash || current.protected) fail('source changed before review');
       const result = await options.review(run);
@@ -308,7 +311,8 @@ export function createHostHooks({ root, harness, worktree, state, models, review
   const ask = async (conversation, requestId, content) => {
     const settled = await (await conversation.submit({ type: 'input', requestId, content }, ctx)).wait(ctx);
     if (settled.status !== 'done' || settled.type !== 'input') fail(`model request failed: ${settled.reason ?? settled.status} ${settled.detail ?? ''}`);
-    return answerText(await conversation.commit(tx => tx.entry(AssistantEntry, settled.answer), ctx));
+    const entry = await conversation.commit(tx => tx.entry(AssistantEntry, settled.answer), ctx);
+    return { answer: answerText(entry), stopReason: entry?.model?.[0]?.stopReason ?? null };
   };
   const usage = async run => policy.nativeAccounting ? nativeUsage(harness, root, run) : { cost: usageCost(await harness.usage(ctx)) - (run.usageStart ?? 0), usageComplete: true };
   const spent = async run => { const value = await usage(run); if (value.cost === null) fail('model request failed: usage unknown'); return value.cost; };
@@ -370,8 +374,18 @@ export function createHostHooks({ root, harness, worktree, state, models, review
         }, ctx);
       }
       const reviewer = await harness.conversation(run.reviewer, ctx);
-      const answer = await ask(reviewer, `${run.requestId}:review`, `Inspect full diff, affected callers/tests, and read_github_plans when plans exist. Expected source parents: ${JSON.stringify(run.expectedParents)}; pinned upstream: ${run.upstreamSha ?? 'none'}. A merge can change ancestry even when its tree diff is empty. Return ONLY JSON {"approve":true,"findings":[]} if no blocking findings; otherwise {"approve":false,"findings":["specific problems"]}.`);
-      return { answer, cost: (await spent(run)) - run.spent };
+      let response = await ask(reviewer, `${run.requestId}:review`, `Inspect full diff, affected callers/tests, and read_github_plans when plans exist. Expected source parents: ${JSON.stringify(run.expectedParents)}; pinned upstream: ${run.upstreamSha ?? 'none'}. A merge can change ancestry even when its tree diff is empty. Return ONLY JSON {"approve":true,"findings":[]} if no blocking findings; otherwise {"approve":false,"findings":["specific problems"]}. No Markdown fences or surrounding prose.`);
+      const diagnostic = value => {
+        const verdict = parseReview(value.answer).reason;
+        return { stopReason: value.stopReason, textLength: value.answer.length, verdict: value.stopReason === 'stop' || ['review-rejected', 'contradictory-review'].includes(verdict) ? verdict : 'incomplete-review' };
+      };
+      run.reviewDiagnostics = [diagnostic(response)];
+      if (['invalid-review', 'incomplete-review'].includes(run.reviewDiagnostics[0].verdict)) {
+        await putRun(root, run);
+        response = await ask(reviewer, `${run.requestId}:review-format`, 'Your final response was incomplete or did not match the verdict schema. Reissue your independent review as ONLY JSON {"approve":true,"findings":[]} or {"approve":false,"findings":["specific problems"]}. No Markdown fences or surrounding prose. Preserve every blocking finding from your review; do not change a negative verdict to satisfy formatting. Reject unsafe, unverified, or uncertain changes. This is the only format correction attempt.');
+        run.reviewDiagnostics.push(diagnostic(response));
+      }
+      return { answer: response.stopReason === 'stop' || ['review-rejected', 'contradictory-review'].includes(run.reviewDiagnostics.at(-1).verdict) ? response.answer : '', cost: (await spent(run)) - run.spent };
     },
     gate: async run => {
       const dir = runDirectory(run); await mkdir(dir, { recursive: true, mode: 0o700 });

@@ -42,12 +42,12 @@ test('lease pins original task, cap, creation-anchored absolute deadline; queued
 });
 test('rolling24h known complete REPLACES reservation; partial/missing/interrupted retains entire cap across midnight', () => {
   const l = lease(), settledAt = new Date(now + HOUR).toISOString();
-  const known = { ledgerReservation: l.hash, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
+  const known = { phase: 'rejected', ledgerReservation: l.hash, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
   const entry = { lease: l, settlement: known, settledAt };
   assert.equal(rollingAllowance([entry], now + 20 * HOUR), 13);
   assert.equal(rollingAllowance([entry], now + 24.5 * HOUR), 13);
   assert.equal(rollingAllowance([entry], now + 25 * HOUR), 15);
-  for (const settlement of [null, { ...known, usageComplete: false }, { ...known, ledgerReservation: 'x' }, { ...known, reportedUsage: { status: 'unknown' }, knownSubtotal: 2 }]) assert.equal(rollingAllowance([{ ...entry, settlement }], now + 20 * HOUR), 0);
+  for (const settlement of [null, { ...known, usageComplete: false }, { ...known, ledgerReservation: 'x' }, { ...known, reportedUsage: { status: 'unknown' }, knownSubtotal: 2 }, ...['admitted', 'executing', 'reviewing', undefined].map(phase => ({ ...known, phase }))]) assert.equal(rollingAllowance([{ ...entry, settlement }], now + 20 * HOUR), 0);
   assert.equal(rollingAllowance([{ ...entry, settlement: null }], now + 26 * HOUR), 0);
   assert.equal(rollingAllowance([{ ...entry, settlement: null }], now + 26 * HOUR + 300001), 15);
   assert.equal(rollingAllowance([{ ...entry, terminal: false }], now + 30 * HOUR), 0);
@@ -56,7 +56,7 @@ test('rolling24h known complete REPLACES reservation; partial/missing/interrupte
 test('unknown attempt and later known retry charge independently; no full-cap refund funds replacement', () => {
   const original = makeLease({ run, repoId: 7, workflowId: 8, task, cap: 10, now }), replacement = makeLease({ run: { ...run, id: 43 }, repoId: 7, workflowId: 8, task, cap: 5, now });
   const settledAt = new Date(now).toISOString();
-  const settlement = { ledgerReservation: replacement.hash, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
+  const settlement = { phase: 'published', ledgerReservation: replacement.hash, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
   assert.equal(rollingAllowance([{ lease: original, settlement: null }, { lease: replacement, settlement, settledAt }], now), 3);
   assert.equal(rollingAllowance([{ lease: lease(), settlement: null }, { lease: replacement, settlement, settledAt }], now), 0);
 });

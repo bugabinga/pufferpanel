@@ -44,6 +44,13 @@ A failed or rejected candidate cannot release.
 
 Actions summaries and explicitly selected sanitized artifacts are the reporting surface.
 Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, and verified release.
+Require a complete reviewer response matching the strict JSON verdict schema.
+Permit at most one same-reviewer format correction for malformed or incomplete output, within the original paid budget and deadline; never retry substantive rejection or contradictory findings as formatting.
+Retain bounded stop-reason, text-length, and verdict diagnostics, not raw reviewer answers.
+Recognizable substantive or contradictory rejection remains terminal even when the provider marks that response truncated.
+Clear prior usage completeness before model dispatch or resume; active-model and explicitly interrupted reports cannot settle partial subtotals.
+Intermediate review/format-correction checkpoints remain unknown-cost until final accounting is refreshed.
+A second invalid or incomplete response remains a bot failure with no gate, source commit, or publication.
 Report reasons, bounded reviewer findings, relevant issue/PR identifiers, source/tree hashes, phase and gate timings, model usage/cost, and publication receipts.
 Retain useful failure diagnostics even when execution throws or the runner is interrupted.
 Never upload raw model transcripts, SQLite, environment dumps, credential files, or unchecked command logs.

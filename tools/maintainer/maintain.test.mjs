@@ -75,6 +75,28 @@ test('review checkpoint distinguishes invalid output from findings and retains f
     await harness.close(ctx);
   }
 });
+test('resumed model work invalidates old settlement before dispatch and phase transition', async t => {
+  const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
+  const reportedUsage = async run => { run.usageComplete = true; return 2; };
+  const first = hooks({ inspect: async () => { throw Error('temporary inspection unavailable'); }, reportedUsage });
+  await assert.rejects(advance(root, { ...first, day: '2026-04-03' }), /temporary inspection/);
+  const stale = await getRun(root, harness);
+  assert.equal(stale.phase, 'reviewing'); assert.equal(stale.usageComplete, true); assert.equal(stale.reportedUsage, 2);
+  const checkpoints = [];
+  root._maintainerOnCheckpoint = async run => checkpoints.push(structuredClone(run));
+  const resumed = hooks({ reportedUsage, review: async () => {
+    const beforeDispatch = await getRun(root, harness);
+    assert.equal(beforeDispatch.usageComplete, false); assert.equal(beforeDispatch.reportedUsage, null);
+    return { answer: '{"approve":true,"findings":[]}', cost: 0 };
+  } });
+  const done = await advance(root, { ...resumed, day: '2026-04-03' });
+  assert.equal(done.phase, 'published'); assert.equal(done.usageComplete, true); assert.equal(done.reportedUsage, 2);
+  assert.ok(checkpoints.some(run => run.phase === 'gating'));
+  for (const run of checkpoints.filter(run => ['reviewing', 'gating'].includes(run.phase))) {
+    assert.equal(run.usageComplete, false); assert.equal(run.reportedUsage, null);
+  }
+  await harness.close(ctx);
+});
 test('failed model phase accounts durable reported usage instead of claiming zero', async t => {
   const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
   const h = hooks({ execute: async () => { throw Error('model request failed'); }, reportedUsage: async () => 2 });
@@ -123,7 +145,18 @@ function repo(path) {
   const command = (...args) => execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
   return command;
 }
-test('real faux coding/reviewer turns, host commit, and SQLite daily idempotency', async t => {
+test('real faux coding/reviewer turns, bounded format correction, host commit, and SQLite idempotency', async t => {
+  const approval = '{"approve":true,"findings":[]}';
+  for (const scenario of [
+    { name: 'valid final verdict after tool rounds', answers: [approval], approved: true },
+    { name: 'one format correction preserves strict JSON gate', answers: ['```json\n' + approval + '\n```', approval], approved: true },
+    { name: 'second malformed verdict stays rejected', answers: ['not JSON', 'still not JSON'], approved: false, reason: 'invalid-review' },
+    { name: 'truncated valid-looking JSON needs complete final verdict', answers: [approval, approval], firstStop: 'length', approved: true },
+    { name: 'genuine findings never trigger format correction', answers: ['{"approve":false,"findings":["unsafe change"]}'], approved: false, reason: 'review-rejected' },
+    { name: 'truncated rejection never triggers format correction', answers: ['{"approve":false,"findings":["unsafe change"]}'], firstStop: 'length', approved: false, reason: 'review-rejected' },
+    { name: 'contradictory findings never trigger format correction', answers: ['{"approve":true,"findings":["unsafe change"]}'], approved: false, reason: 'contradictory-review' },
+    { name: 'truncated contradiction never triggers format correction', answers: ['{"approve":true,"findings":["unsafe change"]}'], firstStop: 'length', approved: false, reason: 'contradictory-review' },
+  ]) await t.test(scenario.name, async t => {
   const dir = await scratch(t); const source = join(dir, 'source'); await mkdir(source);
   const git = repo(source); git('init', '-q', '-b', 'main'); git('config', 'user.name', 'test'); git('config', 'user.email', 'test@example.test');
   await writeFile(join(source, 'value.txt'), 'before'); git('add', '.'); git('commit', '-qm', 'initial'); git('remote', 'add', 'upstream', source);
@@ -140,7 +173,7 @@ test('real faux coding/reviewer turns, host commit, and SQLite daily idempotency
     fauxAssistantMessage('Fixed value.'),
     fauxAssistantMessage(fauxToolCall('read_github_plans', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('diff', {}), { stopReason: 'toolUse' }),
-    fauxAssistantMessage('{"approve":true,"findings":[]}'),
+    ...scenario.answers.map((answer, index) => fauxAssistantMessage(answer, index === 0 && scenario.firstStop ? { stopReason: scenario.firstStop } : {})),
   ]);
   const registry = createRegistry(); registry.install(CodingTools); const reviewerExtension = installReviewer(registry, worktree);
   const policy = {};
@@ -156,13 +189,17 @@ test('real faux coding/reviewer turns, host commit, and SQLite daily idempotency
   let gated = 0, published = 0;
   host.gate = async () => { gated++; }; host.publish = async () => { published++; };
   const run = await advance(root, { harness, ...host, day: '2026-04-03' });
-  assert.equal(run.phase, 'published'); assert.equal(gated, 1); assert.equal(published, 1); assert.ok(run.reviewer);
-  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 7);
+  assert.equal(run.phase, scenario.approved ? 'published' : 'rejected'); assert.equal(gated, Number(scenario.approved)); assert.equal(published, Number(scenario.approved)); assert.ok(run.reviewer);
+  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 6 + scenario.answers.length);
+  assert.equal(run.reviewDiagnostics.length, scenario.answers.length);
+  if (!scenario.approved) { assert.equal(run.review.reason, scenario.reason); assert.equal(run.commit, undefined); }
+  if (scenario.reason === 'review-rejected') assert.deepEqual(run.review.findings, ['unsafe change']);
   assert.equal(await readFile(join(worktree, 'value.txt'), 'utf8'), 'after'); assert.equal(await readFile(join(source, 'value.txt'), 'utf8'), 'before');
   assert.equal((await harness.snapshot(GitHubPlansDoc, root.id, ctx)).plans.length, 1);
-  assert.equal(await reconcileCommit(worktree, { ...run, head: run.base }), run.commit);
-  await advance(root, { harness, ...host, day: '2026-04-03' }); assert.equal(published, 1);
+  if (scenario.approved) assert.equal(await reconcileCommit(worktree, { ...run, head: run.base }), run.commit);
+  await advance(root, { harness, ...host, day: '2026-04-03' }); assert.equal(published, Number(scenario.approved));
   await harness.close(ctx);
+  });
 });
 test('provider budget guard rejects before real model dispatch', async t => {
   const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));

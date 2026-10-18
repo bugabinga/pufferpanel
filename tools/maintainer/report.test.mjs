@@ -77,6 +77,27 @@ test('management kind survives serialization and hash-shaped known secrets never
   assert.equal(masked.day, null); assert.equal(masked.fingerprint, null); assert.equal(masked.sourceIdentity.diffHash, null);
   assert.equal(JSON.stringify(masked).includes(key), false);
 });
+test('active model and interrupted checkpoints cannot settle stale known usage', () => {
+  for (const phase of ['admitted', 'executing', 'reviewing']) {
+    const report = reportFor({ phase, usageComplete: true, reportedUsage: 1, spent: 1 });
+    assert.equal(report.usageComplete, false); assert.equal(report.reportedUsage.status, 'unknown');
+    assert.equal(reportFor(report).usageComplete, false);
+  }
+  const interrupted = reportFor({ phase: 'gating', usageComplete: true, reportedUsage: 1 }, { interrupted: true });
+  assert.equal(interrupted.usageComplete, false); assert.equal(interrupted.reportedUsage.status, 'unknown');
+  assert.equal(reportFor(interrupted).reportedUsage.status, 'unknown');
+});
+test('review format diagnostics remain bounded and exclude model text', () => {
+  const report = reportFor({ reviewDiagnostics: [
+    { stopReason: 'stop', textLength: 80, verdict: 'invalid-review', answer: 'private reviewer body' },
+    { stopReason: 'stop', textLength: 30, verdict: 'approved' },
+    { stopReason: 'error', textLength: 100, verdict: 'unknown' },
+  ] });
+  assert.equal(report.reviewDiagnostics.length, 2);
+  assert.deepEqual(reportFor(report).reviewDiagnostics, report.reviewDiagnostics);
+  assert.doesNotMatch(JSON.stringify(report), /private reviewer body/);
+  assert.deepEqual(reportFor({ reviewDiagnostics: [{ stopReason: 'untrusted body', textLength: -1, verdict: 'untrusted body' }] }).reviewDiagnostics, [{ stopReason: 'unknown', textLength: null, verdict: 'unknown' }]);
+});
 test('sarcastic voice keeps no-op and failed outcomes explicit', async t => {
   const dir = await scratch(t); const input = join(dir, 'input.json'); const summary = join(dir, 'summary.md');
   await writeFile(input, JSON.stringify({ phase: 'published', commit: null, spent: 0, reportedUsage: 0 }));

@@ -37,6 +37,7 @@ export function outcomeFor(run, interrupted = false) {
 export function reportFor(run, { env = process.env, interrupted = false, gateEvents = null } = {}) {
   if (run?.sourceIdentity) run = { ...run, ...run.sourceIdentity, spent: run.spend, reportedUsage: run.reportedUsage?.status === 'known' ? run.reportedUsage.cost : null };
   const identity = source(run, env);
+  const modelPending = interrupted || ['admitted', 'executing', 'reviewing'].includes(run?.phase);
   const phaseCosts = Object.fromEntries(Object.entries(run?.modelPhaseCost ?? {}).filter(([phase]) => /^[a-z-]{2,32}$/.test(phase) && redact(phase, env) === phase).map(([phase, value]) => [phase, { cost: safeNumber(value?.cost), status: ['known', 'unknown', 'not-run'].includes(value?.status) ? value.status : 'unknown' }]));
   const reason = run?.reason ?? run?.review?.reason ?? (run?.phase === 'rejected' ? 'review-rejected' : run?.phase === 'failed' ? 'maintenance-failed' : null);
   const report = {
@@ -56,7 +57,7 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     githubDiagnostics: run?.githubDiagnostics ? { issuesDisabled: run.githubDiagnostics.issuesDisabled === true, truncated: run.githubDiagnostics.truncated === true, authorRole: /^permission-(write|maintain|admin|push)$/.test(run.githubDiagnostics.authorRole ?? '') ? run.githubDiagnostics.authorRole : null, checks: run.githubDiagnostics.checks === 'satisfied' ? 'satisfied' : 'unknown', policy: run.githubDiagnostics.policy === 'unprotected' ? 'unprotected' : 'unknown' } : null,
     sourceRejection: ['unsupported-history', 'protected-history', 'non-descendant'].includes(run?.sourceRejection) ? run.sourceRejection : null,
     modelFailure: ['environment', 'transient'].includes(run?.modelFailure) ? run.modelFailure : null,
-    usageComplete: typeof run?.usageComplete === 'boolean' ? run.usageComplete : null,
+    usageComplete: modelPending ? false : typeof run?.usageComplete === 'boolean' ? run.usageComplete : null,
     knownSubtotal: safeNumber(run?.knownSubtotal),
     modelCalls: Number.isInteger(run?.modelCalls) && run.modelCalls >= 0 && run.modelCalls <= 256 ? run.modelCalls : null,
     budgetCap: safeNumber(run?.budgetCap),
@@ -74,9 +75,10 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     outcome: outcomeFor(run, interrupted),
     reason: reason ? redact(reason, env).slice(0, 500) : null,
     findings: findings(run?.review?.findings ?? run?.findings, env),
+    reviewDiagnostics: Array.isArray(run?.reviewDiagnostics) ? run.reviewDiagnostics.slice(0, 2).map(entry => ({ stopReason: ['stop', 'length', 'toolUse', 'error', 'aborted'].includes(entry?.stopReason) ? entry.stopReason : 'unknown', textLength: Number.isSafeInteger(entry?.textLength) && entry.textLength >= 0 ? entry.textLength : null, verdict: ['approved', 'review-rejected', 'invalid-review', 'contradictory-review', 'incomplete-review'].includes(entry?.verdict) ? entry.verdict : 'unknown' })) : [],
     timeline: Array.isArray(run?.timeline) ? run.timeline.slice(0, 30).map(entry => ({ phase: safePhase(entry?.phase), at: safeNumber(entry?.at) })) : [],
     modelPhaseCost: phaseCosts,
-    reportedUsage: run?.usageComplete === false || safeNumber(run?.reportedUsage) === null ? { status: 'unknown' } : { status: 'known', cost: safeNumber(run.reportedUsage) },
+    reportedUsage: modelPending || run?.usageComplete === false || safeNumber(run?.reportedUsage) === null ? { status: 'unknown' } : { status: 'known', cost: safeNumber(run.reportedUsage) },
     sourceIdentity: identity,
     kind: run?.management && !run?.sourceChanged || run?.kind === 'github-management' ? 'github-management' : run?.sourceChanged ? 'source' : 'noop',
     sourceChanged: Boolean(run?.sourceChanged),

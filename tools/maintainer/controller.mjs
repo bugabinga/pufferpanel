@@ -34,7 +34,7 @@ export function rollingAllowance(entries, now = Date.now()) {
   for (const { lease, settlement, settledAt, terminal = true, unknown = false, updatedAt, deadline = 0 } of entries) {
     if (unknown) { if (!terminal || Math.max(time(updatedAt), deadline) + DAY + MARGIN > now) held += 15; continue; }
     if (!lease || lease.cap <= 0 || lease.cap > 15 || !Number.isFinite(lease.cap)) fail('invalid accounting lease');
-    const actual = settlement?.ledgerReservation === lease.hash && settlement?.usageComplete === true && settlement?.reportedUsage?.status === 'known' && Number.isFinite(settlement.reportedUsage.cost) && settlement.reportedUsage.cost >= 0 ? settlement.reportedUsage.cost : null;
+    const actual = ['gating', 'committing', 'publishing', 'published', 'rejected', 'failed', 'managing'].includes(settlement?.phase) && settlement?.ledgerReservation === lease.hash && settlement?.usageComplete === true && settlement?.reportedUsage?.status === 'known' && Number.isFinite(settlement.reportedUsage.cost) && settlement.reportedUsage.cost >= 0 ? settlement.reportedUsage.cost : null;
     if (actual !== null && terminal) { if (time(settledAt) + DAY > now) held += actual; }
     else if (!terminal || lease.deadline + DAY + MARGIN > now) held += lease.cap;
   }
