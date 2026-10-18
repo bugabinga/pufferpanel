@@ -53,6 +53,15 @@ Recognizable substantive or contradictory rejection remains terminal even when t
 Clear prior usage completeness before model dispatch or resume; active-model and explicitly interrupted reports cannot settle partial subtotals.
 Intermediate review/format-correction checkpoints remain unknown-cost until final accounting is refreshed.
 A second invalid or incomplete response remains a bot failure with no gate, source commit, or publication.
+Permit at most one in-run fixed-gate diagnosis/repair for an approved maintenance source candidate, never a PR or management-only task.
+Require unchanged candidate identity, a failure event from that exact gate invocation, and a bounded regular private log inside the owned run directory; missing, stale, symlinked, or ambiguous evidence cannot authorize repair.
+Name private evidence by the gate invocation's event boundary so a pre-checkpoint orphan cannot block a later fresh capture or be reused as current evidence.
+Persist the consumed repair allowance, invalidate reviewer and management approval, and clear usage completeness before another dispatch.
+Detach run data deeply from SDK-owned snapshots before mutation so checkpoint changes reach SQLite, including after restart or recursive repair.
+Preserve the original task, request/accounting identity, lease, deadline, and budget; charge only newly incurred usage and accumulate both cycles' phase costs.
+Give the executor the private failure log as untrusted data and restrict it to diagnosis or a safe correction of that failure, not a new maintenance sweep or weaker checks.
+Use a fresh independent reviewer on the entire resulting candidate and plans, then rerun every fixed gate before source persistence.
+Another failure or rejection ends repair; no raw logs, private evidence paths, or source diffs enter public reports.
 Report reasons, bounded reviewer findings, relevant issue/PR identifiers, source/tree hashes, phase and gate timings, model usage/cost, and publication receipts.
 Retain useful failure diagnostics even when execution throws or the runner is interrupted.
 Never upload raw model transcripts, SQLite, environment dumps, credential files, or unchecked command logs.

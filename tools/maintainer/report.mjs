@@ -57,6 +57,7 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     githubDiagnostics: run?.githubDiagnostics ? { issuesDisabled: run.githubDiagnostics.issuesDisabled === true, truncated: run.githubDiagnostics.truncated === true, authorRole: /^permission-(write|maintain|admin|push)$/.test(run.githubDiagnostics.authorRole ?? '') ? run.githubDiagnostics.authorRole : null, checks: run.githubDiagnostics.checks === 'satisfied' ? 'satisfied' : 'unknown', policy: run.githubDiagnostics.policy === 'unprotected' ? 'unprotected' : 'unknown' } : null,
     sourceRejection: ['unsupported-history', 'protected-history', 'non-descendant'].includes(run?.sourceRejection) ? run.sourceRejection : null,
     modelFailure: ['environment', 'transient'].includes(run?.modelFailure) ? run.modelFailure : null,
+    gateRepair: (run?.gateRepairs ?? run?.gateRepair?.attempts) === 1 ? { attempts: 1, gate: ['whitespace', 'node', 'ace', 'tests-image', 'go-normal', 'go-race', 'go-vet', 'actionlint'].includes(run?.gateFailure?.name ?? run?.gateRepair?.gate) ? (run?.gateFailure?.name ?? run.gateRepair.gate) : 'unknown' } : null,
     usageComplete: modelPending ? false : typeof run?.usageComplete === 'boolean' ? run.usageComplete : null,
     knownSubtotal: safeNumber(run?.knownSubtotal),
     modelCalls: Number.isInteger(run?.modelCalls) && run.modelCalls >= 0 && run.modelCalls <= 256 ? run.modelCalls : null,

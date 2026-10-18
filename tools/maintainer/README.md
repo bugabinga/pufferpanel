@@ -9,6 +9,8 @@ No klops auto-update configuration is changed.
 
 Daily timer → isolated persistent worktree → bounded maintenance agent → independent read-only reviewer → fixed gates → host commit → numbered image → `latest`.
 No useful changes → no commit or release.
+A failed fixed gate permits one maintenance-only diagnosis/repair using a bounded private log, inside the original budget and deadline.
+Repairs revoke prior approval, get a fresh independent full review, and rerun every gate; PR tasks never acquire a coding turn.
 A rejected draft remains in the maintenance worktree for the next daily batch.
 Desktop mode never pushes Git remote refs.
 CI release mode pushes only reviewed source to fork `trunk`, without force or overwriting independent advancement.

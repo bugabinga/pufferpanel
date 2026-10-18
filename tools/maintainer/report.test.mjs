@@ -87,6 +87,12 @@ test('active model and interrupted checkpoints cannot settle stale known usage',
   assert.equal(interrupted.usageComplete, false); assert.equal(interrupted.reportedUsage.status, 'unknown');
   assert.equal(reportFor(interrupted).reportedUsage.status, 'unknown');
 });
+test('gate repair report preserves bounded metadata without private evidence or stale approval', () => {
+  const report = reportFor({ gateRepairs: 1, gateFailure: { name: 'tests-image', log: '/private/gate-repair.log', body: 'private command output' }, managementApproved: false });
+  assert.deepEqual(report.gateRepair, { attempts: 1, gate: 'tests-image' });
+  assert.deepEqual(reportFor(report).gateRepair, report.gateRepair);
+  assert.doesNotMatch(JSON.stringify(report), /private|command output/);
+});
 test('review format diagnostics remain bounded and exclude model text', () => {
   const report = reportFor({ reviewDiagnostics: [
     { stopReason: 'stop', textLength: 80, verdict: 'invalid-review', answer: 'private reviewer body' },
