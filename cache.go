@@ -57,8 +57,11 @@ func (c *MemoryCache) Write(b []byte) (n int, err error) {
 	n = len(b)
 
 	//remove data until we've gotten small enough
+	//a single write larger than the whole capacity empties the buffer and must
+	//not index into it; that oversize message is kept once and evicted first
+	//on the next write, so the cache stays bounded without panicking
 	var pop cacheMessage
-	for c.Size+n > c.Capacity {
+	for c.Size+n > c.Capacity && len(c.Buffer) > 0 {
 		pop, c.Buffer = c.Buffer[0], c.Buffer[1:]
 		c.Size = c.Size - len(pop.msg)
 	}
