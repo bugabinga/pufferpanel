@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -35,16 +36,13 @@ func init() {
 
 func SyncNodeToConfig() {
 	var masterUrl = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(config.MasterUrl.Value(), "http://"), "https://"), "/")
-	var masterParts = strings.SplitN(masterUrl, ":", 2)
-	models.LocalNode.PublicHost = strings.Split(masterUrl, ":")[0]
-	models.LocalNode.PrivateHost = strings.Split(masterUrl, ":")[0]
+	masterHost, masterPort := splitHostPortLenient(masterUrl)
+	models.LocalNode.PublicHost = masterHost
+	models.LocalNode.PrivateHost = masterHost
 
-	if len(masterParts) == 2 {
-		port, err := cast.ToUint16E(masterParts[1])
-		if err == nil {
-			models.LocalNode.PublicPort = port
-			models.LocalNode.PrivatePort = port
-		}
+	if masterPort != 0 {
+		models.LocalNode.PublicPort = masterPort
+		models.LocalNode.PrivatePort = masterPort
 	} else {
 		//default port to 80 or 443 as the url doesn't have one, so we can assume one or other
 		if strings.HasPrefix(config.MasterUrl.Value(), "https://") {
@@ -56,14 +54,10 @@ func SyncNodeToConfig() {
 		}
 	}
 
-	sftpHost := config.SftpHost.Value()
-	sftpParts := strings.SplitN(sftpHost, ":", 2)
+	_, sftpPort := splitHostPortLenient(config.SftpHost.Value())
 
-	if len(sftpParts) == 2 {
-		port, err := cast.ToUint16E(sftpParts[1])
-		if err == nil {
-			models.LocalNode.SFTPPort = port
-		}
+	if sftpPort != 0 {
+		models.LocalNode.SFTPPort = sftpPort
 	}
 }
 
@@ -198,6 +192,26 @@ func nodeHostPort(host string, port uint16) string {
 		return host + ":" + portString
 	}
 	return net.JoinHostPort(host, portString)
+}
+
+// splitHostPortLenient splits a configured host or host:port string the way
+// net.SplitHostPort does, tolerating bracketed IPv6 literals like the
+// daemon.sftp.host bind "[::]:5657" and bare IPv6 literals like fc00::1.
+// port is 0 when the value carries no usable port, which mirrors the old
+// behavior of only overwriting ports when one parsed successfully.
+func splitHostPortLenient(value string) (host string, port uint16) {
+	if h, p, err := net.SplitHostPort(value); err == nil {
+		if parsed, castErr := cast.ToUint16E(p); castErr == nil {
+			return h, parsed
+		}
+		return h, 0
+	}
+	// no port, or an unbracketed IPv6 literal: fc00::1:8080 is a valid IPv6
+	// address on its own, so it stays whole rather than being chopped at a colon
+	if _, err := netip.ParseAddr(value); err == nil {
+		return value, 0
+	}
+	return strings.Trim(value, "[]"), 0
 }
 
 func (ns *Node) OpenSocket(node *models.Node, path string, writer http.ResponseWriter, request *http.Request) error {

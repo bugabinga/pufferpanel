@@ -17,7 +17,7 @@ RUN npm install --global --allow-scripts=yarn yarn@1.22.22 && \
 
 FROM --platform=$BUILDPLATFORM docker.io/tonistiigi/xx:1.10.0 AS xx
 
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2-alpine AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-alpine AS builder
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
@@ -51,7 +51,7 @@ RUN xx-go build -buildvcs=false -tags "$tags" -ldflags "-X 'github.com/pufferpan
 RUN xx-verify /pufferpanel/pufferpanel
 
 # Lifecycle tests download glibc-based game runtimes.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2 AS tests
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3 AS tests
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM

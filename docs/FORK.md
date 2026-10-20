@@ -7,7 +7,7 @@ This document records fork-specific technical behavior rather than an upstream c
 
 ## Build and regeneration
 
-The Go module requires Go 1.27.2 in [`go.mod`](../go.mod).
+The Go module requires Go 1.27.3 in [`go.mod`](../go.mod).
 Swagger generation uses the pinned module tool through `go tool swag` in [`Dockerfile`](../Dockerfile).
 Frontend workspaces use Yarn Classic 1.22.22 as declared in [`client/package.json`](../client/package.json).
 From `client/`, run `yarn workspace frontend update:ace` to regenerate vendored Ace assets.
@@ -27,8 +27,9 @@ Missing, corrupt, malformed, traversal, or over-limit archives therefore leave l
 A write or out-of-space failure during final replacement can leave a partial live replacement; the backup remains intact.
 The archive data writer can leave a partial destination file when a read error occurs.
 Current tracks are selected manually and do not update the host automatically.
+Node addresses parse through `net.SplitHostPort`, so IPv6 literals work in `panel.settings.masterUrl` and the `daemon.sftp.host` bind with or without brackets, matching upstream issue #1478; an unbracketed `fc00::1:8080` stays one address rather than splitting at a colon.
 The template-tester image retains Ubuntu 22.04 because the official Mono packages failed dependency resolution on Ubuntu 26.04.
-Go 1.27.2, Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.
+Go 1.27.3, Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.
 
 ## Archive behavior
 
