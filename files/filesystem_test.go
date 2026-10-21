@@ -19,6 +19,10 @@ func TestFileServerRejectsRootEscapes(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("sentinel"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	//os.WriteFile is subject to the process umask, so pin the fixture mode explicitly
+	if err := os.Chmod(outside, 0644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink(outside, filepath.Join(root, "outside")); err != nil {
 		t.Fatal(err)
 	}

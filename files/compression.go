@@ -144,6 +144,10 @@ func Extract(sourceFS FileServer, sourceFile string, targetFS FileServer, target
 		if n > maxExtractedFileSize || n > remaining {
 			return ErrArchiveLimit
 		}
+		//creation modes are masked by the process umask, so enforce the archived mode
+		if err := targetFS.Chmod(target, info.Mode()|0600); err != nil {
+			return err
+		}
 		return ctx.Err()
 	})
 }

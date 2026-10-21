@@ -24,6 +24,7 @@ Granting that user access to a container socket grants control of every containe
 Backups and uploads are destructive-capable workflows, so stop affected workloads and verify backups before extracting or replacing archive data.
 Restore first extracts and validates an archive in an OS-temporary staging directory, then removes live root children and copies staged data through confined file servers.
 Missing, corrupt, malformed, traversal, or over-limit archives therefore leave live files unchanged and retain the backup.
+File-server writes and archive extraction enforce requested or archived permission bits with an explicit chmod, so server files, extracted archives, and restores keep their modes regardless of the daemon process umask.
 A write or out-of-space failure during final replacement can leave a partial live replacement; the backup remains intact.
 The archive data writer can leave a partial destination file when a read error occurs.
 Current tracks are selected manually and do not update the host automatically.

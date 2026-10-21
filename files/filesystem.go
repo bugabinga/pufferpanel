@@ -423,13 +423,16 @@ func (sfp *fileServer) WriteFile(name string, content []byte, mode os.FileMode) 
 	if err != nil {
 		return err
 	}
-	defer utils.Close(f)
-
-	if content != nil {
-		_, err = f.Write(content)
+	_, writeErr := f.Write(content)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
 	}
-
-	return err
+	if closeErr != nil {
+		return closeErr
+	}
+	//the mode passed to open is masked by the process umask, so enforce the requested mode
+	return sfp.Chmod(name, mode)
 }
 
 func (sfp *fileServer) CreateTemp(dir, pattern string) (*os.File, error) {
