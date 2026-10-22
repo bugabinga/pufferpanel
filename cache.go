@@ -16,6 +16,16 @@ type MemoryCache struct {
 	Capacity int
 	Size     int
 	Lock     sync.RWMutex
+
+	// lastTs is the newest timestamp handed to a stored message or returned
+	// as a polling epoch. Writes only allocate strictly newer timestamps,
+	// which keeps the ReadFrom `time > startTime` filter lossless even when
+	// a write and a poll land in the same wall-clock microsecond.
+	lastTs int64
+
+	// now supplies UnixMicro timestamps. Tests may freeze it; production
+	// always uses the wall clock.
+	now func() int64
 }
 
 func CreateCache() *MemoryCache {
@@ -26,6 +36,7 @@ func CreateCache() *MemoryCache {
 	return &MemoryCache{
 		Buffer:   make([]cacheMessage, 0),
 		Capacity: capacity * 1024, //convert to KB
+		now:      func() int64 { return time.Now().UnixMicro() },
 	}
 }
 
@@ -34,11 +45,21 @@ func (c *MemoryCache) Read() (msg []byte, lastTime int64) {
 	return
 }
 
+// ReadFrom returns every buffered message newer than startTime plus the epoch
+// a client should pass as startTime on its next poll. Raising lastTs while
+// holding the write lock guarantees any message written after this read gets a
+// strictly newer timestamp than the returned epoch, so the next poll cannot
+// skip it; before that guarantee, a write landing in the same microsecond as
+// the poll's timestamp was dropped from polling results until the buffer was
+// replayed from zero (upstream issue #1439 symptom).
 func (c *MemoryCache) ReadFrom(startTime int64) (msg []byte, lastTime int64) {
-	c.Lock.RLock()
-	defer c.Lock.RUnlock()
+	c.Lock.Lock()
+	defer c.Lock.Unlock()
 
-	lastTime = time.Now().UnixMicro()
+	if t := c.now(); t > c.lastTs {
+		c.lastTs = t
+	}
+	lastTime = c.lastTs
 
 	msg = make([]byte, 0)
 
@@ -69,7 +90,13 @@ func (c *MemoryCache) Write(b []byte) (n int, err error) {
 	co := make([]byte, len(b))
 	copy(co, b)
 
-	c.Buffer = append(c.Buffer, cacheMessage{msg: co, time: time.Now().UnixMicro()})
+	ts := c.now()
+	if ts <= c.lastTs {
+		ts = c.lastTs + 1
+	}
+	c.lastTs = ts
+
+	c.Buffer = append(c.Buffer, cacheMessage{msg: co, time: ts})
 	c.Size = c.Size + n
 	return
 }

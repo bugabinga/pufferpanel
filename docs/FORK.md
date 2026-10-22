@@ -29,6 +29,7 @@ A write or out-of-space failure during final replacement can leave a partial liv
 The archive data writer can leave a partial destination file when a read error occurs.
 Current tracks are selected manually and do not update the host automatically.
 Node addresses parse through `net.SplitHostPort`, so IPv6 literals work in `panel.settings.masterUrl` and the `daemon.sftp.host` bind with or without brackets, matching upstream issue #1478; an unbracketed `fc00::1:8080` stays one address rather than splitting at a colon.
+Console-cache timestamps are strictly monotonic and every polling epoch returned by `/api/servers/{id}/console` is newer than all previously stored messages, so a log line written in the same microsecond as a poll is delivered by the next poll instead of being dropped (the `time` parameter is Unix microseconds, not milliseconds).
 The template-tester image retains Ubuntu 22.04 because the official Mono packages failed dependency resolution on Ubuntu 26.04.
 Go 1.27.3, Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.
 
