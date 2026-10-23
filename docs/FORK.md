@@ -10,6 +10,8 @@ This document records fork-specific technical behavior rather than an upstream c
 The Go module requires Go 1.27.3 in [`go.mod`](../go.mod).
 Swagger generation uses the pinned module tool through `go tool swag` in [`Dockerfile`](../Dockerfile).
 Frontend workspaces use Yarn Classic 1.22.22 as declared in [`client/package.json`](../client/package.json).
+The frontend build stage in [`Dockerfile`](../Dockerfile) pins Node 26.12.1-alpine; the template-tester image keeps Node 26.10.0 from its verified compatibility build.
+`yarn clean` in [`client/`](../client/package.json) removes workspace `dist` output and the Vite dependency cache with `rm -rf`; Vite has no `clean` subcommand, and running `vite clean` starts a dev server instead, so that upstream script text is deliberately not used.
 From `client/`, run `yarn workspace frontend update:ace` to regenerate vendored Ace assets.
 [`client/frontend/scripts/update-ace.sh`](../client/frontend/scripts/update-ace.sh) copies only regular non-symlink source files into regular non-symlink existing destination files and fails when an expected source file is absent.
 The Ace source package is pinned to 1.44.0 in [`client/frontend/package.json`](../client/frontend/package.json).
@@ -29,6 +31,7 @@ A write or out-of-space failure during final replacement can leave a partial liv
 The archive data writer can leave a partial destination file when a read error occurs.
 Current tracks are selected manually and do not update the host automatically.
 Node addresses parse through `net.SplitHostPort`, so IPv6 literals work in `panel.settings.masterUrl` and the `daemon.sftp.host` bind with or without brackets, matching upstream issue #1478; an unbracketed `fc00::1:8080` stays one address rather than splitting at a colon.
+Docker `Config.Hostname` in a template resolves `${variable}` tokens against server variables before container creation, so `"Hostname": "${servername}"` names the container after the server instead of passing the literal token to the engine, matching upstream issue #1424.
 Console-cache timestamps are strictly monotonic and every polling epoch returned by `/api/servers/{id}/console` is newer than all previously stored messages, so a log line written in the same microsecond as a poll is delivered by the next poll instead of being dropped (the `time` parameter is Unix microseconds, not milliseconds).
 The template-tester image retains Ubuntu 22.04 because the official Mono packages failed dependency resolution on Ubuntu 26.04.
 Go 1.27.3, Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.

@@ -345,6 +345,10 @@ func (d *Docker) createContainer(environment *pufferpanel.Environment, data puff
 		containerConfig.WorkingDir = containerRoot
 	}
 
+	if containerConfig.Hostname != "" {
+		containerConfig.Hostname = utils.ReplaceTokens(containerConfig.Hostname, data.Variables, utils.PlainReplace)
+	}
+
 	//append anything the container config added
 	var envVars = make(map[string]string)
 

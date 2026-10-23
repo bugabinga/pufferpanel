@@ -35,7 +35,7 @@ require (
 	github.com/moby/moby/client v0.6.2
 	github.com/nwaples/rardecode/v2 v2.4.5
 	github.com/opencontainers/image-spec v1.1.1
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 	github.com/pquerna/otp v1.5.0
 	github.com/pterm/pterm v0.12.84
 	github.com/sendgrid/sendgrid-go v3.16.1+incompatible

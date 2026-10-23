@@ -1,7 +1,7 @@
 ###
 # Builder container
 ###
-FROM --platform=$BUILDPLATFORM docker.io/library/node:26.10.0-alpine AS node
+FROM --platform=$BUILDPLATFORM docker.io/library/node:26.12.1-alpine AS node
 
 WORKDIR /build
 COPY client .

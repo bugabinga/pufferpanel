@@ -16,29 +16,27 @@ import (
 	"github.com/pufferpanel/pufferpanel/v3/utils"
 )
 
-func TestDockerCreateContainerPayloadDoesNotBindPanelTimezone(t *testing.T) {
+type containerCreatePayload struct {
+	Hostname   string   `json:"Hostname"`
+	Env        []string `json:"Env"`
+	HostConfig struct {
+		Binds []string `json:"Binds"`
+	} `json:"HostConfig"`
+}
+
+func TestDockerCreateContainerPayload(t *testing.T) {
 	forbiddenTimezoneBinds := []string{
 		"/etc/timezone:/etc/timezone:ro",
 		"/etc/localtime:/etc/localtime:ro",
 	}
-	payloads := make(chan struct {
-		Env        []string `json:"Env"`
-		HostConfig struct {
-			Binds []string `json:"Binds"`
-		} `json:"HostConfig"`
-	}, 1)
+	payloads := make(chan containerCreatePayload, 1)
 	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/images/json"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`[{"RepoTags":["test/image:latest"]}]`))
 		case strings.HasSuffix(r.URL.Path, "/containers/create"):
-			var payload struct {
-				Env        []string `json:"Env"`
-				HostConfig struct {
-					Binds []string `json:"Binds"`
-				} `json:"HostConfig"`
-			}
+			var payload containerCreatePayload
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Errorf("decode ContainerCreate payload: %v", err)
 				w.WriteHeader(http.StatusBadRequest)
@@ -77,11 +75,12 @@ func TestDockerCreateContainerPayloadDoesNotBindPanelTimezone(t *testing.T) {
 			customBind: "/custom:ro",
 		},
 		HostConfig: container.HostConfig{Binds: []string{"/existing:/existing:ro"}},
-		Config:     container.Config{Env: []string{"TZ=from-config", "KEEP=config"}},
+		Config:     container.Config{Env: []string{"TZ=from-config", "KEEP=config"}, Hostname: "${servername}"},
 	}
 	environment := &pufferpanel.Environment{Server: server}
 	if err := docker.createContainer(environment, pufferpanel.ExecutionData{
 		Environment: map[string]string{"TZ": "from-execution"},
+		Variables:   map[string]interface{}{"servername": "replaced-host"},
 	}, context.Background(), dockerClient); err != nil {
 		t.Fatal(err)
 	}
@@ -104,5 +103,8 @@ func TestDockerCreateContainerPayloadDoesNotBindPanelTimezone(t *testing.T) {
 	}
 	if !slices.Contains(payload.Env, "TZ=from-execution") || slices.Contains(payload.Env, "TZ=from-config") || !slices.Contains(payload.Env, "KEEP=config") {
 		t.Errorf("ContainerCreate Env = %#v, want execution TZ precedence and configured environment", payload.Env)
+	}
+	if payload.Hostname != "replaced-host" {
+		t.Errorf("ContainerCreate Hostname = %q, want server variables replaced in the configured hostname", payload.Hostname)
 	}
 }
