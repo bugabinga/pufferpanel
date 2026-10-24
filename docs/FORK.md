@@ -30,9 +30,11 @@ File-server writes and archive extraction enforce requested or archived permissi
 A write or out-of-space failure during final replacement can leave a partial live replacement; the backup remains intact.
 The archive data writer can leave a partial destination file when a read error occurs.
 Current tracks are selected manually and do not update the host automatically.
+The hotkey directive resolves its group through `binding.instance.$.proxy`, because Vue hands directive bindings an exposed proxy for script-setup components under the Vite dev server, and that proxy has no `_` or global properties; without the unwrap the frontend fails to mount during dev-server load (upstream PR pufferpanel/pufferpanel#1507, by Lycano; verified against Vue 3.5.43, a no-op for options components).
 Node addresses parse through `net.SplitHostPort`, so IPv6 literals work in `panel.settings.masterUrl` and the `daemon.sftp.host` bind with or without brackets, matching upstream issue #1478; an unbracketed `fc00::1:8080` stays one address rather than splitting at a colon.
 Docker `Config.Hostname` in a template resolves `${variable}` tokens against server variables before container creation, so `"Hostname": "${servername}"` names the container after the server instead of passing the literal token to the engine, matching upstream issue #1424.
 Console-cache timestamps are strictly monotonic and every polling epoch returned by `/api/servers/{id}/console` is newer than all previously stored messages, so a log line written in the same microsecond as a poll is delivered by the next poll instead of being dropped (the `time` parameter is Unix microseconds, not milliseconds).
+Server restarts retry `Start` while the after-exit handler still holds the server running lock during post-execution steps, instead of polling only the environment process state and failing with `server running` when the two disagree; the regression is `TestDoRestartWaitsForPostExecution` in [`web/daemon/restart_test.go`](../web/daemon/restart_test.go).
 The template-tester image retains Ubuntu 22.04 because the official Mono packages failed dependency resolution on Ubuntu 26.04.
 Go 1.27.3, Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.
 

@@ -171,16 +171,21 @@ func doRestart(server *servers.Server, timeout time.Duration) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	//wait for the timeout to be done or the server to not be running
-	for server.IsIdle() != nil {
+	//the environment reports the process as gone the moment it exits, but the
+	//after-exit handler keeps the server's running lock until post-execution
+	//steps finish, so Start can bounce with ErrServerRunning even though the
+	//process is dead; retry until the lock frees or we run out of time
+	for {
+		err = server.Start()
+		if err == nil || !errors.Is(err, pufferpanel.ErrServerRunning) {
+			return err
+		}
 		select {
 		case <-timer.C:
-			return pufferpanel.ErrServerRunning
+			return err
 		case <-ticker.C:
 		}
 	}
-
-	return server.Start()
 }
 
 // @Summary Restart server
