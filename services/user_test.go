@@ -1,9 +1,16 @@
 package services
 
 import (
+	"encoding/base64"
 	"testing"
 
+	webauthnProto "github.com/go-webauthn/webauthn/protocol"
+	webauthn "github.com/go-webauthn/webauthn/webauthn"
 	"github.com/pufferpanel/pufferpanel/v3/config"
+	"github.com/pufferpanel/pufferpanel/v3/models"
+	"github.com/stretchr/testify/assert"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func TestUserWebAuthnRelyingPartyConfig(t *testing.T) {
@@ -57,4 +64,66 @@ func TestUserWebAuthnRelyingPartyConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUserDeletePasskeyIsScopedToOwner(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := db.AutoMigrate(&models.User{}, &models.WebauthnCredential{}); err != nil {
+		t.Fatal(err)
+	}
+
+	owner := &models.User{Username: "passkey_owner", Email: "owner@example.test", HashedPassword: "notarealhash"}
+	other := &models.User{Username: "passkey_victim", Email: "victim@example.test", HashedPassword: "notarealhash"}
+	for _, u := range []*models.User{owner, other} {
+		if err := db.Create(u).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rawID := []byte("credential-id-one")
+	stored := &models.WebauthnCredential{
+		ID:         webauthnProto.URLEncodedBase64(rawID),
+		Name:       "victim key",
+		UserId:     other.ID,
+		Credential: webauthn.Credential{ID: rawID, PublicKey: []byte("pk"), AttestationType: "none"},
+	}
+	if err := db.Create(stored).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	us := &User{DB: db}
+	encodedID := base64.RawURLEncoding.EncodeToString(rawID)
+
+	// a different user attempting to delete the credential must not remove it
+	if err := us.DeletePasskey(owner.ID, encodedID); err != nil {
+		t.Fatalf("DeletePasskey by non-owner returned error: %v", err)
+	}
+	var count int64
+	if err := db.Model(&models.WebauthnCredential{}).Where("user_id = ?", other.ID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !assert.EqualValues(t, 1, count, "non-owner delete removed the victim credential") {
+		return
+	}
+
+	// the actual owner can delete it
+	if err := us.DeletePasskey(other.ID, encodedID); err != nil {
+		t.Fatalf("DeletePasskey by owner returned error: %v", err)
+	}
+	if err := db.Model(&models.WebauthnCredential{}).Where("user_id = ?", other.ID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	assert.EqualValues(t, 0, count, "owner delete did not remove the credential")
 }

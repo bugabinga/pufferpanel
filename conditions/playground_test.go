@@ -1,9 +1,10 @@
 package conditions
 
 import (
+	"testing"
+
 	"cel.dev/cel-go/cel"
 	"github.com/stretchr/testify/assert"
-	"testing"
 )
 
 func Test(t *testing.T) {

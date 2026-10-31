@@ -1,12 +1,13 @@
 package conditions
 
 import (
-	"cel.dev/cel-go/cel"
 	"fmt"
 	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
+
+	"cel.dev/cel-go/cel"
 )
 
 var GlobalConstantValues = map[string]interface{}{

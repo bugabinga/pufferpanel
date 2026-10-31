@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/braintree/manners"
 	"github.com/gin-gonic/gin"
 	"github.com/pufferpanel/pufferpanel/v3"
 	"github.com/pufferpanel/pufferpanel/v3/config"
@@ -100,18 +98,11 @@ func TestMain(m *testing.M) {
 		_ = config.SftpHost.Set(fmt.Sprintf("%s:%d", models.LocalNode.PrivateHost, models.LocalNode.SFTPPort), false)
 		_ = config.AuthUrl.Set(fmt.Sprintf("http://%s:%d/oauth2/token", models.LocalNode.PrivateHost, models.LocalNode.PrivatePort), false)
 
-		l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", models.LocalNode.PrivateHost, models.LocalNode.PrivatePort))
-		if err != nil {
-			fmt.Printf("Error starting web services: %s", err.Error())
-			os.Exit(1)
-		}
-
-		webService := manners.NewWithServer(&http.Server{Handler: router})
+		webService := &http.Server{Handler: router, Addr: fmt.Sprintf("%s:%d", models.LocalNode.PrivateHost, models.LocalNode.PrivatePort)}
 		pufferpanel.Engine = router
 
 		go func() {
-			err = webService.Serve(l)
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := webService.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				fmt.Printf("Error starting web services: %s", err.Error())
 				os.Exit(1)
 			}
