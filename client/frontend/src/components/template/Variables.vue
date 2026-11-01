@@ -8,6 +8,7 @@ import KeyValueInput from '@/components/ui/KeyValueInput.vue'
 import Overlay from '@/components/ui/Overlay.vue'
 import TextField from '@/components/ui/TextField.vue'
 import Toggle from '@/components/ui/Toggle.vue'
+import { renameVariableInGroups, visibleVariables } from './variables-helpers.js'
 
 const props = defineProps({
   modelValue: { type: String, required: true }
@@ -120,6 +121,7 @@ function confirmEdit() {
   editOpen.value = false
   if (edit.value.oldName && edit.value.oldName !== edit.value.name) {
     delete template.value.data[edit.value.oldName]
+    template.value.groups = renameVariableInGroups(template.value.groups, edit.value.oldName, edit.value.name)
   }
   const name = edit.value.name
   delete edit.value.name
@@ -254,7 +256,11 @@ function confirmChangeVarGroup() {
 }
 
 function nameValid() {
-  return edit.value.name.trim() !== ''
+  const name = edit.value.name?.trim()
+  if (!name) {
+    return false
+  }
+  return name === edit.value.oldName || !Object.hasOwn(template.value.data, name)
 }
 
 onUpdated(() => {
@@ -302,7 +308,7 @@ const supportsOptions = {
           <btn variant="icon" :tooltip="t('templates.variables.RemoveGroup')" @click="removeGroup(group)"><icon name="close" /></btn>
         </div>
         <ul class="list">
-          <li v-for="name in group.variables" :key="name" class="list-item clickable" @click="startEdit(name)">
+          <li v-for="name in visibleVariables(group, template.data)" :key="name" class="list-item clickable" @click="startEdit(name)">
             <div class="list-item-content">
               <span v-text="template.data[name].display" />
               <btn variant="icon" :tooltip="t('templates.variables.MoveToGroup')" @click.stop="changeGroup(name, group)"><icon name="select-group" /></btn>

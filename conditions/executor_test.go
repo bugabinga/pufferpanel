@@ -189,7 +189,7 @@ func TestReplaceInString(t *testing.T) {
 				},
 				extras: nil,
 			},
-			want:    "Hello ERROR: <input>:1:2: undeclared reference to 'asdf' (in container '')\n |  asdf \n | .^!",
+			want:    "Hello ERROR: <input>:1:2: undeclared reference to 'asdf'\n |  asdf \n | .^!",
 			wantErr: true,
 		},
 	}

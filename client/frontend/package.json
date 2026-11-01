@@ -8,6 +8,7 @@
     "build": "vite build",
     "serve": "vite preview",
     "lint": "eslint src",
+    "test": "node --test test",
     "format": "prettier . --write",
     "update:ace": "bash scripts/update-ace.sh"
   },
