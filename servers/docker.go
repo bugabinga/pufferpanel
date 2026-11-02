@@ -36,7 +36,6 @@ type Docker struct {
 	Config        container.Config     `json:"config,omitempty"`
 
 	connection          client.HijackedResponse
-	cli                 *client.Client
 	statLocker          sync.Mutex
 	lastStats           *pufferpanel.ServerStats
 	lastStatTime        time.Time
@@ -45,14 +44,13 @@ type Docker struct {
 }
 
 func CreateDockerEnvironment() pufferpanel.EnvironmentImpl {
-	/*return &Docker{
+	return &Docker{
 		ImageName: "pufferpanel/generic",
 		Network:   "host",
 		Ports:     make([]string, 0),
 		Binds:     make(map[string]string),
 		Labels:    make(map[string]string),
-	}*/
-	return nil
+	}
 }
 
 func (d *Docker) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps pufferpanel.ExecutionData) error {
@@ -447,7 +445,11 @@ func (d *Docker) createContainer(environment *pufferpanel.Environment, data puff
 	networkConfig := &network.NetworkingConfig{}
 
 	//for now, default to linux across the board. This resolves problems that Windows has when you use it and docker
-	_, err = d.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+	cl, err := pufferpanel.GetDockerClient()
+	if err != nil {
+		return err
+	}
+	_, err = cl.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:           containerConfig,
 		HostConfig:       hostConfig,
 		NetworkingConfig: networkConfig,

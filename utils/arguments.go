@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/buildkite/shellwords"
@@ -53,6 +54,9 @@ func SplitArguments(source string) (cmd string, arguments []string) {
 	} else if len(parts) == 1 {
 		return parts[0], []string{}
 	}
+	parts = slices.DeleteFunc(parts, func(s string) bool {
+		return s == "" || s == "\"\""
+	})
 
 	return parts[0], parts[1:]
 }
