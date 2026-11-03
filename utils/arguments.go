@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/buildkite/shellwords"
@@ -48,10 +49,12 @@ func ReplaceTokensInMap(msg map[string]string, mapping map[string]any) map[strin
 func SplitArguments(source string) (cmd string, arguments []string) {
 	parts, _ := shellwords.Split(source)
 
+	parts = slices.DeleteFunc(parts, func(s string) bool {
+		return s == "" || s == "\"\""
+	})
+
 	if len(parts) == 0 {
 		return "", []string{}
-	} else if len(parts) == 1 {
-		return parts[0], []string{}
 	}
 
 	return parts[0], parts[1:]

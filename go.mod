@@ -4,8 +4,8 @@ go 1.27.3
 
 require (
 	cel.dev/cel-go v0.33.2
-	github.com/MicahParks/jwkset v0.11.3
-	github.com/MicahParks/keyfunc/v3 v3.8.2
+	github.com/MicahParks/jwkset v0.11.4
+	github.com/MicahParks/keyfunc/v3 v3.9.1
 	github.com/buildkite/shellwords v1.0.1
 	github.com/cavaliergopher/grab/v3 v3.0.1
 	github.com/creack/pty v1.1.24
@@ -17,7 +17,7 @@ require (
 	github.com/go-co-op/gocron/v2 v2.23.0
 	github.com/go-git/go-git/v5 v5.19.3
 	github.com/go-gormigrate/gormigrate/v2 v2.1.7
-	github.com/go-playground/validator/v10 v10.30.5
+	github.com/go-playground/validator/v10 v10.30.6
 	github.com/go-webauthn/webauthn v0.18.2
 	github.com/gofrs/uuid/v5 v5.5.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -26,7 +26,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/go-version v1.9.0
 	github.com/mailgun/mailgun-go/v4 v4.23.0
-	github.com/mailjet/mailjet-apiv3-go/v4 v4.0.9
+	github.com/mailjet/mailjet-apiv3-go/v4 v4.1.0
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/mholt/archives v0.1.5
 	github.com/moby/moby/api v1.56.1

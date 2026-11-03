@@ -98,6 +98,28 @@ func TestSplitArguments(t *testing.T) {
 			wantCmd:       "java",
 			wantArguments: []string{"-jar", "server.jar"},
 		},
+		{
+			//regression: empty-string arguments are dropped instead of passed to the process (upstream b2723e9c)
+			args:          "java \"\" -jar x.jar \"\"",
+			wantCmd:       "java",
+			wantArguments: []string{"-jar", "x.jar"},
+		},
+		{
+			args:          "a \"\" b",
+			wantCmd:       "a",
+			wantArguments: []string{"b"},
+		},
+		{
+			//regression: a command made only of empty tokens returned a slice-bounds panic, not ("", [])
+			args:          "\"\" \"\"",
+			wantCmd:       "",
+			wantArguments: []string{},
+		},
+		{
+			args:          "\"\"",
+			wantCmd:       "",
+			wantArguments: []string{},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
