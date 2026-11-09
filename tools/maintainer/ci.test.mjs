@@ -38,12 +38,15 @@ function fixture(t, protectedEdit = false) {
   return { dir, source, state, artifact, base, commit, tree, result, output, git, command, imported, origin };
 }
 
-// Hide ambient provider credentials so selection sees exactly the fixture's keys.
+// Non-key provider settings pi-ai reads beside a credential (Cloudflare fills the account into its endpoint URL).
+const companions = ['CLOUDFLARE_ACCOUNT_ID'];
+const ambientNames = () => [...providerKeyNames(), ...companions];
+// Hide ambient provider credentials and companions so selection sees exactly the fixture's values.
 function providerEnv(t, vars = {}) {
-  const saved = Object.fromEntries(providerKeyNames().map(name => [name, process.env[name]]));
-  for (const name of Object.keys(saved)) delete process.env[name];
+  const saved = Object.fromEntries(ambientNames().filter(name => name in process.env).map(name => [name, process.env[name]]));
+  for (const name of ambientNames()) delete process.env[name];
   Object.assign(process.env, vars);
-  t.after(() => { for (const name of providerKeyNames()) delete process.env[name]; Object.assign(process.env, saved); });
+  t.after(() => { for (const name of ambientNames()) delete process.env[name]; Object.assign(process.env, saved); });
 }
 test('CI model refs resolve offline to distinct providers with known nonzero prices and supported thinking', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -59,7 +62,7 @@ test('CI model refs resolve offline to distinct providers with known nonzero pri
 test('selection uses providers with standard env credentials, prefers an independent reviewer, and fails closed without any', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   const settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
-  const select = async vars => { for (const name of providerKeyNames()) delete process.env[name]; Object.assign(process.env, vars); return selectModels(settings, await createRuntime(dir)); };
+  const select = async vars => { for (const name of ambientNames()) delete process.env[name]; Object.assign(process.env, vars); return selectModels(settings, await createRuntime(dir)); };
   providerEnv(t);
   await assert.rejects(select({}), /no configured model available/);
   let choices = await select({ ZAI_API_KEY: 'zai-only' });
@@ -71,6 +74,14 @@ test('selection uses providers with standard env credentials, prefers an indepen
   assert.deepEqual(choices.available.map(choice => choice.provider), ['zai', 'anthropic', 'deepseek']);
   choices = await select({ ZAI_API_KEY: 'zai', MINIMAX_API_KEY: 'minimax' });
   assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' });
+  // Cloudflare is wired for classifiers only: it never becomes a coding model, but its classifiers resolve with key + account.
+  choices = await select({ ZAI_API_KEY: 'zai', CLOUDFLARE_API_KEY: 'cf', CLOUDFLARE_ACCOUNT_ID: 'acct' });
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['zai']);
+  const runtime = await createRuntime(dir);
+  assert.ok(runtime.getModelOfType('classifier', 'cloudflare-workers-ai', '@cf/cloudflare/clef-flash'));
+  assert.ok(await runtime.checkAuth('cloudflare-workers-ai'));
+  await select({ ZAI_API_KEY: 'zai', CLOUDFLARE_API_KEY: 'cf' });
+  assert.equal(await (await createRuntime(dir)).checkAuth('cloudflare-workers-ai'), undefined, 'key without account is unusable');
   choices = await select({ MINIMAX_API_KEY: 'minimax-only' });
   assert.deepEqual(choices.executor, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
 });
@@ -119,7 +130,7 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   const named = [...maintain.matchAll(/^ {10}([A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$/gm)];
   assert.ok(named.length > 0 && named.every(([, env, secret]) => env === secret));
   const forwarded = Object.fromEntries(named.map(([, name]) => [name, 'set']));
-  assert.deepEqual(providerKeyNames(forwarded).sort(), Object.keys(forwarded).sort(), 'only pi-ai provider credential names');
+  assert.deepEqual([...providerKeyNames(forwarded), ...companions.filter(name => name in forwarded)].sort(), Object.keys(forwarded).sort(), 'only pi-ai provider credential names and their companions');
   const settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
   for (const ref of settings.annieModels) assert.ok(findEnvKeys(ref.split('/')[0], forwarded)?.length, ref);
   assert.doesNotMatch(maintain, /REGISTRY_PASSWORD|ANNIE_GH_TOKEN|contents: write|issues: write|pull-requests: write/);
