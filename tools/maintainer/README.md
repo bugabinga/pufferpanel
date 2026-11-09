@@ -87,7 +87,7 @@ Manual `observe` or `sweep` refreshes cheap read-only discovery/checkpoint evide
 
 Configure two environments, each restricted to deployment branch `trunk`:
 
-- `honest-annie-model`: a provider API key secret enables that provider: `ZAI_API_KEY` (Z.AI account entitled to GLM-5.3 on its coding endpoint), `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, or `OPENCODE_API_KEY`.
+- `honest-annie-model`: a provider API key secret enables that provider: `ZAI_API_KEY` (Z.AI account entitled to GLM-5.3 on its coding endpoint), `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`, or `MINIMAX_API_KEY` (MiniMax M Plan key on the international `api.minimax.io` endpoint).
   A new provider needs its pi-ai env name added to the three model steps in the workflow and a model ref in `ci-settings.json`; a test enforces both.
 - `honest-annie-release`: secrets `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, scoped to publishing `registry.bugabinga.net/pufferpanel`.
 

@@ -69,6 +69,10 @@ test('selection uses providers with standard env credentials, prefers an indepen
   choices = await select({ ZAI_API_KEY: 'zai', DEEPSEEK_API_KEY: 'deepseek', ANTHROPIC_API_KEY: 'anthropic' });
   assert.equal(choices.executor.provider, 'zai'); assert.deepEqual(choices.reviewer, { provider: 'anthropic', modelId: 'claude-sonnet-5-5', thinkingLevel: 'high' });
   assert.deepEqual(choices.available.map(choice => choice.provider), ['zai', 'anthropic', 'deepseek']);
+  choices = await select({ ZAI_API_KEY: 'zai', MINIMAX_API_KEY: 'minimax' });
+  assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' });
+  choices = await select({ MINIMAX_API_KEY: 'minimax-only' });
+  assert.deepEqual(choices.executor, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
 });
 test('CI initialization confines runtime paths to runner temp and prepare sets bot identity', t => {
   const f = fixture(t); const envFile = join(f.dir, 'github-env'), agent = join(f.dir, 'agent');
