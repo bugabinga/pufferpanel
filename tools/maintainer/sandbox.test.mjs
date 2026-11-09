@@ -217,7 +217,8 @@ test('ui_snapshot primes the visual image, keeps isolation, runs non-root withou
   // Snapshot time shares the review's sandbox budget and is reported with the visual state.
   await f.sandbox.release();
   assert.deepEqual(f.sandbox.diagnostic().visual, { status: 'available', reason: null, browser: 'Chromium 156.0.8078.79 Alpine Linux', snapshotCalls: 1 });
-  assert.ok(f.sandbox.diagnostic().runSeconds > 0);
+  // Rounded to 0.1 s: a fast fake podman may legitimately report 0.
+  assert.ok(Number.isFinite(f.sandbox.diagnostic().runSeconds) && f.sandbox.diagnostic().runSeconds >= 0);
   // Parameters: at most six absolute routes and a bounded viewport.
   const parameters = compile(f.sandbox.snapshotTool.parameters);
   assert.ok(parameters.check({ routes: ['/'] }) && parameters.check({ routes: Array(6).fill('/servers'), viewport: { width: 320, height: 240 }, login: false }));
