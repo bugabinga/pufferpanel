@@ -64,6 +64,11 @@ test('zero-dispatch requires terminal native original model-step evidence; fallb
   for (const jobs of [[{ name: 'check', conclusion: 'failure' }], [{ name: 'maintain', conclusion: 'skipped' }], [{ name: 'maintain', conclusion: 'failure', steps: [{ name: 'Maintain or review selected task', conclusion: 'skipped' }] }]]) assert.equal(provenZeroDispatch(run, jobs), true);
   for (const jobs of [[], [{ name: 'maintain', conclusion: 'cancelled' }], [{ name: 'maintain', steps: [{ name: 'Maintain or review selected task', conclusion: 'success' }] }]]) assert.equal(provenZeroDispatch(run, jobs), false);
   assert.equal(provenZeroDispatch({ ...run, status: 'in_progress' }, [{ name: 'maintain', conclusion: 'skipped' }]), false);
+  // Never-started first attempts (e.g. GitHub's malicious-workflow approval gate) are proven zero dispatch; other empty job lists stay unknown.
+  for (const conclusion of ['action_required', 'startup_failure']) assert.equal(provenZeroDispatch({ ...run, conclusion, run_attempt: 1 }, []), true);
+  assert.equal(provenZeroDispatch({ ...run, conclusion: 'action_required', run_attempt: 2 }, []), false);
+  assert.equal(provenZeroDispatch({ ...run, conclusion: 'cancelled', run_attempt: 1 }, []), false);
+  assert.equal(provenZeroDispatch({ ...run, conclusion: 'action_required', run_attempt: 1 }, [{ name: 'maintain', conclusion: 'success' }]), false);
   const fallback = { fingerprint: null, ledgerReservation: null, reportedUsage: { status: 'unknown' } };
   assert.equal(noCompletionEvidence(fallback), true);
   for (const change of [{ fingerprint: task.fingerprint }, { ledgerReservation: lease().hash }, { commit: base }, { managementApproved: true }]) assert.equal(noCompletionEvidence({ ...fallback, ...change }), false);

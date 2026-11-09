@@ -137,6 +137,8 @@ export const noCompletionEvidence = report => report?.fingerprint == null && rep
 function singleton(artifacts, name) { const found = artifacts.filter(item => item.name === name); if (found.length > 1) fail('duplicate ledger artifact'); return found[0]; }
 export function provenZeroDispatch(run, jobs) {
   if (run.status !== 'completed' || !Array.isArray(jobs)) return false;
+  // A first attempt GitHub never started (approval-gated or invalid workflow) has no jobs and cannot have dispatched a model.
+  if (!jobs.length && run.run_attempt === 1 && ['action_required', 'startup_failure'].includes(run.conclusion)) return true;
   const maintain = jobs.find(job => job.name === 'maintain');
   if (maintain?.conclusion === 'skipped') return true;
   const model = maintain?.steps?.find(step => step.name === 'Maintain or review selected task');
