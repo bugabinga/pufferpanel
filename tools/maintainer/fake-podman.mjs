@@ -28,8 +28,9 @@ const name = args[args.indexOf('--name') + 1], behavior = visual ?? config.run[a
 fs.writeFileSync(marker('running', name), '');
 // A leaked container survives removal, as when Podman loses track of one.
 if (behavior.leak) fs.writeFileSync(marker('leaked', name), '');
-// Exit only after piped output is flushed, like a real container's.
-const finish = code => { fs.rmSync(marker('running', name), { force: true }); process.stdout.write('', () => process.exit(code)); };
+// Exit only after piped output is flushed, like a real container's: set the code and let the event loop drain;
+// process.exit() can drop a large pending pipe write (flaky truncated tails on CI runners).
+const finish = code => { fs.rmSync(marker('running', name), { force: true }); process.exitCode = code; };
 if (behavior.mutate) { fs.writeFileSync(path.join(behavior.mutate, 'escaped.txt'), 'escaped'); execFileSync('git', ['-C', behavior.mutate, 'add', '-A']); }
 process.stdout.write(behavior.output ?? '');
 if (behavior.bytes) process.stdout.write('HEAD' + 'x'.repeat(behavior.bytes) + 'TAIL');
