@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { pinnedRunroot } from './fake-podman.mjs';
 
 const moduleDir = new URL('.', import.meta.url).pathname;
 const command = (file, args, options = {}) => spawnSync(file, args, { encoding: 'utf8', ...options });
@@ -44,7 +45,10 @@ if(name==='curl'){
   return { root, repo, run, env, git, load, update, publish };
 }
 test('preflight, gate, publisher use identical private Podman arguments and emit gate events', t => {
-  const f = fixture(t); const runroot = join(f.root, 'rr'); mkdirSync(runroot, { mode: 0o700 }); chmodSync(runroot, 0o700);
+  // Explicit runroots must satisfy the 50-byte budget podman.sh enforces on every runner: the harness gate
+  // runs these tests with a deep TMPDIR, where one under tmpdir() is too long and preflight fails closed.
+  const f = fixture(t); const runroot = pinnedRunroot(t);
+  assert.ok(Buffer.byteLength(runroot) <= 50, 'explicit runroot exceeds the 50-byte budget podman.sh enforces');
   const common = { ...f.env, PUFFER_MAINT_STATE: join(f.root, 'state'), PUFFER_MAINT_RUNROOT: runroot, PUFFER_MAINT_SOURCE: f.repo, HONEST_ANNIE_ARTIFACT: join(f.root, 'artifact'), GITHUB_SHA: f.git('rev-parse', 'HEAD') };
   const preflight = command('bash', [join(moduleDir, 'ci.sh'), 'preflight'], { env: common }); assert.equal(preflight.status, 0, preflight.stderr);
   const gate = command('bash', [join(moduleDir, 'gate.sh'), f.repo, f.run], { env: common }); assert.equal(gate.status, 0, gate.stderr);
