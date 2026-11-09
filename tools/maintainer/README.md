@@ -378,6 +378,17 @@ The executor uses an operator-trusted local shell with the operator's OS permiss
 Prompts and protected-path checks are policy defenses, not an OS sandbox or credential-isolation boundary.
 Use a dedicated restricted account/environment before enabling this against untrusted projects if stronger isolation is needed.
 The reviewer's scripts have a confined read tool, fixed diff tool, plan reader, and sandboxed `run` tool, with no host shell or write tool.
+`guard.mjs` is a best-effort tool guard selected for the executor and reviewer conversations; snapshot, protected-path, host-commit, review, and import checks remain authoritative.
+Before a `write` or `edit` it canonicalises the path and rejects targets outside the worktree, through a symlink leaving it, symlinks themselves, `.git`, and `PROTECTED_PATHS` from `task.mjs`, the same list the post-hoc checks use; the tool then runs on the checked absolute path.
+Before a `bash` call it rejects, with a corrective reason, quote-aware command starts that commit, push, tag, hard-reset, rebase, cherry-pick, merge (use `merge_upstream`), change Git config or remotes, push or log in to registries, run `gh`, send credentials with curl/wget, or redirect/`tee` into protected paths, also after `;`, `&&`, `||`, `|`, `$(`, backticks, and inside `sh -c`/`eval`.
+Known gaps include variables, aliases, generated scripts, interpreters such as `python -c`, `cd` before relative redirects, redirects to quoted paths with spaces, unlisted option-argument pairs before a subcommand, and copy commands; the post-hoc checks still catch their source effects.
+A push those gaps let through has no post-hoc undo; the model shell's credential-free environment is the backstop there.
+The shell gate in `gate.sh` keeps its own literal copy of the protected list.
+PR tasks have no executor conversation; maintenance, management, and gate-repair executor turns all select the guard.
+A later harness-repair task kind would install another guard name with `protectedPaths: []`; confinement and `.git` protection stay.
+Results of reviewer `run`, `read_github_plans`, executor reads outside the worktree (intake, private gate log), and executor `bash` that fetches, reads the intake, or names `upstream` are wrapped in `<untrusted id=…>` … `</untrusted id=…>` with a random per-process id.
+Look-alike markers inside are escaped, so content cannot close the block; JSON stays parseable because only non-token strings are wrapped in place.
+Scripts receive the wrapping in the `output` field or string value they would print; exit codes and other structured fields are unchanged.
 Host gate/publisher copies come from the original harness directory, not the candidate checkout.
 Offline tests use real SQLite and faux model turns that drive real codemode scripts and nested tools, real temporary Git worktrees/commits, and stubbed external publisher commands.
 No paid maintenance run, live gate build, registry publication, system installation, or deployment is performed by those tests.

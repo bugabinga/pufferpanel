@@ -13,6 +13,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { advance, RunDoc, createHostHooks, ModelCodingTools, ModelCodemode, installReviewer, snapshot } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 import { fakeReviewSandbox } from './fake-podman.mjs';
+import { createGuard } from './guard.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
 const secretNames = ['GH_TOKEN', 'ANNIE_GH_TOKEN', 'REGISTRY_PASSWORD', 'ZAI_API_KEY'];
@@ -37,6 +38,7 @@ async function fixture(t, responses) {
   registry.install(ModelCodingTools); registry.install(ModelCodemode);
   const { sandbox } = await fakeReviewSandbox(t, dir, state);
   const reviewerExtension = installReviewer(registry, worktree, sandbox);
+  const guard = createGuard({ worktree }); registry.install(guard);
   const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), {
     models,
     registry,
@@ -48,10 +50,10 @@ async function fixture(t, responses) {
   const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc });
   const githubPlanReader = installGitHubPlanReader(registry, root);
   const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: 'faux', modelId: 'faux-1' } };
-  const hooks = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, reviewSandbox: sandbox, executorExtension, githubPlanReader, instructions: 'Offline test.', snapshotHttp: async () => { throw Error('network forbidden'); } });
+  const hooks = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, reviewSandbox: sandbox, executorExtension, githubPlanReader, guard, instructions: 'Offline test.', snapshotHttp: async () => { throw Error('network forbidden'); } });
   hooks.prepare = async () => ({ base, upstream: 'upstream/main', upstreamRef: 'refs/heads/main', upstreamSha: 'b'.repeat(40), intakePath: join(dir, 'intake.json'), usageStart: 0 });
   hooks.execute = async run => {
-    const result = await createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, instructions: 'Offline test.' }).execute(run);
+    const result = await createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, guard, instructions: 'Offline test.' }).execute(run);
     return result;
   };
   hooks.inspect = async () => snapshot(worktree);
@@ -88,6 +90,9 @@ await tools.propose_github({ actions: ${JSON.stringify(actions)} });`),
   const stored = JSON.stringify((await f.harness.snapshot(GitHubPlansDoc, f.root.id, ctx)).plans);
   for (const secret of Object.values(sentinels)) assert.equal(stored.includes(secret), false);
   assert.match(stored, /\[redacted\]/);
+  // The reviewer saw the plans' prose spotlit in place; the JSON stayed printable as JSON.
+  const seen = JSON.stringify((await (await f.harness.conversation(run.reviewer, ctx)).entries({}, 1000, undefined, ctx)).items);
+  assert.match(seen, /<untrusted id=[0-9a-f]{32}>/);
 });
 
 test('same proposal replay deduplicates within run; tomorrow fresh request retires old proposals', async t => {

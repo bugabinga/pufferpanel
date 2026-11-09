@@ -7,6 +7,7 @@ import { defineDoc, defineExtension, defineTool } from '@earendil-works/pi-durab
 import { arr, int, obj, opt, str } from '@earendil-works/pi-schema';
 import { createHash } from 'node:crypto';
 import { redact } from './report.mjs';
+import { PROTECTED_PATHS } from './task.mjs';
 
 const execFile = promisify(execFileCallback);
 const API = 'https://api.github.com';
@@ -88,12 +89,12 @@ export function installGitHubTools(registry, { root, worktree, runDoc }) {
     if (base !== run.base) throw Error('prepared base changed');
     if (await gitOk(worktree, 'merge-base', '--is-ancestor', run.upstreamSha, 'HEAD')) return { output: [{ type: 'text', text: JSON.stringify({ base, upstreamSha: run.upstreamSha, conflicts: [], merged: false, alreadyContained: true }) }] };
     try { await git(worktree, 'merge', '--no-commit', '--no-ff', run.upstreamSha); } catch { /* inspect conflict state below */ }
-    await git(worktree, 'restore', '--source', base, '--staged', '--worktree', '--', '.github', 'tools/maintainer');
+    await git(worktree, 'restore', '--source', base, '--staged', '--worktree', '--', ...PROTECTED_PATHS);
     const conflicts = (await git(worktree, 'diff', '--name-only', '--diff-filter=U')).split('\n').filter(Boolean);
     if (conflicts.length) return { output: [{ type: 'text', text: JSON.stringify({ base, upstreamSha: run.upstreamSha, conflicts, merged: false }) }] };
     const mergeHead = await git(worktree, 'rev-parse', '-q', '--verify', 'MERGE_HEAD').catch(() => null);
     if (mergeHead !== run.upstreamSha) throw Error('upstream merge refused');
-    if (await gitOk(worktree, 'diff', '--quiet', base, '--', '.github', 'tools/maintainer')) return { output: [{ type: 'text', text: JSON.stringify({ base, upstreamSha: run.upstreamSha, conflicts: [], merged: true }) }] };
+    if (await gitOk(worktree, 'diff', '--quiet', base, '--', ...PROTECTED_PATHS)) return { output: [{ type: 'text', text: JSON.stringify({ base, upstreamSha: run.upstreamSha, conflicts: [], merged: true }) }] };
     throw Error('protected paths changed by upstream merge');
   } });
   const propose = defineTool({ name: 'propose_github', description: 'Persist one bounded non-executing GitHub management proposal for this run.', parameters: obj({ actions: arr(actionSchema, { minItems: 1, maxItems: 10 }) }, { open: true }), replay: 'safe', execute: async ({ actions }, api, context) => {

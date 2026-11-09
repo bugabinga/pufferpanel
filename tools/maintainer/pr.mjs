@@ -1,7 +1,7 @@
 import { execFile as callback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { authorTrust } from './github.mjs';
-import { OWN, isSha } from './task.mjs';
+import { OWN, PROTECTED_PATHS, isSha } from './task.mjs';
 const execFile = promisify(callback);
 export const git = async (cwd, ...args) => (await execFile('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })).stdout.trim();
 export const ancestor = async (cwd, a, b) => { try { await git(cwd, 'merge-base', '--is-ancestor', a, b); return true; } catch { return false; } };
@@ -50,7 +50,7 @@ export async function verifyPRHistory(cwd, task, tree = null) {
   if (!await ancestor(cwd, task.base, task.head)) throw Error('PR base not ancestor of head');
   const history = await git(cwd, 'rev-list', '--parents', `${task.base}..${task.head}`);
   if (!history || history.split('\n').some(line => line.split(' ').length !== 2)) throw Error('unsupported PR merge history');
-  const protectedPaths = await git(cwd, 'log', '--format=', '--name-only', `${task.base}..${task.head}`, '--', '.github', 'tools/maintainer');
+  const protectedPaths = await git(cwd, 'log', '--format=', '--name-only', `${task.base}..${task.head}`, '--', ...PROTECTED_PATHS);
   if (protectedPaths) throw Error('PR introduced trusted harness or CI changes');
   const actual = await git(cwd, 'rev-parse', `${task.head}^{tree}`);
   if (tree && tree !== actual) throw Error('PR exact tree mismatch');

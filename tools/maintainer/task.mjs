@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
 export const OWN = 'bugabinga/pufferpanel';
 export const REF = 'refs/heads/trunk';
+// Trusted harness and CI policy: bot edits are refused here (guard.mjs) and by every post-hoc source check.
+export const PROTECTED_PATHS = Object.freeze(['tools/maintainer', '.github']);
 export const isSha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 export const versionFor = day => day.split('-').map(Number).join('.');
 export function validateTask(value) {

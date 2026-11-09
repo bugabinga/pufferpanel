@@ -46,6 +46,8 @@ Actions summaries and explicitly selected sanitized artifacts are the reporting 
 Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, republishing, abandoned, and verified release.
 Executor and reviewer models are offered only the durable `codemode` tool, plus `submit_verdict` for the reviewer; their other tools are callable only from scripts, scripts cannot start scripts, and script `models.*` is disabled so every model request crosses the budgeted provider boundary.
 Nested shell calls use the same credential-free prepared environment as before.
+A best-effort tool guard rejects writes outside the worktree, through escaping symlinks, or into `.git` and the protected harness/CI paths, and shell commands that would bypass host commits, pushes, tags, history, Git configuration, registry publication, GitHub effects, or credential use, each with a corrective reason; post-hoc source checks remain authoritative.
+Untrusted tool output (intake, sandbox runs, persisted plans, remote fetches) reaches models between per-run random-id markers that content cannot forge, without changing exit codes or JSON structure.
 The reviewer ends its review by calling `submit_verdict` once with a closed bounded schema: findings (`id`, `severity` blocking|advisory, optional `file`/`line`, `impact`, `evidence`, `correction`) and what it `checked`.
 The host derives approval from the durable tool record, never from answer text: approve iff exactly one valid call recorded no blocking finding.
 A reviewer run ending without a verdict gets exactly one reminder within the same run, paid budget, and deadline; a second miss, or a repeated verdict, is invalid review output.

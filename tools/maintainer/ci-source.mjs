@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { execFile as callback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { selectedTask, bindTask, readJSON, isSha, REF } from './task.mjs';
+import { selectedTask, bindTask, readJSON, isSha, REF, PROTECTED_PATHS } from './task.mjs';
 import { git, ancestor, verifyPRHistory, checkPR, checkBranchPolicy, githubRead, protectedPolicy } from './pr.mjs';
 import { reportFor } from './report.mjs';
 import { reviewFeedback } from './feedback.mjs';
@@ -31,7 +31,7 @@ export async function metadata(artifact, task, githubSha) {
 export async function verifyCandidate(worktree, run, task) {
   const parents = (await git(worktree, 'show', '-s', '--format=%P', run.commit)).split(' ').filter(Boolean);
   if (parents.length !== run.expectedParents.length || parents.some((p, i) => p !== run.expectedParents[i]) || await git(worktree, 'rev-parse', 'HEAD') !== run.commit || await git(worktree, 'rev-parse', 'HEAD^{tree}') !== run.tree || await git(worktree, 'status', '--porcelain')) throw Error('candidate identity mismatch');
-  if (await git(worktree, 'diff', '--name-only', run.base, run.commit, '--', 'tools/maintainer', '.github')) throw Error('candidate changed trusted harness or CI');
+  if (await git(worktree, 'diff', '--name-only', run.base, run.commit, '--', ...PROTECTED_PATHS)) throw Error('candidate changed trusted harness or CI');
   if (run.taskKind === 'pr') await verifyPRHistory(worktree, task, run.tree);
 }
 export function allowedOld(cwd, run, old) {
