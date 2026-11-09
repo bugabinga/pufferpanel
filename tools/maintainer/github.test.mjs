@@ -1,6 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { collectGitHubSnapshot, authorTrust } from './github.mjs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { collectGitHubSnapshot, authorTrust, writeIntake, removeIntake } from './github.mjs';
+
+test('untrusted intake is private and removable only at its own temp path', async t => {
+  const path = await writeIntake({ own: { prs: { items: [] } } });
+  assert.ok(existsSync(path)); assert.match(dirname(path), /\/pufferpanel-intake-[^/]+$/);
+  await removeIntake(path); assert.equal(existsSync(dirname(path)), false);
+  await removeIntake(path); await removeIntake(undefined);
+  // Anything else, such as a test fixture or a tampered run record, is never removed.
+  const other = mkdtempSync(join(tmpdir(), 'annie-intake-other-')); t.after(() => rmSync(other, { recursive: true, force: true }));
+  writeFileSync(join(other, 'snapshot.json'), '{}'); await removeIntake(join(other, 'snapshot.json')); assert.ok(existsSync(join(other, 'snapshot.json')));
+});
 
 const response = (value, status = 200, headers = {}) => ({ ok: status >= 200 && status < 300, status, headers: new Headers(headers), json: async () => value });
 test('bounded GitHub intake uses fixed API paths and never serializes token', async () => {

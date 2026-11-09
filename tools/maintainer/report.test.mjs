@@ -112,19 +112,27 @@ test('review verdict diagnostics remain bounded and exclude model text', () => {
 });
 test('reviewer sandbox diagnostic is bounded, redacted, idempotent, and reaches report.json and the summary', async t => {
   const env = { ZAI_API_KEY: 'zai-sandbox-sentinel' };
-  const valid = { status: 'limited', reason: 'cgroup limits not delegated: crun: controller `memory` is not available zai-sandbox-sentinel', podmanVersion: '4.9.3', runCalls: 2, runSeconds: 12.5, transcript: 'private run output' };
-  const report = reportFor({ phase: 'rejected', sandbox: valid }, { env });
-  assert.deepEqual(report.sandbox, { status: 'limited', reason: 'cgroup limits not delegated: crun: controller `memory` is not available [redacted]', podmanVersion: '4.9.3', runCalls: 2, runSeconds: 12.5 });
+  const valid = { status: 'limited', reason: 'cgroup limits not delegated: crun: controller `memory` is not available zai-sandbox-sentinel', podmanVersion: '4.9.3', runCalls: 2, runSeconds: 12.5, transcript: 'private run output', visual: { status: 'unavailable', reason: 'visual probe failed: chromium zai-sandbox-sentinel', browser: null, snapshotCalls: 0, screenshot: 'private run output' } };
+  const report = reportFor({ phase: 'rejected', sandbox: { ...valid, cleanupFailed: true }, executorDiagnostics: [{ turn: 'maintenance', stopReason: 'length', textLength: 9 }] }, { env });
+  assert.deepEqual(report.sandbox, { status: 'limited', reason: 'cgroup limits not delegated: crun: controller `memory` is not available [redacted]', podmanVersion: '4.9.3', runCalls: 2, runSeconds: 12.5, visual: { status: 'unavailable', reason: 'visual probe failed: chromium [redacted]', browser: null, snapshotCalls: 0 }, cleanupFailed: true });
   assert.deepEqual(reportFor(report, { env }).sandbox, report.sandbox);
   assert.doesNotMatch(JSON.stringify(report), /private run output|zai-sandbox-sentinel/);
   assert.equal(reportFor({ sandbox: { status: 'escaped' } }).sandbox, null); assert.equal(reportFor({}).sandbox, null);
-  assert.deepEqual(reportFor({ sandbox: { status: 'unavailable', reason: 'x'.repeat(500), podmanVersion: '4.9.3; rm -rf /', runCalls: -1, runSeconds: 'NaN' } }).sandbox, { status: 'unavailable', reason: 'x'.repeat(200), podmanVersion: null, runCalls: null, runSeconds: null });
+  assert.deepEqual(reportFor({ sandbox: { status: 'unavailable', reason: 'x'.repeat(500), podmanVersion: '4.9.3; rm -rf /', runCalls: -1, runSeconds: 'NaN' } }).sandbox, { status: 'unavailable', reason: 'x'.repeat(200), podmanVersion: null, runCalls: null, runSeconds: null, visual: null });
+  // Hostile executor, repair, and cleanup evidence stays closed and bounded.
+  const hostile = reportFor({ executorDiagnostics: [{ turn: 'x', stopReason: 'rm -rf /', textLength: -1, lengthReminded: 'yes' }, { turn: 'gate-repair', stopReason: 'length', textLength: 12, lengthReminded: true }, { turn: 'maintenance' }], gateRepairSkipped: 'other', sandbox: { status: 'available', cleanupFailed: 'yes' } });
+  assert.deepEqual(hostile.executorDiagnostics, [{ turn: 'unknown', stopReason: 'unknown', lengthCapped: false, lengthReminded: false, textLength: null }, { turn: 'gate-repair', stopReason: 'length', lengthCapped: true, lengthReminded: true, textLength: 12 }]);
+  assert.equal(hostile.gateRepairSkipped, null); assert.equal('cleanupFailed' in hostile.sandbox, false);
+  assert.equal(reportFor({ sandbox: { status: 'available', cleanupFailed: true } }).sandbox.cleanupFailed, true);
+  // Visual review: closed status, bounded reason, plain browser version, sane call count.
+  assert.deepEqual(reportFor({ sandbox: { status: 'available', visual: { status: 'skipped', reason: 'y'.repeat(300), browser: 'Chromium 156; rm -rf /', snapshotCalls: 1.5 } } }).sandbox.visual, { status: 'skipped', reason: 'y'.repeat(200), browser: null, snapshotCalls: null });
+  assert.equal(reportFor({ sandbox: { status: 'available', visual: { status: 'rendered' } } }).sandbox.visual, null);
   const dir = await scratch(t), input = join(dir, 'result.json'), summary = join(dir, 'summary.md');
   await writeFile(input, JSON.stringify(report));
   const collected = await collect({ reportPath: input, reportDir: join(dir, 'artifact'), summaryPath: summary });
   assert.deepEqual(collected.sandbox, report.sandbox);
   assert.deepEqual(JSON.parse(await readFile(join(dir, 'artifact', 'report.json'), 'utf8')).sandbox, report.sandbox);
-  assert.match(await readFile(summary, 'utf8'), /Reviewer sandbox: limited \(cgroup limits not delegated.*podman 4\.9\.3; 2 runs, 12\.5 s\)/);
+  assert.match(await readFile(summary, 'utf8'), /Executor: final answer hit the output cap \(maintenance\); a script may not have run  \nReviewer sandbox: limited \(cgroup limits not delegated.*podman 4\.9\.3; 2 runs, 12\.5 s; container cleanup failed\)  \nVisual review: unavailable \(visual probe failed: chromium \\\[redacted\\\]; 0 snapshots\)/);
 });
 test('sarcastic voice keeps no-op and failed outcomes explicit', async t => {
   const dir = await scratch(t); const input = join(dir, 'input.json'); const summary = join(dir, 'summary.md');

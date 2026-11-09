@@ -10,6 +10,7 @@ No klops auto-update configuration is changed.
 Daily timer → isolated persistent worktree → bounded maintenance agent → independent reviewer with an offline sandbox over frozen tree T → fixed gates → host commit → numbered image → `latest`.
 No useful changes → no commit or release.
 A failed fixed gate permits one maintenance-only diagnosis/repair using a bounded private log, inside the original budget and deadline.
+A repair starts only with at least 75 minutes left before the run deadline; later, the gate failure stands and the report says `gateRepairSkipped: insufficient-time`.
 Repairs revoke prior approval, get a fresh independent full review, and rerun every gate; PR tasks never acquire a coding turn.
 A rejected draft remains in the maintenance worktree for the next daily batch.
 Desktop mode never pushes Git remote refs.
@@ -75,6 +76,7 @@ The reservation adds that budget with pi-ai's own `adjustMaxTokensForThinking` (
 pi-ai may still clamp the sent value to the remaining context, so the reservation is an upper bound on the adapter's max output.
 An offline test drives the real pi-ai anthropic-messages and openai-completions adapters and fails if the sent `max_tokens` differs from the reservation; bedrock is not covered.
 Both conversations are offered only Pi Durable's `codemode` tool (QuickJS sandbox, 256 MiB VM memory limit); the reviewer also gets `submit_verdict`.
+Each executor turn's final stop reason is reported in `executorDiagnostics`; a final answer cut at the output cap, which can silently drop a truncated codemode script, gets one continuation per executor conversation asking for a shorter script.
 Scripts call the other tools as nested calls; `codemode` and `submit_verdict` are model-only, and script `models.*` is disabled because it would bypass this provider boundary.
 Nested `bash` uses the same prepared credential-free shell environment.
 Code mode replays a script after a restart from its journal; per Pi Durable's replay policy a nested `bash` interrupted mid-run is not replay-safe, so it rejects in the script as interrupted instead of rerunning.
@@ -324,6 +326,8 @@ Offline fixtures do not establish those production seams.
 ## Verification and release
 
 Host gates run pinned frozen frontend install/tests/lint/build, byte-check vendored Ace, full uncached Go normal/race suites, vet, actionlint, and first-party whitespace checks.
+Every gate build and check reads a private export of exactly the gated tree, made by the same `puffer_export_tree` as reviewer priming, so `gate.ok` still names that tree and the gate reuses every primed layer.
+A linked worktree's `.git` pointer file alone changed the `COPY . .` digest in a local probe, and an ignored `client/frontend/dist` leftover changed `COPY client .`; neither reaches an export.
 Go runs in the glibc Docker test stage with built frontend embeds, not an Alpine container missing gcc/game compatibility/assets.
 The successful gate receipt identifies the exact Git tree, not a reusable boolean success marker.
 Only the host creates a commit after an independent `submit_verdict` with zero blocking findings and unchanged candidate identity.
@@ -348,6 +352,8 @@ That build executes the candidate's Dockerfile, including its `go test ./...` an
 The build's Podman client gets only session and storage variables; no provider key, GitHub token, or registry auth reaches it or the build.
 It runs only after the same head, tree, diff, and protected-path check that guards review, and it approves nothing.
 A failed or late build leaves `run` rejecting as unavailable; the review continues read-only, and the fixed gate rebuilds and reports the failure.
+Priming starts only if the deadline still holds the 30-minute review window, a 35-minute gate reserve, and one more minute; otherwise `run` and `ui_snapshot` are unavailable with `insufficient time before the run deadline` and the review stays read-only.
+Measured locally with Podman 6.1.4, on a host not otherwise idle: a cold prime of `node` and `tests` took 774 s, then the gate took 959 s with all 4 `node` and all 31 `tests` build steps from cache (3 s and 34 s), despite a planted ignored `dist` file in the worktree; Go normal 417 s, race 442 s, vet 56 s, actionlint 7 s.
 Its build log stays in the private run directory as `review-prime.log`.
 Management-only candidates change no source, so they skip the build and `run` rejects as unavailable.
 `run({ command, timeoutSeconds?, toolchain? })` starts a disposable rootless container by image ID with `--network=none`, `--read-only`, T mounted read-only at `/src`, and a 4 GiB executable tmpfs `/tmp` holding a fresh copy in `/tmp/work`.
@@ -361,23 +367,49 @@ If the probe fails because cgroup controllers are not delegated, or if Podman sa
 An unknown `--unsetenv-all` falls back to explicit `--unsetenv` of the image's and Podman's defaults, and an unknown `--read-only-tmpfs` to Podman's default read-only tmpfs mounts; Podman 4.9 supports both flags, so these paths are not expected to fire there.
 Any other probe failure makes the sandbox `unavailable`; network isolation, the read-only source, and environment isolation are never dropped.
 Removal uses `--stop-timeout 0` with `podman rm --force`, so no `rm --time` support is needed.
-The run report carries a sanitized `sandbox` diagnostic: `available`, `limited`, or `unavailable`, a reason of at most 200 redacted characters, the Podman version (recorded even when priming fails), and the count and total seconds of `run` calls.
+The run report carries a sanitized `sandbox` diagnostic: `available`, `limited`, or `unavailable`, a reason of at most 200 redacted characters, the Podman version (recorded even when priming fails), the count and total seconds of `run` calls, and `visual`: `available`, `unavailable`, or `skipped` with a bounded reason, the Chromium version, and the `ui_snapshot` call count.
 Calls run one at a time, default 5 minutes, at most 15, and share 30 minutes of sandbox time per review inside the run deadline.
 `run` resolves `{ exitCode, output, truncated }` for every exit code, keeping the first and last 32 KiB of combined output around an omission marker.
 Timeouts, Podman exit 125, and a missing exit status reject instead.
 Timeout, abort, and review end remove the container with `podman rm --force` and verify it is gone; `podman run --timeout` is a backstop if the host dies.
+A container that review end cannot remove is reported as `cleanupFailed: true`; it never discards a recorded verdict and fails the review only when none was recorded.
 The sandbox budget lives in the process; a restarted review starts a fresh one, still bounded by the run deadline, and an interrupted `run` is never replayed.
 Each call starts with a cold Go build cache, so broad builds and `-race` runs are slow; full suites stay with the fixed gates.
 After the reviewer settles, the host compares head, index tree, full diff, and protected paths with the recorded candidate; any change discards the verdict as `invalid-review`.
 `run.sh` exports its pinned `PUFFER_MAINT_RUNROOT`, because Podman's storage database rejects a different runroot for the same root; the sandbox refuses to start without one.
 Fake-Podman tests cover flags, environment, freezing, capping, timeout and abort cleanup, and the budget; an optional real rootless smoke runs only with a local `alpine:3.22.0` and never pulls.
 
+### Visual review
+
+When the frozen candidate changes a path under `client/` or `web/`, priming also builds a visual image from the host-owned `visual.Containerfile`; other candidates skip it and `report.sandbox.visual` says `skipped`.
+The image is the digest-pinned `node:26.12.1-alpine`, that Alpine branch's Chromium and DejaVu fonts, the candidate's own panel binary copied from the just-primed `tests` image, and the host-owned `ui-driver.mjs`.
+The panel binary comes from the Alpine `builder` stage with cgo sqlite, so it is musl-dynamic: it runs in the Alpine visual image but not in the glibc `tests` image.
+Chromium follows that Alpine branch's security builds instead of an exact apk pin, which would break priming on every Alpine update; the report records the installed version.
+A visual build failure only makes `ui_snapshot` unavailable; `run` and the fixed gate are unaffected.
+A visual probe runs the probed profile as uid 65534 and requires loopback-only networking, a read-only root, an empty environment, a starting Chromium, a running panel binary, and a readable driver.
+`ui_snapshot({ routes, viewport?, login? })` is script-only and `replay: "unsafe"`; each call starts a fresh container with the `run` profile plus `--user 65534:65534`, `TZ=UTC`, `LANG=C.UTF-8`, and no host mount at all.
+Inside, a throwaway tmpfs config binds the panel to `127.0.0.1:8080` with sqlite in `/tmp/panel`, the daemon and SFTP off, and a random session key.
+The panel's own CLI then runs `db upgrade` and `user add --admin` with a 48-hex password generated in the container for that call only, before `pufferpanel run` and the driver start.
+The driver speaks CDP over `--remote-debugging-pipe`, so Chromium opens no port, and fixes viewport (default 1280×800), UTC, en-US, light scheme, reduced motion, and a style that stops animations, transitions, and the caret.
+`login: true` signs in through the real login form; an empty virtual WebAuthn authenticator makes the form's passkey attempt fail at once.
+Per route it returns final URL, title, 4000 characters of visible text, 60 accessibility-tree lines for landmarks, headings, and controls, console errors and warnings, uncaught exceptions, failed requests (status ≥400 or failed loads), `offlineRequests` to other hosts that fail only because the container is offline, and a viewport PNG.
+Limits are 6 routes per call, 8 calls per review, 1 MiB base64 per screenshot after one half-scale retry, 3 MiB per call, and 6 MiB of driver output; each call may take 60 s plus 25 s per route and login, from the same 30-minute budget as `run`.
+Screenshots are image blocks `{ type: 'image', data, mimeType: 'image/png' }` in the structured result, so a reviewer script shows one to the model with `image(route.screenshot)`.
+When the configured reviewer model's `input` lacks `image`, the result sets `imageInput: false`, omits screenshots, and says so; text signals stay, and pi-ai already replaces images with a placeholder for text-only models after a failover.
+Results are spotlit like `run`: every non-token string is wrapped in untrusted markers, while image blocks stay intact for `image()`.
+Chromium runs with `--no-sandbox` as uid 65534: measured locally, it refuses to start as root without that flag, and as non-root its namespace sandbox aborts at `sys_chroot` under `--cap-drop all` and `no-new-privileges`.
+The offline, capability-free, read-only, non-root container is the isolation boundary instead, and it holds only the candidate's own panel.
+Measured locally with Podman 6.1.4 on a cold disk-backed private store: `node` 90 s, `tests` 999 s including the Dockerfile's `go test ./...`, visual image about 60 s cold (Chromium layer about 815 MB) and 1 s cached.
+A cached re-prime with the visual image took 30 to 44 s, one public route took 2 to 4 s, and login plus two routes took 25 s, all well inside the 40-minute priming and 2-hour run limits.
+A local end-to-end run against this repository rendered `/auth/login`, then after login `/servers` and `/self`, with no console errors, exceptions, or failed requests; only the Gravatar avatar request failed offline.
+Unverified on the hosted runner: Podman 4.9's `COPY --chmod` with a local `--from` image, subordinate-ID mapping for uid 65534, and disk headroom for the extra image of about 1 GB.
+
 ## Trust and tests
 
 The executor uses an operator-trusted local shell with the operator's OS permissions.
 Prompts and protected-path checks are policy defenses, not an OS sandbox or credential-isolation boundary.
 Use a dedicated restricted account/environment before enabling this against untrusted projects if stronger isolation is needed.
-The reviewer's scripts have a confined read tool, fixed diff tool, plan reader, and sandboxed `run` tool, with no host shell or write tool.
+The reviewer's scripts have a confined read tool, fixed diff tool, plan reader, sandboxed `run` tool, and sandboxed `ui_snapshot` tool, with no host shell or write tool.
 `guard.mjs` is a best-effort tool guard selected for the executor and reviewer conversations; snapshot, protected-path, host-commit, review, and import checks remain authoritative.
 Before a `write` or `edit` it canonicalises the path and rejects targets outside the worktree, through a symlink leaving it, symlinks themselves, `.git`, and `PROTECTED_PATHS` from `task.mjs`, the same list the post-hoc checks use; the tool then runs on the checked absolute path.
 Before a `bash` call it rejects, with a corrective reason, quote-aware command starts that commit, push, tag, hard-reset, rebase, cherry-pick, merge (use `merge_upstream`), change Git config or remotes, push or log in to registries, run `gh`, send credentials with curl/wget, or redirect/`tee` into protected paths, also after `;`, `&&`, `||`, `|`, `$(`, backticks, and inside `sh -c`/`eval`.
@@ -386,7 +418,7 @@ A push those gaps let through has no post-hoc undo; the model shell's credential
 The shell gate in `gate.sh` keeps its own literal copy of the protected list.
 PR tasks have no executor conversation; maintenance, management, and gate-repair executor turns all select the guard.
 A later harness-repair task kind would install another guard name with `protectedPaths: []`; confinement and `.git` protection stay.
-Results of reviewer `run`, `read_github_plans`, executor reads outside the worktree (intake, private gate log), and executor `bash` that fetches, reads the intake, or names `upstream` are wrapped in `<untrusted id=…>` … `</untrusted id=…>` with a random per-process id.
+Results of reviewer `run`, `ui_snapshot`, `read_github_plans`, executor reads outside the worktree (intake, private gate log), and executor `bash` that fetches, reads the intake, or names `upstream` are wrapped in `<untrusted id=…>` … `</untrusted id=…>` with a random per-process id.
 Look-alike markers inside are escaped, so content cannot close the block; JSON stays parseable because only non-token strings are wrapped in place.
 Scripts receive the wrapping in the `output` field or string value they would print; exit codes and other structured fields are unchanged.
 Host gate/publisher copies come from the original harness directory, not the candidate checkout.

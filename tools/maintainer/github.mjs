@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { defineDoc, defineExtension, defineTool } from '@earendil-works/pi-durable';
@@ -58,6 +58,11 @@ export async function writeIntake(snapshot) {
   const path = join(dir, 'snapshot.json');
   await writeFile(path, JSON.stringify(snapshot), { mode: 0o600 });
   return path;
+}
+// Intake is untrusted data for one process: removed when that process ends, never left in temp space.
+export async function removeIntake(path) {
+  if (typeof path !== 'string' || basename(path) !== 'snapshot.json' || !basename(dirname(path)).startsWith('pufferpanel-intake-') || dirname(dirname(path)) !== tmpdir()) return;
+  await rm(dirname(path), { recursive: true, force: true });
 }
 export async function authorTrust(login, { fetchImpl = fetch, token = null } = {}) {
   if (!/^[A-Za-z0-9-]{1,39}$/.test(login ?? '')) return { eligible: false, reason: 'invalid-login' };

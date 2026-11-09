@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 module=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$module/podman.sh"
-usage() { echo 'usage: sandbox.sh version STATE | prime STATE SNAPSHOT LOG SECONDS | probe STATE SNAPSHOT IMAGE | run STATE SNAPSHOT go|node IMAGE PROFILE NAME SECONDS COMMAND | kill STATE NAME' >&2; exit 64; }
+usage() { echo 'usage: sandbox.sh version STATE | prime STATE SNAPSHOT LOG SECONDS VISUAL | probe STATE SNAPSHOT IMAGE | run STATE SNAPSHOT go|node IMAGE PROFILE NAME SECONDS COMMAND | vprobe STATE IMAGE PROFILE | visual STATE IMAGE PROFILE NAME SECONDS INPUT | kill STATE NAME' >&2; exit 64; }
 [[ $# -ge 2 ]] || usage
 # One pinned runroot per process: Podman's storage database rejects a different runroot for the same root.
 [[ -n ${PUFFER_MAINT_RUNROOT:-} ]] || { echo 'pinned Podman runroot required' >&2; exit 64; }
@@ -15,6 +15,28 @@ profile_pattern='^(limits|nolimits),(unsetenv-all|unsetenv-image),(ro-tmpfs|defa
 base_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 go_env=(--env "PATH=/usr/local/go/bin:/go/bin:$base_path" --env GOPATH=/go --env GOMODCACHE=/go/pkg/mod --env GOCACHE=/tmp/go-cache --env GOFLAGS=-mod=readonly --env GOPROXY=off --env GOSUMDB=off --env GOTOOLCHAIN=local)
 node_env=(--env "PATH=$base_path" --env npm_config_offline=true)
+# The visual container runs as an unprivileged uid with a fixed locale and timezone, and mounts nothing from the host.
+visual_env=(--env "PATH=$base_path" --env TZ=UTC --env LANG=C.UTF-8)
+visual_user=65534:65534
+run_user=
+# Throwaway panel: tmpfs config, sqlite database, and a per-run random admin password, created with the panel's own CLI.
+# Only loopback exists (--network=none); the daemon and its SFTP listener stay off. Setup failures become a JSON error line.
+read -r -d '' visual_setup <<'EOF' || true
+set -eu
+umask 077
+d=/tmp/panel
+mkdir -p "$d/data" /tmp/home
+key=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+od -An -N24 -tx1 /dev/urandom | tr -d ' \n' >"$d/password"
+printf '{"logs":"%s/logs","web":{"host":"127.0.0.1:8080"},"panel":{"database":{"dialect":"sqlite3","url":"file:%s/panel.db?cache=shared"},"web":{"files":""},"sessionKey":"%s"},"daemon":{"enable":false,"data":{"root":"%s/data"}}}' "$d" "$d" "$key" "$d" >"$d/config.json"
+cd "$d"
+panel() { /opt/annie/pufferpanel --config "$d/config.json" "$@"; }
+if ! { panel db upgrade >"$d/setup.log" 2>&1 || [ $? = 9 ]; } || ! panel user add --name annie --email annie@example.com --password "$(cat "$d/password")" --admin >>"$d/setup.log" 2>&1 || ! grep -q 'User added' "$d/setup.log"; then
+  echo '{"error":"candidate panel seeding failed (db upgrade or user add)"}'; exit 0
+fi
+panel run >"$d/panel.log" 2>&1 &
+exec node /opt/annie/ui-driver.mjs "$1"
+EOF
 
 # Flags every profile keeps: no network, read-only root and source, no capabilities, explicit environment only, timeouts.
 # A profile may only drop cgroup limits or swap a flag for its Podman 4.9 equivalent.
@@ -26,7 +48,8 @@ container_args() {
   for key in "${env[@]}"; do [[ $key == --env ]] || explicit+="${key%%=*} "; done
   args=(run --rm --name "$name" --label pufferpanel.annie.review=1 --pull=never --network=none --read-only)
   [[ $tmpfs == ro-tmpfs ]] && args+=(--read-only-tmpfs=false)
-  args+=(--tmpfs /tmp:rw,exec,nosuid,nodev,size=4g,mode=1777 -v "$snapshot:/src:ro")
+  args+=(--tmpfs /tmp:rw,exec,nosuid,nodev,size=4g,mode=1777)
+  [[ $snapshot == - ]] || args+=(-v "$snapshot:/src:ro")
   if [[ $envmode == unsetenv-all ]]; then args+=(--unsetenv-all); else
     for key in container TERM $("${podman[@]}" image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" | cut -d= -f1); do
       [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo 'unexpected image environment' >&2; return 1; }
@@ -35,6 +58,7 @@ container_args() {
   fi
   args+=(--http-proxy=false "${env[@]}" --env HOME=/tmp/home --env TMPDIR=/tmp)
   [[ $limits == limits ]] && args+=(--memory 8g --memory-swap 8g --cpus 4 --pids-limit 4096)
+  [[ -z $run_user ]] || args+=(--user "$run_user")
   args+=(--cap-drop all --security-opt no-new-privileges --stop-timeout 0 --timeout "$((seconds + 30))" --log-driver none -w /tmp --entrypoint /bin/sh "$image")
 }
 remove_container() {
@@ -55,7 +79,7 @@ case $mode in
     podman_version
     ;;
   prime)
-    [[ $# == 5 && $3 == /* && $4 == /* && $5 =~ ^[1-9][0-9]*$ ]] || usage
+    [[ $# == 6 && $3 == /* && $4 == /* && $5 =~ ^[1-9][0-9]*$ && $6 =~ ^[01]$ ]] || usage
     snapshot=$(realpath -e "$3") log=$4
     # The fixed gate's own image builds, from the exported snapshot rather than the mutable worktree.
     # They run the candidate's Dockerfile with network but without credentials, before review.
@@ -66,7 +90,17 @@ case $mode in
       (( end > SECONDS )) || { echo 'sandbox priming deadline exceeded' >&2; exit 1; }
       timeout --signal=TERM --kill-after=30s "$((end - SECONDS))s" "${podman[@]}" build "${PUFFER_MAINT_BUILD_ARGS[@]}" --target "$target" -t "localhost/pufferpanel-maintainer-$target" -f Dockerfile . >>"$log" 2>&1
     done
-    printf '%s %s\n' "$("${podman[@]}" image inspect --format '{{.Id}}' localhost/pufferpanel-maintainer-tests)" "$("${podman[@]}" image inspect --format '{{.Id}}' localhost/pufferpanel-maintainer-node)"
+    # The visual image adds the browser layer and the candidate's panel binary; its failure only disables ui_snapshot.
+    visual=-
+    if [[ $6 == 1 ]] && (( end > SECONDS )); then
+      context=$(mktemp -d)
+      cp "$module/visual.Containerfile" "$context/Containerfile"; cp "$module/ui-driver.mjs" "$context/"
+      if timeout --signal=TERM --kill-after=30s "$((end - SECONDS))s" "${podman[@]}" build "${PUFFER_MAINT_BUILD_ARGS[@]}" -t localhost/pufferpanel-maintainer-visual -f "$context/Containerfile" "$context" >>"$log" 2>&1; then
+        visual=$("${podman[@]}" image inspect --format '{{.Id}}' localhost/pufferpanel-maintainer-visual)
+      fi
+      rm -rf "$context"
+    fi
+    printf '%s %s %s\n' "$("${podman[@]}" image inspect --format '{{.Id}}' localhost/pufferpanel-maintainer-tests)" "$("${podman[@]}" image inspect --format '{{.Id}}' localhost/pufferpanel-maintainer-node)" "$visual"
     ;;
   probe)
     # One trivial container per review proves the profile; output is key=value lines, always exit 0 once parsed.
@@ -128,6 +162,40 @@ echo sandbox-probe-ok'
     status=$?
     set -e
     # Only a status on fd 3 proves Podman ran; the host treats its absence as infrastructure failure.
+    printf '%s\n' "$status" >&3
+    ;;
+  vprobe)
+    # The visual container keeps the probed profile and adds a non-root uid; it must run the browser and the panel binary.
+    [[ $# == 4 && $3 =~ ^[a-f0-9]{64}$ && $4 =~ $profile_pattern ]] || usage
+    image=$3 profile=$4 run_user=$visual_user name="annie-review-vprobe$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+    check='if [ "$(id -u)" = 0 ]; then echo "vprobe: running as root"; exit 1; fi
+if [ "$(grep -c : /proc/net/dev)" != 1 ]; then echo "vprobe: network not isolated"; exit 1; fi
+for f in /opt/annie/.probe /etc/.probe; do if touch "$f" 2>/dev/null; then echo "vprobe: root writable"; exit 1; fi; done
+for v in $(env | cut -d= -f1); do case $v in PATH|HOME|TMPDIR|HOSTNAME|PWD|SHLVL|OLDPWD|_|TZ|LANG) ;; *) echo "vprobe: unexpected environment variable $v"; exit 1;; esac; done
+mkdir -p /tmp/home; cd /tmp
+v=$(chromium-browser --version 2>/dev/null) || { echo "vprobe: chromium does not start"; exit 1; }
+/opt/annie/pufferpanel version >/dev/null 2>&1 || { echo "vprobe: candidate panel binary does not run"; exit 1; }
+[ -r /opt/annie/ui-driver.mjs ] || { echo "vprobe: driver unreadable"; exit 1; }
+echo "browser=$v"; echo visual-probe-ok'
+    set +e
+    out=$(container_args "$profile" "$name" 60 - "$image" "${visual_env[@]}" && "${podman[@]}" "${args[@]}" -ec "$check" visual-probe 2>&1)
+    code=$?
+    set -e
+    remove_container "$name" || { printf 'status=unavailable\nreason=visual probe container cleanup failed\nbrowser=\n'; exit 0; }
+    if (( code == 0 )) && [[ $out == *visual-probe-ok* ]]; then
+      browser=$(grep -m1 '^browser=' <<<"$out" | cut -d= -f2- | tr -cd '[:alnum:] .+_-' | cut -c1-60)
+      printf 'status=available\nreason=\nbrowser=%s\n' "$browser"; exit 0
+    fi
+    printf 'status=unavailable\nreason=visual probe failed: %s\nbrowser=\n' "$(grep -viE '^(WARN|time=)' <<<"$out" | first_line '[^[:space:]]')"
+    ;;
+  visual)
+    [[ $# == 7 && $3 =~ ^[a-f0-9]{64}$ && $4 =~ $profile_pattern && $5 =~ $name_pattern && $6 =~ ^[1-9][0-9]{0,3}$ && $7 == '{'* ]] || usage
+    image=$3 profile=$4 name=$5 seconds=$6 input=$7 run_user=$visual_user
+    container_args "$profile" "$name" "$seconds" - "$image" "${visual_env[@]}"
+    set +e
+    "${podman[@]}" "${args[@]}" -ec "$visual_setup" visual "$input"
+    status=$?
+    set -e
     printf '%s\n' "$status" >&3
     ;;
   kill)

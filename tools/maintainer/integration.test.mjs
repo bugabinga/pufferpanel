@@ -17,7 +17,7 @@ import { materializePR, verifyPRHistory, checkPR, git } from './pr.mjs';
 import { pushSource, metadata, verifyCandidate } from './ci-source.mjs';
 import { reportFor, collect } from './report.mjs';
 import { approvedPlan } from './management.mjs';
-import { fakeReviewSandbox } from './fake-podman.mjs';
+import { fakeReviewSandbox, pinnedRunroot } from './fake-podman.mjs';
 const moduleDir = new URL('.', import.meta.url).pathname;
 const response = (body, status = 200, link = '') => ({ ok: status === 200, status, headers: new Headers({ link }), json: async () => body });
 const apiData = task => ({
@@ -46,7 +46,7 @@ async function fixture(t) {
   const task = validateTask({ kind: 'pr', day: '2026-04-03', repo: 'bugabinga/pufferpanel', ref: 'refs/heads/trunk', base, head, number: 7, author: 'trusted', upstreamSha: base, upstreamRef: 'refs/heads/trunk', fingerprint: 'f'.repeat(64) });
   const state = join(dir, 'model-state'), worktree = join(state, 'worktree');
   g('worktree', 'add', '-q', '-b', 'pi-maintenance', worktree);
-  return { dir, source, origin, upstream, state, worktree, task, g, base, head, tree };
+  return { dir, source, origin, upstream, state, worktree, task, g, base, head, tree, runroot: pinnedRunroot(t) };
 }
 async function candidate(f) {
   await materializePR(f.worktree, f.task, { fetchImpl: fakeFetch(f.task) });
@@ -74,6 +74,7 @@ test('actual faux PR route executes ZERO coding turns, reviewer reads complete B
   t.after(() => harness.close(ctx)); const root = await harness.root(ctx);
   const choices = { executor: { provider: 'nonexistent', modelId: 'forbidden' }, reviewer: { provider: 'faux', modelId: 'faux-1' } };
   const hooks = createHostHooks({ root, harness, state: f.state, worktree: f.worktree, models: choices, reviewerExtension, reviewSandbox: sandbox, guard, task: f.task, upstreamUrl: f.upstream, snapshotHttp: fakeFetch(f.task), intakeProvider: async () => ({ upstream: {} }) });
+  t.after(() => hooks.dispose());
   let gates = 0, reviews = 0; const originalReview = hooks.review;
   hooks.review = async run => { reviews++; assert.match((await snapshot(f.worktree)).diff, /PR full change/); return originalReview(run); };
   hooks.gate = async run => { gates++; assert.equal(run.tree, f.tree); assert.equal(await git(f.worktree, 'rev-parse', 'HEAD'), f.base); };
@@ -137,7 +138,7 @@ fs.writeFileSync(p,JSON.stringify(s));
 `;
   for (const name of ['podman', 'curl']) { await writeFile(join(bin, name), fake); await chmod(join(bin, name), 0o700); }
   const fakeState = join(f.dir, 'fake.json'); await writeFile(fakeState, JSON.stringify({ commands: [], remote: {}, sha: f.head, version: run.version, config: 'a'.repeat(64) }));
-  const env = { ...process.env, GITHUB_ACTIONS: 'false', NODE_OPTIONS: `--import=${preload}`, PATH: `${bin}:${process.env.PATH}`, FAKE_STATE: fakeState, PUFFER_MAINT_TASK: JSON.stringify(f.task), PUFFER_MAINT_SOURCE: f.source, PUFFER_MAINT_STATE: f.state, PUFFER_MAINT_RESULT: result, GITHUB_SHA: f.base, HONEST_ANNIE_ARTIFACT: artifact, GITHUB_OUTPUT: output };
+  const env = { ...process.env, GITHUB_ACTIONS: 'false', NODE_OPTIONS: `--import=${preload}`, PATH: `${bin}:${process.env.PATH}`, FAKE_STATE: fakeState, PUFFER_MAINT_TASK: JSON.stringify(f.task), PUFFER_MAINT_SOURCE: f.source, PUFFER_MAINT_STATE: f.state, PUFFER_MAINT_RESULT: result, GITHUB_SHA: f.base, HONEST_ANNIE_ARTIFACT: artifact, GITHUB_OUTPUT: output, PUFFER_MAINT_RUNROOT: f.runroot };
   const cli = (action, extra = {}) => spawnSync('bash', [join(moduleDir, 'ci.sh'), action], { env: { ...env, ...extra }, encoding: 'utf8' });
   return { cli, env, artifact, output, fakeState };
 }

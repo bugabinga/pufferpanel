@@ -22,6 +22,13 @@ fi
 before=$(git diff --binary HEAD | sha256sum | cut -d' ' -f1)
 tree=$(git write-tree)
 run whitespace git diff --check HEAD -- . ':(exclude)client/frontend/public/js/ace/**'
+# Every build and check below reads a private export of exactly $tree, the same context reviewer priming built from,
+# so its image layers are reused and nothing outside the recorded tree (.git pointer, ignored outputs) reaches them.
+context=$(mktemp -d)
+trap 'chmod -R u+w "$context" 2>/dev/null; rm -rf "$context"' EXIT
+exported=$context/src
+puffer_export_tree "$worktree" "$tree" "$exported"
+cd "$exported"
 build_args=("${PUFFER_MAINT_BUILD_ARGS[@]}")
 # The node stage itself runs frozen dependency install, JS tests, lint and production build.
 run node "${podman[@]}" build "${build_args[@]}" --target node -t localhost/pufferpanel-maintainer-node -f Dockerfile .
@@ -41,6 +48,7 @@ run go-normal "${test_run[@]}" 'go test -count=1 ./...'
 run go-race "${test_run[@]}" 'go test -race -count=1 ./...'
 run go-vet "${test_run[@]}" 'go vet ./...'
 # Pinned check tool, without mutating project module files or host caches.
-run actionlint "${podman[@]}" run --rm --network host -v "$worktree/.github:/checks/.github:ro" -e TMPDIR=/tmp -e GOCACHE=/tmp/go-cache --entrypoint sh localhost/pufferpanel-maintainer-tests -ec 'go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -config-file /checks/.github/actionlint.yaml /checks/.github/workflows/*.yml'
+run actionlint "${podman[@]}" run --rm --network host -v "$exported/.github:/checks/.github:ro" -e TMPDIR=/tmp -e GOCACHE=/tmp/go-cache --entrypoint sh localhost/pufferpanel-maintainer-tests -ec 'go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -config-file /checks/.github/actionlint.yaml /checks/.github/workflows/*.yml'
+cd "$worktree"
 [[ $(git write-tree) == "$tree" && $(git diff --binary HEAD | sha256sum | cut -d' ' -f1) == "$before" && -z $(git ls-files --others --exclude-standard) ]] || { echo 'candidate changed during verification' >&2; exit 1; }
 printf '%s\n' "$tree" >"$run_dir/gate.ok"

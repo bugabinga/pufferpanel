@@ -118,6 +118,9 @@ export function spotlightText(id, text) {
   const walk = node => typeof node === 'string' ? leaf(node) : Array.isArray(node) ? node.map(walk) : node && typeof node === 'object' ? Object.fromEntries(Object.entries(node).map(([key, item]) => [leaf(key), walk(item)])) : node;
   return JSON.stringify(walk(value));
 }
+// Structured results such as ui_snapshot: every non-token string is wrapped in place; image blocks stay intact so image() accepts them.
+const isImage = node => node?.type === 'image' && typeof node.data === 'string';
+const spotlightValue = (id, node) => typeof node === 'string' ? (TOKEN.test(node) ? node : spotlight(id, node)) : Array.isArray(node) ? node.map(item => spotlightValue(id, item)) : node && typeof node === 'object' && !isImage(node) ? Object.fromEntries(Object.entries(node).map(([key, item]) => [key, spotlightValue(id, item)])) : node;
 const NOT_RUN = new Set(['blocked', 'invalid_arguments', 'tool_unavailable', 'abandoned']);
 // Wraps only text that can reach the model: output items, a string value or the `output` field programs read, and
 // thrown error text; exit codes and other structured fields stay intact.
@@ -127,7 +130,7 @@ export function spotlightResult(id, result) {
   return {
     ...result,
     ...(result.output ? { output: result.output.map(item => item.type === 'text' ? { ...item, text: wrap(item.text) } : item) } : {}),
-    ...(typeof value === 'string' ? { structuredOutput: wrap(value) } : typeof value?.output === 'string' ? { structuredOutput: { ...value, output: wrap(value.output) } } : {}),
+    ...(typeof value === 'string' ? { structuredOutput: wrap(value) } : typeof value?.output === 'string' ? { structuredOutput: { ...value, output: wrap(value.output) } } : value && typeof value === 'object' ? { structuredOutput: spotlightValue(id, value) } : {}),
     ...(result.diagnostics ? { diagnostics: result.diagnostics.map(diagnostic => diagnostic.code === 'tool_error' ? { ...diagnostic, message: spotlight(id, diagnostic.message) } : diagnostic) } : {}),
   };
 }
@@ -137,7 +140,7 @@ export function createGuard({ worktree, name = 'pufferpanel-guard', protectedPat
   if (!worktree) throw Error('guard worktree is required');
   const paths = Object.freeze([...protectedPaths]);
   const untrusted = async call => {
-    if (['run', 'read_github_plans'].includes(call.name)) return true;
+    if (['run', 'ui_snapshot', 'read_github_plans'].includes(call.name)) return true;
     if (call.name === 'bash') return fetchesRemote(String(call.arguments?.command ?? ''));
     if (call.name !== 'read') return false;
     // Anything read from outside the worktree (intake, private gate log) is external data.

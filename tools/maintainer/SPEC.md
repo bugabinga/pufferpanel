@@ -54,15 +54,24 @@ A reviewer run ending without a verdict gets exactly one reminder within the sam
 Allow reviewer responses up to 32,768 output tokens and executor responses up to 16,000, each clamped to the selected model's limit.
 Reserve an upper bound on the maximum output the provider adapter sends before dispatch, phase ceiling plus any thinking budget it may add, inside the unchanged shared budget and original deadline; provider errors settle at that reservation.
 Retain bounded stop-reason, text-length, verdict, and verdict-call-count diagnostics, not raw reviewer answers.
+Retain each executor turn's final stop reason and whether it hit the output cap; a capped final answer gets exactly one continuation per executor conversation asking for a shorter script.
 The reviewer may execute targeted checks only in a disposable offline rootless container over a read-only export of the recorded tree T, never in the maintenance worktree.
 Sandbox containers get no network, credentials, or host environment, a read-only root, bounded time, memory, CPU, and PIDs, and are always removed.
 Preparing the sandbox builds the fixed gate images from T before review, with network but without credentials; this runs candidate build steps earlier than the gate, approves nothing, and its failure only disables `run`.
+Priming starts only when the deadline still holds the review window plus a reserve for the fixed gate; otherwise the sandbox reports unavailable and review stays read-only.
+Priming and the fixed gate build from identical private exports of the recorded tree, so the gate tests exactly that tree and reuses the primed layers.
+A review whose sandbox container cannot be removed reports that, keeps a recorded verdict, and fails only without one.
 A per-review probe may drop only undelegated cgroup resource limits; it never drops network, read-only source, or environment isolation, and reports `available`, `limited`, or `unavailable` with a bounded reason, Podman version, and run count/seconds in the public report.
+For candidates changing `client/` or `web/`, the reviewer may render the candidate's own panel headlessly with `ui_snapshot`: offline, non-root, without host mounts, with a throwaway database and a per-run random admin, inside the same sandbox time budget.
+Rendered pages and screenshots are untrusted data; console, exception, and network signals come before screenshots, and pixel differences never block without a concrete user-facing problem.
+The public report records visual review as `available`, `unavailable`, or `skipped` with a bounded reason, browser version, and snapshot count.
+When the reviewer model has no image input, `ui_snapshot` still returns text signals and says that screenshots were omitted.
 After review the host requires the worktree candidate to still equal T; otherwise the verdict is discarded as invalid review output.
 Clear prior usage completeness before model dispatch or resume; active-model and explicitly interrupted reports cannot settle partial subtotals.
 Intermediate review checkpoints remain unknown-cost until final accounting is refreshed.
 Invalid review output remains a bot failure with no gate, source commit, or publication.
 Permit at most one in-run fixed-gate diagnosis/repair for an approved maintenance source candidate, never a PR or management-only task.
+Start a repair only while at least 75 minutes remain before the run deadline; otherwise keep the gate failure and report the skipped repair.
 Require unchanged candidate identity, a failure event from that exact gate invocation, and a bounded regular private log inside the owned run directory; missing, stale, symlinked, or ambiguous evidence cannot authorize repair.
 Name private evidence by the gate invocation's event boundary so a pre-checkpoint orphan cannot block a later fresh capture or be reused as current evidence.
 Persist the consumed repair allowance, invalidate reviewer and management approval, and clear usage completeness before another dispatch.
@@ -161,6 +170,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection, and in-lease provider failover.
 Shell and workflow validation pass.
 Fake-Podman tests cover reviewer sandbox flags, environment, freezing, output capping, timeout/abort cleanup, and the per-review time budget.
+Fake-Podman tests cover `ui_snapshot` isolation flags, priming decisions, caps, budget sharing, the skipped and unavailable paths, and the result schema; a faux review shows a screenshot to the model with `image()`.
 A real isolated short-runroot container preflight succeeds without changing host configuration.
 Check-only CI verifies the uploaded harness without model requests or production effects.
 Live paid maintenance, PR integration, registry publication, and GitHub administration require separately recorded execution evidence; offline fixtures do not prove them.
