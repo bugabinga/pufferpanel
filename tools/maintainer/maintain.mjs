@@ -8,12 +8,13 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { Harness, createRegistry, defineDoc, defineTool, defineExtension, configure, AssistantEntry } from '@earendil-works/pi-durable';
-import { Type, createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+import { clampThinkingLevel, createAssistantMessageEventStream, isContextOverflow, isRetryableAssistantError } from '@earendil-works/pi-ai';
+import { obj, str } from '@earendil-works/pi-schema';
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { redact, reportFor, writeReport } from './report.mjs';
+import { loadModelSecrets, redact, reportFor, writeReport } from './report.mjs';
 import { collectGitHubSnapshot, writeIntake, installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 import { selectedTask, versionFor } from './task.mjs';
 import { materializePR } from './pr.mjs';
@@ -52,15 +53,16 @@ const accountFailedModelTurn = async (run, phase, options) => {
   } catch { phaseCost(run, phase, null, 'unknown'); run.reportedUsage = null; }
 };
 
-export const modelFailureKind = error => /\b401\b|\b403\b|invalid.?key|missing.*(?:tool|config)|configuration/i.test(String(error ?? '')) ? 'environment' : 'transient';
-export const CallsDoc = defineDoc({ kind: 'pufferpanel.maintenance.calls', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ requestId: null, calls: [] }) });
+// pi-ai's classification: a provider error it never retries (auth, quota, rejected request) is environmental; overflow compacts.
+export const modelFailureKind = message => message?.stopReason === 'error' && !isRetryableAssistantError(message) && !isContextOverflow(message) ? 'environment' : 'transient';
+export const CallsDoc = defineDoc({ kind: 'pufferpanel.maintenance.calls', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', checkpointWhen: () => false, initial: () => ({ requestId: null, calls: [] }) });
 export function callUsage(doc, requestId) {
   const calls = doc && doc.requestId === requestId && Array.isArray(doc.calls) ? doc.calls : [];
   const knownSubtotal = calls.reduce((sum, call) => sum + (call.cost ?? 0), 0);
-  return { usageComplete: calls.every(call => call.cost !== null), knownSubtotal, cost: calls.every(call => call.cost !== null) ? knownSubtotal : null, held: calls.reduce((sum, call) => sum + (call.cost ?? call.cap), 0), dispatched: calls.length, modelFailure: calls.find(call => call.failure === 'environment') ? 'environment' : calls.some(call => call.failure) ? 'transient' : null };
+  return { usageComplete: calls.every(call => call.cost !== null), knownSubtotal, cost: calls.every(call => call.cost !== null) ? knownSubtotal : null, held: calls.reduce((sum, call) => sum + (call.cost ?? call.cap), 0), dispatched: calls.length, modelFailure: calls.at(-1)?.failure ?? null };
 }
 const nativeUsage = async (harness, root, run) => callUsage(await harness.snapshot(CallsDoc, root.id, ctx), run.requestId);
-export const RunDoc = defineDoc({ kind: 'pufferpanel.maintenance.run', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ run: null }) });
+export const RunDoc = defineDoc({ kind: 'pufferpanel.maintenance.run', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', checkpointWhen: () => false, initial: () => ({ run: null }) });
 export { versionFor };
 export const stateDirectory = (env = process.env) => resolve(env.PUFFER_MAINT_STATE ?? join(env.HOME ?? fail('HOME is required'), '.pi/agent/maintenance/pufferpanel'));
 export const sourceDirectory = (env = process.env) => resolve(env.PUFFER_MAINT_SOURCE ?? join(here, '../..'));
@@ -71,16 +73,22 @@ const putRun = async (root, run) => {
 };
 export const usageCost = usage => Object.values(usage?.models ?? {}).reduce((sum, value) => sum + value.cost.total, 0);
 
-export function selectModels(settings, runtime) {
-  const provider = settings.defaultProvider;
-  const tier = settings.ultra?.providerModelTiers?.[provider]?.medium;
-  if (!tier?.model) fail(`no medium model configured for ${provider}`);
-  const slash = tier.model.indexOf('/');
-  const configuredProvider = tier.model.slice(0, slash);
-  const modelId = tier.model.slice(slash + 1);
-  if (configuredProvider !== provider || !modelId || !runtime.getModel(provider, modelId)) fail(`configured model unavailable: ${tier.model}`);
-  const choice = { provider, modelId, thinkingLevel: tier.thinkingLevel ?? 'medium' };
-  return { executor: choice, reviewer: { ...choice } };
+// Ordered `provider/model[:thinking]` preferences; without `annieModels`, Pi's standard default model settings.
+export const modelRefs = settings => settings.annieModels ?? (settings.defaultProvider && settings.defaultModel ? [`${settings.defaultProvider}/${settings.defaultModel}:${settings.defaultThinkingLevel ?? 'medium'}`] : []);
+export const priced = model => [model.cost, ...(model.cost?.tiers ?? [])].every(cost => ['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isFinite(cost?.[key]) && cost[key] >= 0));
+// An entry is usable when ModelRuntime resolves its provider's auth and its catalog prices are known.
+export async function selectModels(settings, runtime) {
+  const refs = modelRefs(settings);
+  if (!Array.isArray(refs) || !refs.length) fail('no models configured');
+  const available = [];
+  for (const ref of refs) {
+    const [, provider, modelId, level] = /^([^/:]+)\/(.+?)(?::(off|minimal|low|medium|high|xhigh|max))?$/.exec(ref) ?? fail(`invalid model ref: ${ref}`);
+    const model = runtime.getModel(provider, modelId);
+    if (model && priced(model) && await runtime.checkAuth(provider).catch(() => undefined)) available.push({ provider, modelId, thinkingLevel: clampThinkingLevel(model, level ?? 'medium') });
+  }
+  if (!available.length) fail(`no configured model available: ${refs.join(', ')}`);
+  // Independent review prefers another provider when one is available.
+  return { executor: available[0], reviewer: { ...available.find(choice => choice.provider !== available[0].provider) ?? available[0] }, available };
 }
 export function createRuntime(agentDir) {
   return ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), modelsStorePath: join(agentDir, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false });
@@ -241,24 +249,44 @@ export async function reconcileCommit(worktree, run) {
   return git(worktree, 'rev-parse', 'HEAD');
 }
 
+// Pi's normal conversation retry policy; every attempt is admitted here like a first request.
+export const RETRY = { enabled: true, maxRetries: 2, baseDelayMs: 2000, maxAgentDelayMs: 30_000 };
+// A provider leaves the run after an error pi-ai never retries, or once Pi's retry policy is spent on it.
+export function exhaustedProviders(calls = []) {
+  const out = new Set(), streak = new Map();
+  for (const call of calls) {
+    const provider = call.model?.split('/')[0];
+    if (!provider) continue;
+    streak.set(provider, call.failure === 'transient' ? (streak.get(provider) ?? 0) + 1 : 0);
+    if (call.failure === 'environment' || streak.get(provider) > RETRY.maxRetries) out.add(provider);
+  }
+  return out;
+}
+const callsOf = async (state, run) => { const doc = await state.harness.snapshot(CallsDoc, state.root.id, ctx); return doc && doc.requestId === run.requestId ? doc.calls : []; };
+
 // Enforce policy at the provider boundary, not a fail-open extension hook.
 export function budgetModels(runtime, state) {
   let reserved = 0;
   state.nativeAccounting = true;
+  const mark = (run, callId, change) => state.root.commit(async tx => {
+    const doc = await tx.doc(CallsDoc, state.root.id);
+    if (doc.requestId !== run.requestId || !doc.calls[callId]) fail('model accounting identity changed');
+    change(doc.calls[callId]);
+  }, ctx);
   return new Proxy(runtime, { get(target, key) {
     if (key !== 'streamSimple') { const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value; }
     return (model, transcript, options = {}) => {
       const stream = createAssistantMessageEventStream();
-      void (async () => {
-        let reservation = 0; let callId; let run;
+      // One admitted, priced, durably recorded physical dispatch; resolves with its unforwarded provider error, if any.
+      const dispatch = async (physical, choice, run) => {
+        let reservation = 0; let callId;
         try {
-          if (options.signal?.aborted) fail('model request cancelled before dispatch');
-          run = await getRun(state.root, state.harness);
-          const spent = (await nativeUsage(state.harness, state.root, run)).held;
-          if (!model.cost || !['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isFinite(model.cost[key]) && model.cost[key] >= 0)) fail('provider pricing unknown');
-          const maxTokens = Math.min(model.maxTokens ?? 32768, run.phase === 'reviewing' ? 32768 : 4000);
+          const spent = callUsage({ requestId: run.requestId, calls: await callsOf(state, run) }, run.requestId).held;
+          if (!physical.cost || !priced(physical)) fail('provider pricing unknown');
+          const price = key => Math.max(physical.cost[key], ...(physical.cost.tiers ?? []).map(tier => tier[key]));
+          const maxTokens = Math.min(physical.maxTokens ?? 32768, run.phase === 'reviewing' ? 32768 : 4000);
           if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) fail('provider output limit unknown');
-          const estimate = (model.contextWindow * Math.max(model.cost.input, model.cost.cacheRead, model.cost.cacheWrite) + maxTokens * model.cost.output) / 1_000_000;
+          const estimate = (physical.contextWindow * Math.max(price('input'), price('cacheRead'), price('cacheWrite')) + maxTokens * price('output')) / 1_000_000;
           withinBudget({ ...run, spent }, Date.now(), reserved + estimate);
           if (process.env.GITHUB_ACTIONS === 'true' && (process.env.GITHUB_RUN_ATTEMPT !== '1' || !run.ledgerReservation)) fail('paid attempt requires original prepaid lease');
           reserved += estimate; reservation = estimate;
@@ -267,45 +295,53 @@ export function budgetModels(runtime, state) {
             const doc = await tx.doc(CallsDoc, state.root.id);
             if (doc.requestId !== run.requestId) { doc.requestId = run.requestId; doc.calls = []; }
             if (doc.calls.length >= 256) fail('model call limit exceeded');
-            callId = doc.calls.length; doc.calls.push({ cap: estimate, cost: null });
+            callId = doc.calls.length; doc.calls.push({ model: `${physical.provider}/${physical.id}`, cap: estimate, cost: null });
           }, ctx);
-          let completed = null; let invalid = false; let finalEvent = null; let rawCost = null;
-          const onProviderStreamEvent = async (chunk, providerModel) => {
-            // A cumulative receipt before later output is not a final usage receipt.
-            if (chunk?.choices?.some(choice => Object.values(choice.delta ?? {}).some(value => value != null && value !== '' && (!Array.isArray(value) || value.length)))) rawCost = null;
-            const raw = chunk?.usage ?? chunk?.choices?.[0]?.usage;
-            if (raw !== undefined) {
-              const input = raw?.prompt_tokens, output = raw?.completion_tokens;
-              const cached = raw?.prompt_tokens_details?.cached_tokens ?? raw?.prompt_cache_hit_tokens ?? raw?.cached_tokens ?? 0;
-              const written = raw?.prompt_tokens_details?.cache_write_tokens ?? 0;
-              rawCost = [input, output, cached, written].every(n => Number.isSafeInteger(n) && n >= 0) && cached + written <= input
-                ? ((input - cached - written) * model.cost.input + output * model.cost.output + cached * model.cost.cacheRead + written * model.cost.cacheWrite) / 1_000_000 : null;
-            }
-            await options.onProviderStreamEvent?.(chunk, providerModel);
-          };
-          for await (const event of target.streamSimple(model, transcript, { ...options, maxRetries: 0, maxTokens, onProviderStreamEvent })) {
-            if (event.type === 'error' || options.signal?.aborted) invalid = true;
-            if (event.type === 'error') await state.root.commit(async tx => { const doc = await tx.doc(CallsDoc, state.root.id); if (doc.requestId === run.requestId && doc.calls[callId]) doc.calls[callId].failure = modelFailureKind(event.error?.errorMessage); }, ctx);
-            if (event.type === 'done') {
-              const usage = event.message?.usage;
-              if (completed !== null || !['stop', 'length', 'toolUse'].includes(event.reason) || event.message?.stopReason !== event.reason || !usage || !['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'].every(key => Number.isFinite(usage[key]) && usage[key] >= 0) || !Number.isFinite(usage.cost?.total) || usage.cost.total < 0) invalid = true;
-              else completed = usage.cost.total;
-            }
-            if (event.type === 'done') finalEvent = event; else stream.push(event);
+          let final = null; let invalid = false; let forwarded = false;
+          const reasoning = physical === model ? options.reasoning : choice.thinkingLevel === 'off' ? undefined : choice.thinkingLevel;
+          for await (const event of target.streamSimple(physical, transcript, { ...options, reasoning, maxRetries: 0, maxTokens })) {
+            if (options.signal?.aborted || final) invalid = true;
+            if (event.type === 'done' || event.type === 'error') { final = event; continue; }
+            forwarded ||= event.partial?.content?.some(part => part.type === 'toolCall' || (part.text ?? part.thinking ?? '') !== '') ?? false;
+            stream.push(event);
           }
-          if (!invalid && completed !== null && rawCost !== null && !options.signal?.aborted) await state.root.commit(async tx => {
-            const doc = await tx.doc(CallsDoc, state.root.id);
-            if (doc.requestId !== run.requestId || !doc.calls[callId]) fail('model accounting identity changed');
-            doc.calls[callId].cost = rawCost;
-          }, ctx);
-          if (!finalEvent || invalid) fail('model request failed: incomplete response');
-          stream.push(finalEvent);
-          stream.end();
+          if (final?.type === 'error') {
+            // A provider error ends the call; its full reservation bounds any spend, so it settles at that cap. Aborts stay unknown.
+            await mark(run, callId, call => { call.failure = modelFailureKind(final.error); if (final.error?.stopReason === 'error' && !invalid) call.cost = call.cap; });
+            return { event: final, forwarded };
+          }
+          const usage = final?.message?.usage;
+          if (invalid || !['stop', 'length', 'toolUse'].includes(final?.reason) || final.message.stopReason !== final.reason || !usage || !['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'].every(key => Number.isFinite(usage[key]) && usage[key] >= 0) || !Number.isFinite(usage.cost?.total) || usage.cost.total < 0) fail('model request failed: incomplete response');
+          // pi-ai prices the dispatched model; a response without prompt or output tokens carried no usage, so its reservation stays held.
+          if (usage.input + usage.cacheRead + usage.cacheWrite > 0 && usage.output > 0) await mark(run, callId, call => { call.cost = usage.cost.total; });
+          stream.push(final); stream.end();
+          return null;
         } catch (error) {
-          if (callId !== undefined) await state.root.commit(async tx => { const doc = await tx.doc(CallsDoc, state.root.id); if (doc.requestId === run.requestId && doc.calls[callId] && !doc.calls[callId].failure) doc.calls[callId].failure = modelFailureKind(error.message); }, ctx);
+          if (callId !== undefined) await mark(run, callId, call => { call.failure ??= 'transient'; });
+          throw error;
+        } finally { reserved -= reservation; }
+      };
+      void (async () => {
+        try {
+          const choices = state.models ?? [];
+          const requested = choices.find(choice => choice.provider === model.provider && choice.modelId === model.id) ?? { provider: model.provider, modelId: model.id };
+          let failed = null;
+          // Failover stays inside the original lease, budget, and deadline; only unforwarded provider errors move on.
+          for (const choice of [requested, ...choices.filter(choice => choice !== requested)]) {
+            if (options.signal?.aborted) fail('model request cancelled before dispatch');
+            const run = await getRun(state.root, state.harness);
+            const physical = choice === requested ? model : target.getModel(choice.provider, choice.modelId);
+            if (!physical || exhaustedProviders(await callsOf(state, run)).has(choice.provider)) continue;
+            failed = await dispatch(physical, choice, run);
+            if (!failed) return;
+            if (failed.forwarded || options.signal?.aborted || !exhaustedProviders(await callsOf(state, run)).has(choice.provider)) break;
+          }
+          if (!failed) fail('model request failed: no configured model available');
+          stream.push(failed.event); stream.end(failed.event.error);
+        } catch (error) {
           const message = { role: 'assistant', content: [], api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: 'error', errorMessage: String(error.message ?? error), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
           stream.push({ type: 'error', reason: 'error', error: message }); stream.end(message);
-        } finally { reserved -= reservation; }
+        }
       })();
       return stream;
     };
@@ -336,8 +372,8 @@ export async function captureGateFailure(worktree, dir, run, boundary) {
 }
 
 export function installReviewer(registry, worktree) {
-  const diff = defineTool({ name: 'diff', description: 'Read complete candidate diff against HEAD.', parameters: Type.Object({}), replay: 'safe', execute: async () => ({ output: [{ type: 'text', text: (await snapshot(worktree)).diff }] }) });
-  const read = defineTool({ name: 'read', description: 'Read a UTF-8 file inside the maintenance checkout.', parameters: Type.Object({ path: Type.String() }), replay: 'safe', execute: async ({ path }) => {
+  const diff = defineTool({ name: 'diff', description: 'Read complete candidate diff against HEAD.', parameters: obj({}, { open: true }), replay: 'safe', execute: async () => ({ output: [{ type: 'text', text: (await snapshot(worktree)).diff }] }) });
+  const read = defineTool({ name: 'read', description: 'Read a UTF-8 file inside the maintenance checkout.', parameters: obj({ path: str() }, { open: true }), replay: 'safe', execute: async ({ path }) => {
     const file = await realpath(resolve(worktree, path));
     if (!file.startsWith(worktree + sep)) fail('reviewer read outside checkout');
     return { output: [{ type: 'text', text: await readFile(file, 'utf8') }] };
@@ -450,6 +486,8 @@ export function createHostHooks({ root, harness, worktree, state, models, review
 }
 
 async function main() {
+  // Drop the step's secret JSON before any child process (git, podman) inherits it.
+  loadModelSecrets();
   if (process.argv.includes('--help')) { console.log('Run through bash tools/maintainer/run.sh. PUFFER_MAINT_SOURCE and PUFFER_MAINT_STATE override source/state paths. PUFFER_MAINT_TASK accepts strict trusted JSON (README schema); selected tasks require PUFFER_MAINT_DEFER_PUBLISH=1 and trusted ci.sh release/management. $15 and 2h daily model budget; publishing is host-controlled.'); return; }
   const task = selectedTask();
   let lease = null;
@@ -466,11 +504,11 @@ async function main() {
   const agentDir = resolve(process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME, '.pi/agent'));
   const runtime = await createRuntime(agentDir);
   const settings = JSON.parse(await readFile(join(agentDir, 'settings.json'), 'utf8'));
-  const models = selectModels(settings, runtime);
+  const models = await selectModels(settings, runtime);
   const registry = createRegistry(); registry.install(ModelCodingTools);
   const reviewerExtension = installReviewer(registry, worktree);
-  const policy = {};
-  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'maintain.sqlite')), { models: budgetModels(runtime, policy), registry, settings: { extensions: [ModelCodingTools], retry: { enabled: false, maxRetries: 0, baseDelayMs: 1000 } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree, shellEnv: modelShellEnv(process.env, policy.intakePath) }) }, ctx);
+  const policy = { models: models.available };
+  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'maintain.sqlite')), { models: budgetModels(runtime, policy), registry, settings: { extensions: [ModelCodingTools], retry: RETRY }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree, shellEnv: modelShellEnv(process.env, policy.intakePath) }) }, ctx);
   let root; let latestRun = null; let stopping = false;
   const save = async interrupted => { if (root) latestRun = await getRun(root, harness) ?? latestRun; const report = reportFor(latestRun, { interrupted }); await writeReport(resultPath, report); return report; };
   const stop = () => { if (stopping) return; stopping = true; process.exitCode = 143; void (async () => { await save(true); await harness.close(ctx); })(); };

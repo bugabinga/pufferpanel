@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { defineDoc, defineExtension, defineTool } from '@earendil-works/pi-durable';
-import { Type } from '@earendil-works/pi-ai';
+import { arr, int, obj, opt, str } from '@earendil-works/pi-schema';
 import { createHash } from 'node:crypto';
 import { redact } from './report.mjs';
 
@@ -17,7 +17,7 @@ const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value) ?
 const issueNumber = value => Number.isInteger(value) && value > 0 && value <= 2_147_483_647;
 const safe = (value, token = null) => redact(String(value ?? '')).split(token || '\u0000').join('[redacted]').slice(0, 4000);
 const git = async (cwd, ...args) => (await execFile('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 })).stdout.trim();
-export const RootDoc = defineDoc({ kind: 'pufferpanel.github.plans', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ allowlist: ['add-label', 'comment', 'create-issue', 'enable-issues'], plans: [] }) });
+export const RootDoc = defineDoc({ kind: 'pufferpanel.github.plans', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', checkpointWhen: () => false, initial: () => ({ allowlist: ['add-label', 'comment', 'create-issue', 'enable-issues'], plans: [] }) });
 export const GitHubPlansDoc = RootDoc;
 
 async function request(fetchImpl, path, token) {
@@ -78,10 +78,10 @@ export function validateActions(actions) {
     return { kind: action.kind, number: action.number ?? null, labels: action.labels?.map(label => safe(label).trim()) ?? null, title: action.kind === 'create-issue' ? safe(action.title).trim() : null, body: action.body ? safe(action.body) : null, expectedUpdatedAt: action.expectedUpdatedAt ?? null };
   });
 }
-const actionSchema = Type.Object({ kind: Type.String(), number: Type.Optional(Type.Integer()), labels: Type.Optional(Type.Array(Type.String())), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), expectedUpdatedAt: Type.Optional(Type.String()) }, { additionalProperties: false });
+const actionSchema = obj({ kind: str(), number: opt(int()), labels: opt(arr(str())), title: opt(str()), body: opt(str()), expectedUpdatedAt: opt(str()) });
 const gitOk = async (cwd, ...args) => { try { await git(cwd, ...args); return true; } catch { return false; } };
 export function installGitHubTools(registry, { root, worktree, runDoc }) {
-  const merge = defineTool({ name: 'merge_upstream', description: 'Merge only upstream SHA pinned by trusted preparation. Never commits.', parameters: Type.Object({}), replay: 'unsafe', execute: async (_args, api, context) => {
+  const merge = defineTool({ name: 'merge_upstream', description: 'Merge only upstream SHA pinned by trusted preparation. Never commits.', parameters: obj({}, { open: true }), replay: 'unsafe', execute: async (_args, api, context) => {
     const run = (await api.snapshot(runDoc, root.id, context))?.run;
     if (!sha(run?.upstreamSha) || !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(run?.upstreamRef ?? '')) throw Error('prepared upstream pin unavailable');
     const base = await git(worktree, 'rev-parse', 'HEAD');
@@ -96,7 +96,7 @@ export function installGitHubTools(registry, { root, worktree, runDoc }) {
     if (await gitOk(worktree, 'diff', '--quiet', base, '--', '.github', 'tools/maintainer')) return { output: [{ type: 'text', text: JSON.stringify({ base, upstreamSha: run.upstreamSha, conflicts: [], merged: true }) }] };
     throw Error('protected paths changed by upstream merge');
   } });
-  const propose = defineTool({ name: 'propose_github', description: 'Persist one bounded non-executing GitHub management proposal for this run.', parameters: Type.Object({ actions: Type.Array(actionSchema, { minItems: 1, maxItems: 10 }) }), replay: 'safe', execute: async ({ actions }, api, context) => {
+  const propose = defineTool({ name: 'propose_github', description: 'Persist one bounded non-executing GitHub management proposal for this run.', parameters: obj({ actions: arr(actionSchema, { minItems: 1, maxItems: 10 }) }, { open: true }), replay: 'safe', execute: async ({ actions }, api, context) => {
     const run = (await api.snapshot(runDoc, root.id, context))?.run;
     if (!run?.requestId || !run?.day) throw Error('active maintenance run unavailable');
     const plan = { actions: validateActions(actions), at: Date.now(), runId: run.requestId };
@@ -120,7 +120,7 @@ export function installGitHubTools(registry, { root, worktree, runDoc }) {
   const extension = defineExtension({ name: 'pufferpanel-github', tools: [merge, propose] }); registry.install(extension); return extension;
 }
 export function installGitHubPlanReader(registry, root) {
-  const reader = defineTool({ name: 'read_github_plans', description: 'Read persisted bounded GitHub management proposals. Read only.', parameters: Type.Object({}), replay: 'safe', execute: async (_args, api, context) => {
+  const reader = defineTool({ name: 'read_github_plans', description: 'Read persisted bounded GitHub management proposals. Read only.', parameters: obj({}, { open: true }), replay: 'safe', execute: async (_args, api, context) => {
     const plans = (await api.snapshot(GitHubPlansDoc, root.id, context))?.plans ?? [];
     return { output: [{ type: 'text', text: JSON.stringify(plans) }] };
   } });

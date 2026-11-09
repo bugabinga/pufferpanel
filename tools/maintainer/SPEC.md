@@ -70,6 +70,11 @@ Redaction is defense-in-depth, not an OS sandbox or a guarantee that arbitrary m
 ## Efficiency and personality
 
 Validate the exact private container storage configuration before paid model requests.
+Stay provider-independent through Pi's normal model runtime: an ordered model preference list, standard provider credentials, and pi-ai error classification, with no provider special-cased in code.
+Use the first available configured model; independent review prefers an available model from a different provider.
+Fail closed when no configured model is available or its pricing is unknown.
+After a provider error pi-ai never retries, or a transient one once Pi's retry policy is spent, move work to the next available model inside the original lease, cap, and deadline.
+Never re-dispatch to an exhausted provider within the run; deterministic provider failures are environment failures, not hourly retries.
 Keep model budgets and process deadlines; do not weaken checks to obtain a green run.
 Prefer an honest no-op over speculative changes or decorative activity.
 Use Annie's concise, cheerful maintainer voice in summaries while keeping failures and consequences unmistakable.
@@ -113,8 +118,9 @@ GitHub state checks and API posts/pushes are not one atomic transaction; live ro
 Only attempt 1 may pay, with a prepaid immutable lease verified by artifact ID/digest before provider dispatch.
 The absolute paid horizon is original GitHub run creation plus two hours, including queued/preflight time and cancellation margin.
 Each lease cap is at most $15 and at most remaining shared rolling-24h allowance.
-A host-owned durable call intent precedes each provider dispatch; only a completed valid response with usage settles it.
+A host-owned durable call intent precedes each provider dispatch, priced for the physical model actually sent; only a completed valid response with pi-ai usage settles it at its normal final usage cost.
 Partial SSE, provider errors, cancellation, missing usage, synthetic zero errors, and missing final reports never refund partial spend.
+A provider error response settles at its full call reservation, so a recovered retry or failover can complete the phase; cancellation, interruption, and missing usage stay unknown.
 Complete known actual cost replaces the lease cap, held for 24h from original final model-report artifact creation.
 Release reports never create a second charge or move that billing timestamp.
 Unknown/partial usage reserves the entire cap until the absolute deadline plus 24h and termination margin, with nonterminal execution held conservatively.
@@ -143,7 +149,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 
 ## Acceptance evidence
 
-Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, and budget admission.
+Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection, and in-lease provider failover.
 Shell and workflow validation pass.
 A real isolated short-runroot container preflight succeeds without changing host configuration.
 Check-only CI verifies the uploaded harness without model requests or production effects.

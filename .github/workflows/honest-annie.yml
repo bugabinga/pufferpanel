@@ -167,13 +167,15 @@ jobs:
           ANNIE_LEASE_ARTIFACT_ID: ${{ steps.prepaid.outputs.artifact-id }}
           ANNIE_LEASE_ARTIFACT_DIGEST: ${{ steps.prepaid.outputs.artifact-digest }}
         run: node tools/maintainer/controller.mjs verify-upload
-      - name: Validate selected model key configuration
+      # Node keeps only pi-ai provider credential names from this JSON; GitHub tokens are never copied.
+      - name: Validate at least one configured model provider is available
         env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-        run: test -n "$ZAI_API_KEY" || { echo 'Set ZAI_API_KEY in honest-annie-model environment' >&2; exit 1; }
+          ANNIE_MODEL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          node --input-type=module -e 'import {readFile} from "node:fs/promises"; import {join} from "node:path"; import {loadModelSecrets} from "./tools/maintainer/report.mjs"; import {createRuntime,selectModels} from "./tools/maintainer/maintain.mjs"; loadModelSecrets(); const dir=process.env.PI_CODING_AGENT_DIR; const {executor,reviewer}=await selectModels(JSON.parse(await readFile(join(dir,"settings.json"),"utf8")),await createRuntime(dir)); console.log(JSON.stringify({executor,reviewer}));'
       - name: Maintain or review selected task
         env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ANNIE_MODEL_SECRETS: ${{ toJSON(secrets) }}
           GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/run.sh
       - name: Export only approved candidates or valid rejection feedback
@@ -190,7 +192,7 @@ jobs:
       - name: Collect sanitized maintenance report
         if: always()
         env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ANNIE_MODEL_SECRETS: ${{ toJSON(secrets) }}
         run: |
           day=$(node -p 'JSON.parse(process.env.PUFFER_MAINT_TASK).day')
           node tools/maintainer/report.mjs collect --report "$PUFFER_MAINT_RESULT" --reportdir "$RUNNER_TEMP/honest-annie-report" --gate-events "$PUFFER_MAINT_STATE/runs/$day/gate-events.jsonl"

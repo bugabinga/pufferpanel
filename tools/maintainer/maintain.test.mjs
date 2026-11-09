@@ -6,18 +6,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
-import { createModels } from '@earendil-works/pi-ai/models';
+import { calculateCost, createModels } from '@earendil-works/pi-ai/models';
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { CodingTools } from '@earendil-works/pi-durable/tools';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure } from './maintain.mjs';
+import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
 async function scratch(t) { const dir = await mkdtemp(join(tmpdir(), 'maintainer-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
-async function open(database, models = {}) {
+async function open(database, models = createModels()) {
   const harness = await Harness.open(await openNodeSqliteStorage(database), { models, registry: createRegistry() }, ctx);
   const root = await harness.root(ctx); root._maintainerHarness = harness; return { harness, root };
 }
@@ -267,6 +268,15 @@ test('native gate evidence binds current events, unchanged source and private bo
   }
 });
 
+// Faux estimates tokens but never prices them; real pi-ai adapters apply calculateCost to the dispatched model.
+const pricedFaux = models => new Proxy(models, { get(target, key) {
+  if (key !== 'streamSimple') { const value = target[key]; return typeof value === 'function' ? value.bind(target) : value; }
+  return (model, context, options) => {
+    const source = target.streamSimple(model, context, options), priced = createAssistantMessageEventStream();
+    void (async () => { for await (const event of source) { if (event.type === 'done') event.message.usage.cost = calculateCost(model, event.message.usage); priced.push(event); } priced.end(); })();
+    return priced;
+  };
+} });
 function repo(path) {
   mkdir(path, { recursive: true });
   const command = (...args) => execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
@@ -284,19 +294,28 @@ test('real faux coding/reviewer turns, bounded format correction, host commit, a
     { name: 'truncated rejection never triggers format correction', answers: ['{"approve":false,"findings":["unsafe change"]}'], firstStop: 'length', approved: false, reason: 'review-rejected' },
     { name: 'contradictory findings never trigger format correction', answers: ['{"approve":true,"findings":["unsafe change"]}'], approved: false, reason: 'contradictory-review' },
     { name: 'truncated contradiction never triggers format correction', answers: ['{"approve":true,"findings":["unsafe change"]}'], firstStop: 'length', approved: false, reason: 'contradictory-review' },
+    { name: 'non-retryable provider error fails over to the next model and still publishes', answers: [approval], approved: true, firstError: '401 Incorrect API key provided' },
+    { name: 'one retryable provider error recovers on Pi retry and still publishes', answers: [approval], approved: true, firstError: '503 Service temporarily unavailable', retryable: true },
+    { name: 'recovered failover then an unrelated gate failure is not an environment failure', answers: [approval], approved: true, firstError: '401 Incorrect API key provided', gateFails: true },
   ]) await t.test(scenario.name, async t => {
   const dir = await scratch(t); const source = join(dir, 'source'); await mkdir(source);
   const git = repo(source); git('init', '-q', '-b', 'main'); git('config', 'user.name', 'test'); git('config', 'user.email', 'test@example.test');
   await writeFile(join(source, 'value.txt'), 'before'); git('add', '.'); git('commit', '-qm', 'initial'); git('remote', 'add', 'upstream', source);
   const state = join(dir, 'state'); await mkdir(state); const worktree = await ensureWorktree(source, state);
   const privateLog = join(state, 'runs', '2026-04-03', 'gate-repair-0.log');
-  const faux = fauxProvider(); const models = createModels(); models.setProvider(faux.provider);
-  const savedSecrets = Object.fromEntries(['GH_TOKEN', 'ANNIE_GH_TOKEN', 'ZAI_API_KEY', 'REGISTRY_PASSWORD', 'GITHUB_ACTIONS'].map(key => [key, process.env[key]]));
+  // Priced so failed-call caps are visible; the backup provider only serves after failover.
+  const fauxModel = { id: 'faux-1', contextWindow: 10000, maxTokens: 8192, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } };
+  const faux = fauxProvider({ models: [fauxModel] }), backup = fauxProvider({ provider: 'faux-backup', models: [fauxModel] });
+  const models = createModels(); models.setProvider(faux.provider); models.setProvider(backup.provider);
+  const failover = scenario.firstError && !scenario.retryable;
+  const savedSecrets = Object.fromEntries(['GH_TOKEN', 'ANNIE_GH_TOKEN', 'ZAI_API_KEY', 'OPENAI_API_KEY', 'REGISTRY_PASSWORD', 'GITHUB_ACTIONS'].map(key => [key, process.env[key]]));
   delete process.env.GITHUB_ACTIONS; // Local faux runtime, including when this test runs on Actions.
-  Object.assign(process.env, { GH_TOKEN: 'gh-sentinel', ANNIE_GH_TOKEN: 'annie-sentinel', ZAI_API_KEY: 'zai-sentinel', REGISTRY_PASSWORD: 'registry-sentinel' });
+  Object.assign(process.env, { GH_TOKEN: 'gh-sentinel', ANNIE_GH_TOKEN: 'annie-sentinel', ZAI_API_KEY: 'zai-sentinel', OPENAI_API_KEY: 'openai-sentinel', REGISTRY_PASSWORD: 'registry-sentinel' });
   t.after(() => { for (const [key, value] of Object.entries(savedSecrets)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall('bash', { command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$ZAI_API_KEY$REGISTRY_PASSWORD" && test -n "$PATH$HOME$TMPDIR" && test -n "$PUFFER_MAINT_INTAKE"' }), { stopReason: 'toolUse' }),
+  if (failover) faux.setResponses([fauxAssistantMessage('', { stopReason: 'error', errorMessage: scenario.firstError })]);
+  (failover ? backup : faux).setResponses([
+    ...(scenario.retryable ? [fauxAssistantMessage('', { stopReason: 'error', errorMessage: scenario.firstError })] : []),
+    fauxAssistantMessage(fauxToolCall('bash', { command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$ZAI_API_KEY$OPENAI_API_KEY$REGISTRY_PASSWORD" && test -n "$PATH$HOME$TMPDIR" && test -n "$PUFFER_MAINT_INTAKE"' }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('write', { path: 'value.txt', content: 'after' }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('propose_github', { actions: [{ kind: 'create-issue', title: 'Track fixture', body: 'Known body' }] }), { stopReason: 'toolUse' }),
     fauxAssistantMessage('Fixed value.'),
@@ -313,19 +332,17 @@ test('real faux coding/reviewer turns, bounded format correction, host commit, a
     ] : []),
   ]);
   const registry = createRegistry(); registry.install(CodingTools); const reviewerExtension = installReviewer(registry, worktree);
-  const policy = {};
-  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(new Proxy(models, { get(target, key) {
-    if (key === 'streamSimple') return (model, transcript, options) => { options.onProviderStreamEvent({ usage: { prompt_tokens: 0, completion_tokens: 0 } }, model); return target.streamSimple(model, transcript, options); };
-    const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
-  } }), policy), registry, settings: { extensions: [CodingTools] }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
+  const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: failover ? 'faux-backup' : 'faux', modelId: 'faux-1' } };
+  const policy = { models: [choices.executor, { provider: 'faux-backup', modelId: 'faux-1' }] };
+  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(pricedFaux(models), policy), registry, settings: { extensions: [CodingTools], retry: { ...RETRY, baseDelayMs: 1 } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
   const root = await harness.root(ctx); Object.assign(policy, { root, harness });
   const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc }); const githubPlanReader = installGitHubPlanReader(registry, root);
-  const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: 'faux', modelId: 'faux-1' } };
   const fixtureFetch = async url => ({ ok: true, status: 200, headers: new Headers(), json: async () => url.includes('/git/ref/') ? { object: { sha: git('rev-parse', 'HEAD') } } : url.includes('/repos/') && !url.includes('/issues') && !url.includes('/pulls') ? { default_branch: 'main' } : [] });
   const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, policy, instructions: 'Test coding fixture.', snapshotHttp: fixtureFetch, upstreamUrl: source });
   let gated = 0, published = 0, firstReviewer = null;
   host.gate = async run => {
     gated++;
+    if (scenario.gateFails) throw Error('fixed gate failed');
     if (scenario.repair && gated === 1) {
       firstReviewer = run.reviewer;
       await mkdir(join(state, 'runs', run.day), { recursive: true }); await writeFile(privateLog, 'private fixture failure');
@@ -333,9 +350,23 @@ test('real faux coding/reviewer turns, bounded format correction, host commit, a
     }
     if (scenario.repair) assert.notEqual(run.reviewer, firstReviewer);
   }; host.publish = async () => { published++; };
+  const calls = async () => (await harness.snapshot(CallsDoc, root.id, ctx)).calls;
+  const total = list => list.reduce((sum, call) => sum + call.cost, 0);
+  if (scenario.gateFails) {
+    await assert.rejects(advance(root, { harness, ...host, day: '2026-04-03' }), /fixed gate failed/);
+    const failed = await getRun(root, harness), recorded = await calls();
+    assert.equal(failed.phase, 'gating'); assert.equal(recorded[0].failure, 'environment'); assert.equal(failed.usageComplete, true); assert.equal(failed.modelFailure, null);
+    await harness.close(ctx); return;
+  }
   const run = await advance(root, { harness, ...host, day: '2026-04-03' });
+  if (scenario.firstError) {
+    const recorded = await calls(), [first, ...rest] = recorded;
+    assert.deepEqual({ model: first.model, failure: first.failure, cost: first.cost }, { model: 'faux/faux-1', failure: scenario.retryable ? 'transient' : 'environment', cost: first.cap });
+    assert.ok(first.cap > 0); assert.deepEqual(rest.map(call => ({ model: call.model, failure: call.failure, settled: call.cost > 0 })), rest.map(() => ({ model: failover ? 'faux-backup/faux-1' : 'faux/faux-1', failure: undefined, settled: true })));
+    assert.ok(Math.abs(run.spent - total(recorded)) < 1e-12 && run.spent > first.cap); assert.equal(run.knownSubtotal, total(recorded)); assert.equal(run.modelFailure, null);
+  }
   assert.equal(run.phase, scenario.approved ? 'published' : 'rejected'); assert.equal(gated, scenario.repair ? 2 : Number(scenario.approved)); assert.equal(published, Number(scenario.approved)); assert.ok(run.reviewer);
-  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 6 + scenario.answers.length + (scenario.repair ? 6 : 0));
+  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 6 + scenario.answers.length + (scenario.repair ? 6 : 0) + (scenario.firstError ? 1 : 0));
   assert.equal(run.reviewDiagnostics.length, scenario.answers.length);
   if (!scenario.approved) { assert.equal(run.review.reason, scenario.reason); assert.equal(run.commit, undefined); }
   if (scenario.reason === 'review-rejected') assert.deepEqual(run.review.findings, ['unsafe change']);
@@ -356,9 +387,18 @@ test('provider budget guard rejects before real model dispatch', async t => {
   assert.equal(called, false); assert.equal(result.stopReason, 'error'); assert.match(result.errorMessage, /deadline/);
   await harness.close(ctx);
 });
-test('configuration uses exact configured medium model and calendar version', () => {
-  const runtime = { getModel: (provider, id) => provider === 'p' && id === 'm' ? {} : undefined };
-  assert.equal(selectModels({ defaultProvider: 'p', ultra: { providerModelTiers: { p: { medium: { model: 'p/m' } } } } }, runtime).executor.modelId, 'm');
-  assert.throws(() => selectModels({ defaultProvider: 'p', ultra: { providerModelTiers: {} } }, runtime));
+test('model shells never inherit provider credentials or the model secret JSON', () => {
+  const env = modelShellEnv({ PATH: '/bin', HOME: '/h', ZAI_API_KEY: 'z', ANTHROPIC_API_KEY: 'a', OPENAI_API_KEY: 'o', GH_TOKEN: 'g', ANNIE_MODEL_SECRETS: '{}' }, '/intake');
+  assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH', 'PUFFER_MAINT_INTAKE', 'TMPDIR']);
+});
+test('configuration falls back to Pi default model settings, skips unpriced or unauthenticated entries, and has calendar version', async () => {
+  const cost = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 };
+  const models = { 'p/m': { cost, reasoning: true }, 'p/free': { cost: {}, reasoning: true }, 'q/m': { cost, reasoning: true } };
+  const runtime = { getModel: (provider, id) => models[`${provider}/${id}`], checkAuth: async provider => provider === 'p' ? { type: 'api_key' } : undefined };
+  assert.deepEqual((await selectModels({ defaultProvider: 'p', defaultModel: 'm', defaultThinkingLevel: 'high' }, runtime)).executor, { provider: 'p', modelId: 'm', thinkingLevel: 'high' });
+  assert.deepEqual((await selectModels({ annieModels: ['p/free:high', 'q/m', 'p/m:low'], defaultProvider: 'q', defaultModel: 'm' }, runtime)).available, [{ provider: 'p', modelId: 'm', thinkingLevel: 'low' }]);
+  await assert.rejects(selectModels({ defaultProvider: 'p' }, runtime), /no models configured/);
+  await assert.rejects(selectModels({ annieModels: ['p/free', 'q/m'] }, runtime), /no configured model available/);
+  await assert.rejects(selectModels({ annieModels: ['p'] }, runtime), /invalid model ref/);
   assert.equal(versionFor('2026-04-03'), '2026.4.3'); assert.equal(stateDirectory({ HOME: '/x' }), '/x/.pi/agent/maintenance/pufferpanel');
 });

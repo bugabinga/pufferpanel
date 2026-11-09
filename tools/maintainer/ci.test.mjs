@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import YAML from 'yaml';
-import { createRuntime, selectModels, snapshot } from './maintain.mjs';
+import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import { createRuntime, priced, selectModels, snapshot } from './maintain.mjs';
+import { providerKeyNames } from './report.mjs';
 
 const moduleDir = new URL('.', import.meta.url).pathname;
 function fixture(t, protectedEdit = false) {
@@ -35,14 +37,37 @@ function fixture(t, protectedEdit = false) {
   return { dir, source, state, artifact, base, commit, tree, result, output, git, command, imported, origin };
 }
 
-test('CI selects bundled zai/glm-5.3 with known pricing without model requests', async t => {
+// Hide ambient provider credentials so selection sees exactly the fixture's keys.
+function providerEnv(t, vars = {}) {
+  const saved = Object.fromEntries(providerKeyNames().map(name => [name, process.env[name]]));
+  for (const name of Object.keys(saved)) delete process.env[name];
+  Object.assign(process.env, vars);
+  t.after(() => { for (const name of providerKeyNames()) delete process.env[name]; Object.assign(process.env, saved); });
+}
+test('CI model refs resolve offline to distinct providers with known nonzero prices and supported thinking', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const refs = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json'))).annieModels;
+  const runtime = await createRuntime(dir);
+  assert.equal(refs[0], 'zai/glm-5.3:high'); assert.equal(new Set(refs.map(ref => ref.split('/')[0])).size, refs.length);
+  for (const ref of refs) {
+    const [, provider, id, level] = /^([^/]+)\/(.+):(\w+)$/.exec(ref); const model = runtime.getModel(provider, id);
+    assert.ok(model && priced(model) && model.cost.input > 0 && model.cost.output > 0, ref); assert.ok(getSupportedThinkingLevels(model).includes(level), ref);
+  }
+  assert.equal(runtime.getModel('zai', 'glm-5.3').baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+});
+test('selection uses providers with standard env credentials, prefers an independent reviewer, and fails closed without any', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   const settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
-  const runtime = await createRuntime(dir); const choices = selectModels(settings, runtime);
-  assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3', thinkingLevel: 'high' });
-  assert.deepEqual(choices.reviewer, choices.executor);
-  const model = runtime.getModel('zai', 'glm-5.3');
-  assert.equal(model.baseUrl, 'https://api.z.ai/api/coding/paas/v4'); assert.ok(model.cost.input > 0); assert.ok(model.cost.output > 0);
+  const select = async vars => { for (const name of providerKeyNames()) delete process.env[name]; Object.assign(process.env, vars); return selectModels(settings, await createRuntime(dir)); };
+  providerEnv(t);
+  await assert.rejects(select({}), /no configured model available/);
+  let choices = await select({ ZAI_API_KEY: 'zai-only' });
+  assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
+  choices = await select({ DEEPSEEK_API_KEY: 'deepseek-only' });
+  assert.deepEqual(choices.executor, { provider: 'deepseek', modelId: 'deepseek-v4-pro', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
+  choices = await select({ ZAI_API_KEY: 'zai', DEEPSEEK_API_KEY: 'deepseek', ANTHROPIC_API_KEY: 'anthropic' });
+  assert.equal(choices.executor.provider, 'zai'); assert.deepEqual(choices.reviewer, { provider: 'anthropic', modelId: 'claude-sonnet-5-5', thinkingLevel: 'high' });
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['zai', 'anthropic', 'deepseek']);
 });
 test('CI initialization confines runtime paths to runner temp and prepare sets bot identity', t => {
   const f = fixture(t); const envFile = join(f.dir, 'github-env'), agent = join(f.dir, 'agent');
@@ -54,7 +79,7 @@ test('CI initialization confines runtime paths to runner temp and prepare sets b
   result = f.command('prepare', { PI_CODING_AGENT_DIR: agent }); assert.equal(result.status, 0, result.stderr);
   assert.equal(f.git('config', 'user.name'), 'honest_annie');
   assert.equal(f.git('remote', 'get-url', 'upstream'), 'https://github.com/pufferpanel/pufferpanel.git');
-  assert.equal(JSON.parse(readFileSync(join(agent, 'settings.json'))).defaultProvider, 'zai');
+  assert.equal(JSON.parse(readFileSync(join(agent, 'settings.json'))).annieModels[0], 'zai/glm-5.3:high');
   assert.equal(existsSync(join(agent, 'auth.json')), false);
 });
 test('CI allocates a short private runroot and cleanup refuses arbitrary paths', t => {
@@ -84,11 +109,11 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   const release = workflow.slice(workflow.indexOf('  release:'), workflow.indexOf('  retry-effects:'));
   assert.doesNotMatch(check, /secrets\.|contents: write/);
   assert.match(maintain, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(maintain, /github\.ref == 'refs\/heads\/trunk'/);
-  assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(maintain, /secrets\.ZAI_API_KEY/);
+  assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(maintain, /ANNIE_MODEL_SECRETS: \$\{\{ toJSON\(secrets\) \}\}/); assert.doesNotMatch(maintain, /ZAI_API_KEY|GITHUB_TOKEN: \$\{\{ secrets/);
   assert.doesNotMatch(maintain, /REGISTRY_PASSWORD|ANNIE_GH_TOKEN|contents: write|issues: write|pull-requests: write/);
   assert.match(maintain, /GH_TOKEN: \$\{\{ github.token \}\}/); // Native read-only preparation only.
   assert.match(maintain, /github.run_attempt == 1/);
-  assert.match(release, /contents: write/); assert.doesNotMatch(release, /ZAI_API_KEY/);
+  assert.match(release, /contents: write/); assert.doesNotMatch(release, /ZAI_API_KEY|toJSON\(secrets\)|ANNIE_MODEL_SECRETS/);
   assert.ok(release.indexOf('ci.sh gate') < release.indexOf('secrets.REGISTRY_PASSWORD'));
   for (const [, ref] of workflow.matchAll(/^\s*- uses: ([^\s]+)/gm)) assert.match(ref, /@[a-f0-9]{40}$/);
   // Model-free republish: trusted harness checkout, release environment, read-only token, gates before registry secrets.
@@ -96,7 +121,7 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   assert.deepEqual(job.needs, ['check', 'observe']); assert.deepEqual(job.permissions, { contents: 'read' }); assert.equal(job.environment, 'honest-annie-release'); assert.equal(job['timeout-minutes'], 90);
   assert.match(job.if, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(job.if, /github\.ref == 'refs\/heads\/trunk'/); assert.match(job.if, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(job.if, /needs\.observe\.outputs\.republish != ''/);
   assert.deepEqual(job.steps[0].with, { ref: '${{ github.sha }}', 'fetch-depth': 0, 'persist-credentials': false });
-  assert.doesNotMatch(text, /ZAI_API_KEY|ANNIE_GH_TOKEN|: write|needs\.observe\.outputs\.task|download-artifact/);
+  assert.doesNotMatch(text, /ZAI_API_KEY|toJSON\(secrets\)|ANNIE_MODEL_SECRETS|ANNIE_GH_TOKEN|: write|needs\.observe\.outputs\.task|download-artifact/);
   assert.ok(text.indexOf('republish.mjs verify') < text.indexOf('republish.mjs gate') && text.indexOf('republish.mjs gate') < text.indexOf('secrets.REGISTRY_PASSWORD') && text.indexOf('secrets.REGISTRY_PASSWORD') < text.indexOf('republish.mjs publish'));
   assert.equal(job.steps.find(step => step.uses?.startsWith('actions/upload-artifact@')).with.name, 'honest-annie-republish-report-${{ github.run_id }}-${{ github.run_attempt }}');
   assert.equal(job.steps.at(-1).run, 'bash tools/maintainer/ci.sh cleanup'); assert.equal(job.steps.at(-1).if, 'always()');

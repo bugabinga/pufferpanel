@@ -401,8 +401,8 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     } else {
       const existing = fresh.outcomes.find(o => o.fingerprint === selected.fingerprint);
       if (existing?.runId >= record.run.id) continue;
-      const reason = result?.reason ?? '';
-      const environment = result?.modelFailure === 'environment' || record.environmentFailure || /401|403|invalid.?key|missing.*(tool|config)|configuration|podman/i.test(reason);
+      // modelFailure carries pi-ai's retry classification; failed preparation steps are environmental too.
+      const environment = result?.modelFailure === 'environment' || record.environmentFailure;
       const outcome = { fingerprint: selected.fingerprint, runId: record.run.id, attempts: (existing?.attempts ?? 0) + 1, nextAt: time(record.run.updated_at) + (environment ? DAY : HOUR), kind: environment ? 'environment' : record.zeroDispatch ? 'zero-dispatch' : 'transient' };
       fresh.outcomes = fresh.outcomes.filter(o => o.fingerprint !== selected.fingerprint); fresh.outcomes.push(outcome);
       if (environment) fresh.environment = { signal: configSignal, nextAt: outcome.nextAt };

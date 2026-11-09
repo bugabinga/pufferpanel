@@ -16,7 +16,7 @@ Desktop mode never pushes Git remote refs.
 CI release mode pushes only reviewed source to fork `trunk`, without force or overwriting independent advancement.
 Maintenance pushes host commit C; selected PRs push original head H, never synthetic C.
 
-Pi Durable `1.2.0`, Pi AI, Chord, and the coding-agent model runtime are pinned in `package-lock.json`.
+Pi Durable `1.5.0`, Pi AI, Pi Schema, Chord, and the coding-agent model runtime are pinned in `package-lock.json`.
 Node ≥24, Bash, Git, rootless Podman, curl, flock, timeout, and standard Linux utilities are required.
 Install this module's pinned npm dependencies before running its wrapper.
 Commit the harness files before the first maintenance run so its dedicated worktree has a complete baseline.
@@ -40,6 +40,8 @@ Compiler/archive scratch uses OS temporary space; permanent worktree, SQLite, ru
 Legacy mode has one idempotent input request ID per UTC day.
 Selected tasks key requests by fingerprint; calendar image tags still permit only one distinct released tree/revision per UTC day.
 SQLite checkpoints retain execution, reviewer identity, reviewed tree/hash, commit, version, and publication phase.
+Pi Durable `1.4.0`+ migrates an existing desktop `maintain.sqlite` to storage schema version 2 on first open; that file cannot be opened by `1.3.0` or earlier, so downgrading the harness requires fresh desktop state.
+Hosted runs always start from fresh state and are unaffected.
 An interrupted commit is accepted only when tree, full expected parent list, subject, and cleanliness prove it is the same reviewed commit.
 An ordinary patch has exact parent `[base]`; a resolved upstream merge has exact parents `[base, pinnedUpstreamSha]` and only when `MERGE_HEAD` was that pinned SHA.
 Pending publication is reconciled before a new daily batch, even after its original model deadline.
@@ -49,12 +51,21 @@ One local flock owns the storage; do not run this storage from multiple processe
 
 ## Models and limits
 
-Desktop executor and separate reviewer conversation use the configured Pi `ultra.providerModelTiers[defaultProvider].medium` model.
-CI uses checked-in `ci-settings.json`: both conversations select exactly `zai/glm-5.3`, with supported `high` thinking.
-The pinned Pi catalog includes GLM-5.3, its Z.AI coding endpoint, context limits, compatibility settings, and nonzero prices.
-CI authenticates through the provider-native `ZAI_API_KEY` environment variable; no desktop auth/settings files are copied.
-Missing configured models fail closed, rather than silently escalating or choosing another provider.
+Models come from an ordered `annieModels` list of `provider/model[:thinking]` refs in the Pi agent `settings.json`.
+Without `annieModels`, desktop uses Pi's standard `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` (default `medium`).
+An entry is available when it resolves in the pinned catalog, has known prices, and `ModelRuntime.checkAuth` finds credentials for its provider; thinking is clamped to the model.
+The executor uses the first available entry; the separate reviewer conversation prefers the next available entry from a different provider, else the executor's model.
+No available entry, an empty list, or a malformed ref fails closed before any model request.
+CI uses checked-in `ci-settings.json`: `zai/glm-5.3:high` first, then Anthropic Claude Sonnet 5.5, Moonshot Kimi K3.1 Pro, DeepSeek V4 Pro, and OpenCode Go GLM-5.3, each only when its provider credential exists.
+An offline test resolves every CI ref with nonzero catalog prices and supported thinking.
+CI authenticates through pi-ai's standard provider environment variables, such as `ZAI_API_KEY` or `ANTHROPIC_API_KEY`; no desktop auth/settings files are copied.
 Existing Pi OAuth/API credentials and model overrides are accessed through `ModelRuntime`, never copied into prompts or logs.
+Provider errors are classified by pi-ai: errors it would retry are `transient`; other errors, such as rejected auth or exhausted quota, are `environment`; context overflow stays with Pi's compaction.
+Pi's normal conversation retry policy (`settings.retry`: two retries, 2s base backoff) retries transient errors on the same model; every attempt passes the same admission.
+A provider leaves the run after an `environment` error, or after a transient error once the retry policy is spent on it.
+If nothing of that response was streamed yet, the same request moves to the next available entry; later requests skip the exhausted provider.
+Failover never extends the original lease, `$15` cap, or deadline, and each dispatch reserves and settles against the physical model actually sent.
+pi-ai `1.5.0` marks Z.AI `1308` as non-retryable, while a `1310` weekly/monthly limit arrives as HTTP 429 and is transient: it fails over only after the retry policy is spent.
 Existing coding-agent extensions cannot be loaded unchanged into Pi Durable's distinct extension API.
 Policies reuse Oliver's small-change preference, selected model tier, independent review, Git protection, and verified-release discipline.
 Provider admission checks reported spend against `$15` and the persisted `2h` deadline before every request.
@@ -76,7 +87,7 @@ Manual `observe` or `sweep` refreshes cheap read-only discovery/checkpoint evide
 
 Configure two environments, each restricted to deployment branch `trunk`:
 
-- `honest-annie-model`: secret `ZAI_API_KEY`, from a Z.AI account entitled to GLM-5.3 on its coding endpoint.
+- `honest-annie-model`: any pi-ai provider API key secret enables that provider, for example `ZAI_API_KEY` (Z.AI account entitled to GLM-5.3 on its coding endpoint), `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, or `OPENCODE_API_KEY`.
 - `honest-annie-release`: secrets `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, scoped to publishing `registry.bugabinga.net/pufferpanel`.
 
 Ordinary source/PR/issue operations and model-free retry use native workflow tokens, not a PAT.
@@ -88,7 +99,14 @@ Required reviewers are intentionally absent for unattended operation; adding an 
 If future trunk protection requires PRs or rejects GitHub Actions pushes, switch to a reviewed PR-based flow rather than bypassing protection.
 Commit display name is `honest_annie`; GitHub authentication/attribution remains the native `github-actions[bot]` identity.
 
-The maintenance job has a read-only GitHub token and only the ZAI secret during its model step.
+The maintenance job has a read-only GitHub token; model provider credentials reach only the availability check, model step, and report collector.
+Those steps receive `toJSON(secrets)` as one `ANNIE_MODEL_SECRETS` value; Node removes it from its own `process.env` and copies only names from pi-ai's standard provider env-var mapping, never `github_token`; the original exec environments of the step shell, wrapper, and Node process still contain it.
+That JSON contains every secret visible to the job: `honest-annie-model` environment secrets, repository secrets, and any organization secrets shared with this repository.
+Only provider-named keys are copied into the process; the full JSON still remains in those steps' environment.
+Keep model credentials in `honest-annie-model` and repository-level secrets empty (currently none).
+Ancestor process environments remain readable to same-user model shells on hosted runners, so this is policy isolation, not a credential boundary.
+Model shells still receive only `PATH`, `HOME`, `TMPDIR`, and `PUFFER_MAINT_INTAKE`.
+Report redaction masks values of every set variable in pi-ai's provider env-var mapping, plus `GH_TOKEN`, `ANNIE_GH_TOKEN`, and `REGISTRY_PASSWORD`.
 It exports a prerequisite Git bundle, candidate metadata, and exact-tree gate receipt, not SQLite, transcripts, credential files, or Podman storage.
 The fresh release runner checks parent/base/SHA/tree, clean source, unchanged `.github` and `tools/maintainer`, and candidate gate identity.
 It discards the imported success marker and independently reruns every fixed gate before registry login, Git push, or image publication.
@@ -124,7 +142,7 @@ Runner loss or a failed maintenance job discards its draft and checkpoints; the 
 Hosted maintenance has both a `$15` per-job cap and a `$15` rolling-24h cap across immutable original-attempt leases.
 Every workflow rerun is unpaid; only selective retries of the known model-free effects job may perform already-approved effects.
 The model/gate wrapper has a two-hour deadline; the separate no-model release job has its own timeout.
-CI validates private Podman storage after runtime preparation and before exposing `ZAI_API_KEY`, then always removes its explicit short runroot; release cleanup also removes registry auth.
+CI validates private Podman storage after runtime preparation and before exposing model credentials, then always removes its explicit short runroot; release cleanup also removes registry auth.
 Each model/release/republish job writes a sanitized Actions summary and uploads only its explicit `report.json` for 14 days, including on failure; raw logs, transcripts, SQLite, environment data, and source diffs are not uploaded.
 Reviewed bundles/plans remain separate explicitly approved 14-day artifacts, never blanket report/log uploads.
 Rerun only a failed release job to reuse the exact commit/version without more model spend.
@@ -252,11 +270,13 @@ Approved candidate: `honest-annie-candidate-RUN_ID-1`, always reused by selectiv
 Artifact transport verifies immutable IDs/digests, bounded ZIP contents, and HTTPS storage redirect hosts; native API auth is never forwarded to storage.
 Known complete actual cost replaces cap reservation and is held 24h from original final model-report artifact creation.
 Unknown/partial/interrupted cost holds the entire cap through original creation + 2h + 24h + 5min; nonterminal execution is held more conservatively.
-The provider boundary persists at most 256 request-scoped call intents before dispatch and settles only valid completed responses with explicit raw `prompt_tokens` and `completion_tokens` counters.
-The installed OpenAI adapter invokes `onProviderStreamEvent` before normalizing usage; the wrapper retains validated scalar counters only, forwards the previous callback, and accounts optional cache-read/write counters using caller-configured prices.
-Missing, empty, partial, invalid, errored, or interrupted SSE usage never settles, even when the adapter returns a successful normalized zero-usage message.
-Provider client retries are disabled with `maxRetries: 0`; every new paid retry requires a fresh original-attempt run and ordinary admission.
-`usageComplete`, `knownSubtotal`, call count, cap, absolute deadline, lease hash, and optional `modelFailure` (`environment` | `transient`) are sanitized report metadata.
+The provider boundary persists at most 256 request-scoped call intents, each naming its physical model, before dispatch.
+Reservations use the dispatched model's highest catalog tier prices for its full context window plus the phase output ceiling.
+Only a valid completed response settles, at pi-ai's normal final `usage.cost.total`: the provider-billed total when `totalFromProvider` is set, otherwise the catalog estimate for the dispatched model.
+A response without prompt and output tokens is treated as missing usage; missing, invalid, aborted, or interrupted usage never settles and keeps its reservation held.
+A provider error response settles at that call's full reservation, a conservative upper bound, so a recovered retry or failover keeps usage complete without refunding the failed call.
+Provider client retries are disabled with `maxRetries: 0`; Pi conversation retries and failover are separate admitted dispatches inside the original run.
+`usageComplete`, `knownSubtotal`, call count, cap, absolute deadline, lease hash, and optional `modelFailure` of the last call (`environment` | `transient`, null after a recovered failure) are sanitized report metadata.
 Default desktop limits remain $15/2h; hosted allowance can only tighten them.
 These are configured token/pricing statistics, not authoritative provider invoices or a tamper-proof financial ledger.
 Artifacts and prompts are not an OS sandbox; repository administrators deleting history or changing trusted policy cross the operational boundary.
@@ -281,7 +301,7 @@ Admission records an in-flight task, not terminal handling; verified original-at
 Manual check mode itself remains fully offline; later native observers establish zero dispatch from job metadata, never from the event name alone.
 Only valid no-op, substantive rejection, or approved work acknowledges maintenance inputs; invalid review output and transient failures remain bot retries, bounded to three attempts per fingerprint with one-hour backoff.
 Exact host-classified PR source refusals (`sourceRejection`: `unsupported-history`, `protected-history`, `non-descendant`) cache until source input changes; stale qualification and transport errors do not.
-Environment failures share a 24-hour cooldown across candidates; actual trusted policy/enablement/config-revision changes reset environment gating.
+Environment failures, a pi-ai non-retryable last model failure or a failed preparation/provider-availability step, share a 24-hour cooldown across candidates; actual trusted policy/enablement/config-revision changes reset environment gating.
 After repairing configuration, an operator may change `ANNIE_CONFIG_REVISION` and manually select `maintain`; remaining allowance, immutable leases, current source qualification, fixed gates, and source-before-auth checks still apply.
 Unknown calls retain their full lease cap independently of later known retries; no refund funds a same-day replacement.
 Effects recovery finds the last failed isolated effects job across at most two prior attempts, even when the latest attempt contains only check/skipped jobs.
@@ -326,6 +346,7 @@ Investigating that restart failure is an initial maintenance candidate, not a re
 [Pi Durable README](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md) documents SQLite recovery, request IDs, tool replay policy, extension registration, and usage accounting.
 [Durable coding-agent example](https://github.com/earendil-works/pi/blob/main/packages/durable/test/examples/26-coding-agent.ts) supplies the built-in tools/environment pattern.
 [Durable reviewer example](https://github.com/earendil-works/pi/blob/main/packages/durable/test/examples/28-reviewer.ts) supplies separate conversation/tool selection.
-[Published package metadata](https://www.npmjs.com/package/@earendil-works/pi-durable/v/1.2.0) confirms the pinned experimental package release.
+[Published package metadata](https://www.npmjs.com/package/@earendil-works/pi-durable/v/1.5.0) confirms the pinned experimental package release.
+[Virtual models](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/virtual-models.md) describe Pi's retry-time model routing; Pi Durable does not route virtual models, so the provider boundary applies the same failover.
 Installed operator Pi was `1.1.0`; this module does not upgrade that installation or `pi-ext` dependencies.
 Experimental API changes require an explicit harness dependency update and tests, not an incidental daily self-update.

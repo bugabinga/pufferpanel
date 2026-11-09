@@ -1,8 +1,21 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
+import { findEnvKeys } from '@earendil-works/pi-ai/compat';
+import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
 
 const text = (value, limit = 500) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\\`*_{}[\]()<>#+!|]/g, '\\$&').slice(0, limit).trim();
-const secretValues = env => ['ZAI_API_KEY', 'GH_TOKEN', 'ANNIE_GH_TOKEN', 'REGISTRY_PASSWORD'].map(key => env[key]).filter(value => typeof value === 'string' && value.length >= 4);
+// Names from pi-ai's standard provider env-var mapping that are set in env; no provider is special-cased.
+export const providerKeyNames = (env = process.env) => [...new Set(getBuiltinProviders().flatMap(provider => findEnvKeys(provider, env) ?? []))].filter(name => typeof env[name] === 'string' && env[name]);
+// The trusted step passes its environment's secrets as one JSON value; only pi-ai provider credentials are kept, never GitHub tokens.
+export function loadModelSecrets(env = process.env) {
+  const raw = env.ANNIE_MODEL_SECRETS; delete env.ANNIE_MODEL_SECRETS;
+  if (!raw) return [];
+  const secrets = JSON.parse(raw);
+  const names = providerKeyNames(secrets);
+  for (const name of names) env[name] = secrets[name];
+  return names;
+}
+const secretValues = env => [...providerKeyNames(env), 'GH_TOKEN', 'ANNIE_GH_TOKEN', 'REGISTRY_PASSWORD'].map(key => env[key]).filter(value => typeof value === 'string' && value.length >= 4);
 export function redact(value, env = process.env) {
   let result = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
   for (const secret of secretValues(env)) {
@@ -141,6 +154,7 @@ export async function collect({ reportPath, gateEventsPath, publishedPath, sourc
 }
 function arg(name) { const index = process.argv.indexOf(name); return index < 0 ? null : process.argv[index + 1] ?? null; }
 async function main() {
+  loadModelSecrets();
   const command = process.argv[2];
   if (!['render', 'collect'].includes(command)) throw Error('usage: report.mjs render|collect --report PATH --reportdir PATH [--gate-events PATH] [--summary PATH]');
   await collect({ reportPath: arg('--report') ?? process.argv[3], gateEventsPath: arg('--gate-events'), publishedPath: arg('--published'), sourceReceiptPath: arg('--source-receipt'), actionReceiptsPath: arg('--action-receipts'), reportDir: arg('--reportdir'), summaryPath: arg('--summary') ?? process.env.GITHUB_STEP_SUMMARY });

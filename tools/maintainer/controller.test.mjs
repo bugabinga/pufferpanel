@@ -8,11 +8,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+import { createAssistantMessageEventStream, createModels } from '@earendil-works/pi-ai';
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { BACKGROUND_CONTEXT as ctx } from '@earendil-works/chord/context';
-import { RunDoc, CallsDoc, budgetModels, callUsage, withinBudget, createRuntime } from './maintain.mjs';
+import { RunDoc, CallsDoc, budgetModels, callUsage, withinBudget, createRuntime, modelFailureKind } from './maintain.mjs';
 import { reportFor, collect } from './report.mjs';
 import { makeLease, verifyLease, rollingAllowance, GitHub, unzipJSON, trustedRun, verifyWake, chooseTask, prFingerprint, controller, digest, observeLedger, provenZeroDispatch, noCompletionEvidence, POLICY_PATH } from './controller.mjs';
 const now = Date.parse('2026-04-03T04:17:00Z'), HOUR = 3600000, DAY = 24 * HOUR;
@@ -199,16 +199,16 @@ test('saturated filtered history shards bounded windows, persistent saturation r
   await assert.rejects(observeLedger(api, { id: 7 }, { id: 8 }, now, 43), /pagination/);
   assert.ok(windows < 16);
 });
-async function modelFixture(t, behavior, extra = {}, selectedModel = null) {
+async function modelFixture(t, behavior, extra = {}, selectedModel = null, { models, getModel } = {}) {
   const dir = await scratch(t), registry = createRegistry();
-  const harness = await Harness.open(await openNodeSqliteStorage(join(dir, 'calls.sqlite')), { registry, models: {} }, ctx);
+  const harness = await Harness.open(await openNodeSqliteStorage(join(dir, 'calls.sqlite')), { registry, models: createModels() }, ctx);
   t.after(() => harness.close(ctx)); const root = await harness.root(ctx);
   const current = { startedAt: Date.now(), requestId: 'current', spent: 0, usageStart: 0, ...extra };
   await root.commit(async tx => { (await tx.doc(RunDoc, root.id)).run = current; }, ctx);
   let called = 0;
-  const runtime = { streamSimple(model, transcript, options) { called++; return behavior(model, transcript, options); } };
+  const runtime = { getModel, streamSimple(model, transcript, options) { called++; return behavior(model, transcript, options); } };
   const model = selectedModel ?? { api: 'test', provider: 'test', id: 'test', contextWindow: 1000, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } };
-  const proxy = budgetModels(runtime, { root, harness });
+  const proxy = budgetModels(runtime, { root, harness, models });
   const execute = async options => { const result = await proxy.streamSimple(model, {}, options).result(); return { result, usage: callUsage(await harness.snapshot(CallsDoc, root.id, ctx), 'current'), called }; };
   return { execute, root, harness };
 }
@@ -219,7 +219,6 @@ test('review reasoning capacity reserves full phase-specific output cost before 
     const model = { api: 'test', provider: 'test', id: 'test', contextWindow: 1000, maxTokens: ceiling, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } };
     const fixture = await modelFixture(t, (selected, transcript, options) => {
       assert.equal(options.maxTokens, expected); assert.equal(options.maxRetries, 0);
-      options.onProviderStreamEvent({ usage: { prompt_tokens: 100, completion_tokens: 100 } }, selected);
       return stream([{ type: 'done', reason: 'stop', message: goodMessage }]);
     }, { phase }, model);
     assert.equal((await fixture.execute()).called, 1);
@@ -229,19 +228,23 @@ test('review reasoning capacity reserves full phase-specific output cost before 
   const insufficient = await modelFixture(t, () => assert.fail('full reviewer reservation exceeds remainder'), { phase: 'reviewing', budgetCap: 0.01 });
   const blocked = await insufficient.execute(); assert.equal(blocked.called, 0); assert.match(blocked.result.errorMessage, /budget/);
 });
-test('durable provider accounting settles real done; synthetic zero failed SSE stays unknown', async t => {
-  const good = await modelFixture(t, (model, transcript, options) => { options.onProviderStreamEvent({ usage: { prompt_tokens: 100, completion_tokens: 100 } }, model); return stream([{ type: 'done', reason: 'stop', message: goodMessage }]); });
+test('durable provider accounting settles real done and provider errors at their cap; incomplete or usage-less responses stay unknown', async t => {
+  const good = await modelFixture(t, () => stream([{ type: 'done', reason: 'stop', message: goodMessage }]));
   const done = await good.execute(); assert.equal(done.usage.usageComplete, true); assert.equal(done.usage.cost, 0.0002); assert.equal(done.called, 1);
-  for (const events of [[], [{ type: 'error', error: { ...goodMessage, stopReason: 'error', usage: { ...goodMessage.usage, cost: { total: 0 } } } }], [{ type: 'done', reason: 'error', message: goodMessage }], [{ type: 'done', reason: 'stop', message: { ...goodMessage, usage: null } }]]) {
+  for (const events of [[], [{ type: 'done', reason: 'error', message: goodMessage }], [{ type: 'done', reason: 'stop', message: { ...goodMessage, usage: null } }], [{ type: 'done', reason: 'stop', message: { ...goodMessage, usage: { ...goodMessage.usage, input: 0 } } }], [{ type: 'error', reason: 'aborted', error: { ...goodMessage, stopReason: 'aborted' } }]]) {
     const f = await modelFixture(t, () => stream(events)); const failed = await f.execute();
     assert.equal(failed.usage.usageComplete, false); assert.equal(failed.usage.cost, null); assert.equal(failed.usage.knownSubtotal, 0); assert.equal(failed.usage.dispatched, 1);
   }
+  // A provider error never refunds: the call settles at its full reservation, keeping usage complete.
+  const errored = await modelFixture(t, () => stream([{ type: 'error', reason: 'error', error: { ...goodMessage, stopReason: 'error', errorMessage: '401 Incorrect API key provided', usage: { ...goodMessage.usage, cost: { total: 0 } } } }]));
+  const settled = await errored.execute();
+  assert.deepEqual(settled.usage, { usageComplete: true, knownSubtotal: 0.005, cost: 0.005, held: 0.005, dispatched: 1, modelFailure: 'environment' });
 });
-test('installed OpenAI SDK adapter raw SSE usage, not normalized zero, settles accounting', async t => {
+test('installed OpenAI SDK adapter: pi-ai usage.cost.total settles accounting; missing usage stays unknown', async t => {
   const runtime = await createRuntime(await scratch(t));
   const selectedModel = { ...runtime.getModel('zai', 'glm-5.3'), contextWindow: 1000, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } };
   for (const raw of [{ prompt_tokens: 100, completion_tokens: 100 }, {}, undefined, { prompt_tokens: 100 }, { completion_tokens: 100 }, { prompt_tokens: 100, completion_tokens: 100, partial: true }, { http: 401 }, { http: 429 }, { http: 503 }, { prompt_tokens: 100, completion_tokens: 100, early: true }]) {
-    let hooks = 0, requests = 0;
+    let requests = 0;
     const fixture = await modelFixture(t, (model, transcript, options) => runtime.streamSimple({ ...model, api: 'openai-completions', baseUrl: 'https://offline.invalid/v1', name: 'fixture', reasoning: false, input: ['text'], maxTokens: 4000 }, { messages: [{ role: 'user', content: 'fixture', timestamp: Date.now() }] }, { ...options, apiKey: 'offline-key', fetch: async () => {
       requests++;
       if (raw?.http) return new Response(JSON.stringify({ error: { message: raw.http === 401 ? 'invalid key' : 'temporarily unavailable' } }), { status: raw.http, headers: { 'content-type': 'application/json' } });
@@ -256,12 +259,47 @@ test('installed OpenAI SDK adapter raw SSE usage, not normalized zero, settles a
       }
       return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
     } }), {}, selectedModel);
-    const result = await fixture.execute({ onProviderStreamEvent() { hooks++; } });
-    assert.equal(requests, 1); assert.ok(hooks >= (raw?.http ? 0 : raw?.partial ? 1 : 2));
+    const result = await fixture.execute();
+    assert.equal(requests, 1);
     assert.equal(result.result.stopReason, raw?.partial || raw?.http ? 'error' : 'stop');
     if (raw?.http) assert.equal(result.usage.modelFailure, raw.http === 401 ? 'environment' : 'transient');
-    assert.equal(result.usage.cost, !raw?.partial && !raw?.early && raw?.prompt_tokens !== undefined && raw?.completion_tokens !== undefined ? 0.0002 : null);
+    if (raw?.partial || raw?.http) assert.equal(result.usage.cost, 0.005); // provider errors settle at the call reservation
+    else if (raw?.prompt_tokens !== undefined && raw?.completion_tokens !== undefined) assert.ok(Math.abs(result.usage.cost - 0.0002) < 1e-12, raw);
+    else assert.equal(result.usage.cost, null);
   }
+});
+test('non-retryable provider errors fail over inside the lease, pricing the dispatched model; retryable errors use Pi retry first', async t => {
+  const catalog = { 'a/x': { api: 'test', provider: 'a', id: 'x', contextWindow: 1000, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } }, 'b/y': { api: 'test', provider: 'b', id: 'y', contextWindow: 1000, cost: { input: 2, output: 2, cacheRead: 2, cacheWrite: 2 } } };
+  const models = [{ provider: 'a', modelId: 'x', thinkingLevel: 'high' }, { provider: 'b', modelId: 'y', thinkingLevel: 'low' }];
+  const scenario = async errors => {
+    const dispatched = [];
+    const fixture = await modelFixture(t, (model, transcript, options) => {
+      dispatched.push(`${model.provider}/${model.id}:${options.reasoning}`);
+      const errorMessage = model.provider === 'a' ? errors.shift() : undefined;
+      const usage = { ...goodMessage.usage, cost: { total: model.cost.input * 0.0002 } };
+      return stream(errorMessage ? [{ type: 'error', reason: 'error', error: { ...goodMessage, provider: model.provider, stopReason: 'error', errorMessage } }] : [{ type: 'done', reason: 'stop', message: { ...goodMessage, provider: model.provider, usage } }]);
+    }, {}, catalog['a/x'], { models, getModel: (provider, id) => catalog[`${provider}/${id}`] });
+    return { dispatched, execute: () => fixture.execute({ reasoning: 'high' }) };
+  };
+  for (const quota of ['401 Incorrect API key provided', '429 {"code":"1308","message":"Usage limit reached"}', '429 insufficient_quota: You exceeded your current quota']) {
+    const f = await scenario([quota]);
+    let result = await f.execute();
+    assert.equal(result.result.stopReason, 'stop'); assert.equal(result.result.provider, 'b');
+    assert.deepEqual(result.usage, { usageComplete: true, knownSubtotal: 0.005 + 0.0004, cost: 0.005 + 0.0004, held: 0.005 + 0.0004, dispatched: 2, modelFailure: null });
+    result = await f.execute();
+    assert.deepEqual(f.dispatched, ['a/x:high', 'b/y:low', 'b/y:low']); assert.equal(result.usage.knownSubtotal, 0.005 + 0.0004 + 0.0004);
+  }
+  const retry = await scenario(['503 Service temporarily unavailable', '503 Service temporarily unavailable', '503 Service temporarily unavailable']);
+  let result = await retry.execute();
+  assert.equal(result.result.stopReason, 'error'); assert.match(result.result.errorMessage, /503/); assert.equal(result.usage.modelFailure, 'transient');
+  assert.equal((await retry.execute()).result.stopReason, 'error'); assert.deepEqual(retry.dispatched, ['a/x:high', 'a/x:high']);
+  result = await retry.execute();
+  assert.equal(result.result.provider, 'b'); assert.deepEqual(retry.dispatched, ['a/x:high', 'a/x:high', 'a/x:high', 'b/y:low']);
+  const recovered = await scenario(['503 Service temporarily unavailable']);
+  await recovered.execute(); result = await recovered.execute();
+  assert.equal(result.result.provider, 'a'); assert.deepEqual(recovered.dispatched, ['a/x:high', 'a/x:high']);
+  assert.equal(modelFailureKind({ stopReason: 'error', errorMessage: 'context_length_exceeded: prompt is too long' }), 'transient');
+  assert.equal(modelFailureKind({ stopReason: 'aborted' }), 'transient');
 });
 test('provider throw/cancellation remains unknown; remainder/deadline rejects BEFORE target with known zero actual calls', async t => {
   const thrown = await modelFixture(t, () => { throw Error('provider throw'); }); assert.equal((await thrown.execute()).usage.cost, null);
@@ -298,7 +336,7 @@ test('workflow isolates secretless PR wake, trusted observation, prepaid attempt
   assert.match(main, /cron: '7,37 \* \* \* \*'/); assert.doesNotMatch(main, /date -u/);
   const model = main.slice(main.indexOf('  maintain:'), main.indexOf('  release:'));
   assert.ok(model.indexOf('ci.sh preflight') < model.indexOf('name: annie-lease-'));
-  assert.ok(model.indexOf('name: annie-lease-') < model.indexOf('secrets.ZAI_API_KEY'));
+  assert.ok(model.indexOf('name: annie-lease-') < model.indexOf('toJSON(secrets)'));
   assert.doesNotMatch(model, /ANNIE_GH_TOKEN|REGISTRY_PASSWORD|contents: write/);
   const release = main.slice(main.indexOf('  release:'), main.indexOf('  retry-effects:'));
   assert.ok(release.indexOf('ci.sh push') < release.indexOf('ci.sh registry-login'));
