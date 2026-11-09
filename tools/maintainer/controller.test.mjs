@@ -243,7 +243,9 @@ test('durable provider accounting settles real done and provider errors at their
   // A provider error never refunds: the call settles at its full reservation, keeping usage complete.
   const errored = await modelFixture(t, () => stream([{ type: 'error', reason: 'error', error: { ...goodMessage, stopReason: 'error', errorMessage: '401 Incorrect API key provided', usage: { ...goodMessage.usage, cost: { total: 0 } } } }]));
   const settled = await errored.execute();
-  assert.deepEqual(settled.usage, { usageComplete: true, knownSubtotal: 0.017, cost: 0.017, held: 0.017, dispatched: 1, modelFailure: 'environment' });
+  const { providerFailures, ...usage } = settled.usage;
+  assert.deepEqual(usage, { usageComplete: true, knownSubtotal: 0.017, cost: 0.017, held: 0.017, dispatched: 1, modelFailure: 'environment' });
+  assert.deepEqual(providerFailures.map(({ observedAt, ...failure }) => (assert.ok(Date.parse(observedAt) > 0), failure)), [{ provider: 'test', kind: 'auth' }]);
 });
 test('installed OpenAI SDK adapter: pi-ai usage.cost.total settles accounting; missing usage stays unknown', async t => {
   const runtime = await createRuntime(await scratch(t));
@@ -307,11 +309,13 @@ test('non-retryable provider errors fail over inside the lease, pricing the disp
     }, {}, catalog['a/x'], { models, getModel: (provider, id) => catalog[`${provider}/${id}`] });
     return { dispatched, execute: () => fixture.execute({ reasoning: 'high' }) };
   };
-  for (const quota of ['401 Incorrect API key provided', '429 {"code":"1308","message":"Usage limit reached"}', '429 insufficient_quota: You exceeded your current quota']) {
+  for (const [quota, kind] of [['401 Incorrect API key provided', 'auth'], ['429 {"code":"1308","message":"Usage limit reached"}', 'quota'], ['429 insufficient_quota: You exceeded your current quota', 'quota']]) {
     const f = await scenario([quota]);
     let result = await f.execute();
     assert.equal(result.result.stopReason, 'stop'); assert.equal(result.result.provider, 'b');
-    assert.deepEqual(result.usage, { usageComplete: true, knownSubtotal: 0.017 + 0.0004, cost: 0.017 + 0.0004, held: 0.017 + 0.0004, dispatched: 2, modelFailure: null });
+    const { providerFailures, ...usage } = result.usage;
+    assert.deepEqual(usage, { usageComplete: true, knownSubtotal: 0.017 + 0.0004, cost: 0.017 + 0.0004, held: 0.017 + 0.0004, dispatched: 2, modelFailure: null });
+    assert.deepEqual(providerFailures.map(failure => [failure.provider, failure.kind]), [['a', kind]], quota);
     result = await f.execute();
     assert.deepEqual(f.dispatched, ['a/x:high', 'b/y:low', 'b/y:low']); assert.equal(result.usage.knownSubtotal, 0.017 + 0.0004 + 0.0004);
   }

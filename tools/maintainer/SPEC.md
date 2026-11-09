@@ -88,11 +88,14 @@ Redaction is defense-in-depth, not an OS sandbox or a guarantee that arbitrary m
 ## Efficiency and personality
 
 Validate the exact private container storage configuration before paid model requests.
-Stay provider-independent through Pi's normal model runtime: an ordered model preference list, standard provider credentials, and pi-ai error classification, with no provider special-cased in code.
-Use the first available configured model; independent review prefers an available model from a different provider.
-Fail closed when no configured model is available or its pricing is unknown.
+Stay provider-independent through Pi's normal model runtime, standard provider credentials, and pi-ai error classification, with no provider or model special-cased in code.
+Work with whichever pi-ai provider API keys are configured; CI forwards every pi-ai provider credential name and known companion explicitly, never the whole secrets context.
+Choose models as Pi does: optional `enabledModels` preference first, then Pi's saved default, then each authenticated provider's Pi default model in Pi's order; no hand-curated model list.
+Use the first available candidate with known pricing; independent review prefers a candidate from a different provider.
+Fail closed when no candidate is available.
 After a provider error pi-ai never retries, or a transient one once Pi's retry policy is spent, move work to the next available model inside the original lease, cap, and deadline.
 Never re-dispatch to an exhausted provider within the run; deterministic provider failures are environment failures, not hourly retries.
+Remember provider quota and auth failures across runs as bounded provider holds until the stated reset or 24h, cleared by a config change; skip held providers, and admit no paid work while every known provider is held.
 Keep model budgets and process deadlines; do not weaken checks to obtain a green run.
 Prefer an honest no-op over speculative changes or decorative activity.
 Use Annie's concise, cheerful maintainer voice in summaries while keeping failures and consequences unmistakable.
@@ -167,7 +170,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 
 ## Acceptance evidence
 
-Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection, and in-lease provider failover.
+Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection from Pi defaults and `enabledModels`, cross-run provider holds, the forwarded provider env list against pi-ai's mapping, and in-lease provider failover.
 Shell and workflow validation pass.
 Fake-Podman tests cover reviewer sandbox flags, environment, freezing, output capping, timeout/abort cleanup, and the per-review time budget.
 Fake-Podman tests cover `ui_snapshot` isolation flags, priming decisions, caps, budget sharing, the skipped and unavailable paths, and the result schema; a faux review shows a screenshot to the model with `image()`.

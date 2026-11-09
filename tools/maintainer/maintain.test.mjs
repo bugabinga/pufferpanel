@@ -12,7 +12,7 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-work
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER, LENGTH_REMINDER, REPAIR_FLOOR_MS } from './maintain.mjs';
+import { advance, RunDoc, selectModels, heldProviders, piModelResolver, providerFailure, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER, LENGTH_REMINDER, REPAIR_FLOOR_MS } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 import { fakeReviewSandbox } from './fake-podman.mjs';
 import { createGuard } from './guard.mjs';
@@ -496,14 +496,40 @@ test('model shells never inherit provider credentials or the model secret JSON',
   const env = modelShellEnv({ PATH: '/bin', HOME: '/h', ZAI_API_KEY: 'z', ANTHROPIC_API_KEY: 'a', OPENAI_API_KEY: 'o', GH_TOKEN: 'g', ANNIE_MODEL_SECRETS: '{}' }, '/intake');
   assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH', 'PUFFER_MAINT_INTAKE', 'TMPDIR']);
 });
-test('configuration falls back to Pi default model settings, skips unpriced or unauthenticated entries, and has calendar version', async () => {
-  const cost = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 };
-  const models = { 'p/m': { cost, reasoning: true }, 'p/free': { cost: {}, reasoning: true }, 'q/m': { cost, reasoning: true } };
-  const runtime = { getModel: (provider, id) => models[`${provider}/${id}`], checkAuth: async provider => provider === 'p' ? { type: 'api_key' } : undefined };
-  assert.deepEqual((await selectModels({ defaultProvider: 'p', defaultModel: 'm', defaultThinkingLevel: 'high' }, runtime)).executor, { provider: 'p', modelId: 'm', thinkingLevel: 'high' });
-  assert.deepEqual((await selectModels({ annieModels: ['p/free:high', 'q/m', 'p/m:low'], defaultProvider: 'q', defaultModel: 'm' }, runtime)).available, [{ provider: 'p', modelId: 'm', thinkingLevel: 'low' }]);
-  await assert.rejects(selectModels({ defaultProvider: 'p' }, runtime), /no models configured/);
-  await assert.rejects(selectModels({ annieModels: ['p/free', 'q/m'] }, runtime), /no configured model available/);
-  await assert.rejects(selectModels({ annieModels: ['p'] }, runtime), /invalid model ref/);
+test('selection orders enabledModels, Pi saved default, then provider defaults; skips unpriced and held; fails closed', async () => {
+  const cost = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, table = piModelResolver.defaultModelPerProvider;
+  const models = [{ provider: 'zai', id: table.zai, cost, reasoning: true }, { provider: 'zai', id: 'free', cost: {}, reasoning: true }, { provider: 'minimax', id: table.minimax, cost, reasoning: true }, { provider: 'custom', id: 'm', cost, reasoning: false }];
+  const runtime = { getAvailable: async () => models }, select = (settings, held) => selectModels(settings, runtime, held);
+  let choices = await select({});
+  assert.deepEqual(choices.available, [{ provider: 'zai', modelId: table.zai, thinkingLevel: 'high' }, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' }]);
+  assert.deepEqual(choices.reviewer, choices.available[1]); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  choices = await select({ defaultProvider: 'custom', defaultModel: 'm', defaultThinkingLevel: 'low' });
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), ['custom/m:off', `zai/${table.zai}:low`, `minimax/${table.minimax}:low`]);
+  choices = await select({ enabledModels: ['zai/free:low', 'minimax/*:medium'] });
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}:${choice.thinkingLevel}`), ['minimax:medium', 'zai:high']);
+  choices = await select({}, new Set(['zai']));
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  await assert.rejects(select({}, new Set(['zai', 'minimax'])), /no configured model available; held providers: zai, minimax/);
+  await assert.rejects(select({ enabledModels: 'zai/*' }), /invalid enabledModels/);
+  await assert.rejects(selectModels({}, { getAvailable: async () => [] }), /no configured model available$/);
   assert.equal(versionFor('2026-04-03'), '2026.4.3'); assert.equal(stateDirectory({ HOME: '/x' }), '/x/.pi/agent/maintenance/pufferpanel');
+});
+test('provider holds from trusted observation are strict, and expired holds release their provider', () => {
+  const now = Date.parse('2026-04-19T00:00:00Z'), hold = { provider: 'zai', until: now + 1, reason: 'quota' };
+  assert.deepEqual([...heldProviders(JSON.stringify([hold, { provider: 'minimax', until: now, reason: 'auth' }]), now)], ['zai']);
+  assert.deepEqual([...heldProviders('', now)], []); assert.deepEqual([...heldProviders(undefined, now)], []);
+  for (const bad of ['{', '{}', JSON.stringify([{ ...hold, extra: 1 }]), JSON.stringify([{ ...hold, reason: 'transient' }]), JSON.stringify([hold, hold]), JSON.stringify([{ ...hold, provider: 'Bad/id' }]), JSON.stringify([{ ...hold, until: 1.5 }])]) assert.throws(() => heldProviders(bad, now), bad);
+});
+test('provider failures classify auth, quota, and transient without error text; zone-less reset times read as UTC+8', () => {
+  const at = Date.parse('2026-04-18T23:41:53Z'), error = errorMessage => providerFailure({ stopReason: 'error', errorMessage }, at);
+  // Observed Z.AI evidence: a 5-hour window reset at 09:29:51 seen at 23:41:53Z fits only UTC+8 (01:29:51Z).
+  assert.deepEqual(error('429 Usage limit reached for 5 hour. Your limit will reset at 2026-04-19 09:29:51'), { kind: 'quota', observedAt: '2026-04-18T23:41:53.000Z', resetAt: '2026-04-19T01:29:51.000Z' });
+  assert.equal(error('429 Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-25T18:45:36Z').resetAt, '2026-04-25T18:45:36.000Z');
+  assert.deepEqual(error('402 insufficient balance'), { kind: 'quota', observedAt: '2026-04-18T23:41:53.000Z' });
+  assert.equal(error('429 {"code":"1308","message":"limit"}').kind, 'quota');
+  assert.equal(error('401 Incorrect API key provided').kind, 'auth'); assert.equal(error('403 Forbidden').kind, 'auth');
+  for (const transient of ['429 rate limit, try again', '503 Service temporarily unavailable', '400 invalid request: tool schema', 'context_length_exceeded: prompt is too long']) assert.equal(error(transient).kind, 'transient', transient);
+  assert.equal(error('limit will reset at 2026-06-30 00:00:00').resetAt, undefined, 'beyond 31 days');
+  assert.equal(error('Your limit will reset at 2026-04-18 01:00:00').resetAt, undefined, 'already past');
+  assert.equal(providerFailure({ stopReason: 'aborted', errorMessage: '401' }, at).kind, 'transient');
 });

@@ -1,10 +1,1 @@
-{
-  "annieModels": [
-    "zai/glm-5.3:high",
-    "minimax/MiniMax-M3:high",
-    "anthropic/claude-sonnet-5-5:high",
-    "moonshotai/kimi-k3.1-pro:high",
-    "deepseek/deepseek-v4-pro:high",
-    "opencode-go/glm-5.3:high"
-  ]
-}
+{}

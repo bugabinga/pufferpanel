@@ -345,3 +345,42 @@ test('incident replay: run 41687463110 attempt 3, persisted 79df79c9 with failed
   const next = await f.json('checkpoint.json'); assert.deepEqual(next.republish, [{ runId: id, attempts: 1, nextAt: Date.parse('2026-11-09T08:07:00Z') }]); assert.ok(next.pendingRuns.includes(id));
   }
 });
+// One paid run whose model report names provider failures; the next observation folds them into provider holds.
+async function heldFixture(t, failures, report = {}) {
+  const f = await fixture(t); await f.execute(); const checkpoint = await f.json('checkpoint.json'), lease = await f.json('lease.json');
+  f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', checkpoint); f.artifact(42, 'annie-lease-42-1', 'lease.json', lease);
+  f.artifact(42, 'honest-annie-model-report-42-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: lease.task.kind, day: lease.task.day, base, managementApproved: false, commit: null, releaseCommit: null, phase: 'failed', reason: 'model-or-phase-failed', modelFailure: 'environment', usageComplete: true, reportedUsage: { status: 'known', cost: 1 }, providers: ['zai', 'minimax'], providerFailures: failures, ...report });
+  return f;
+}
+const iso = at => new Date(at).toISOString();
+test('provider holds: all available providers held admits nothing until the earliest reset; a config revision clears them', async t => {
+  const f = await heldFixture(t, [{ provider: 'zai', kind: 'quota', observedAt: iso(now + 600000), resetAt: iso(now + 5 * 3600000) }, { provider: 'minimax', kind: 'auth', observedAt: iso(now + 1200000) }]);
+  f.setClock(now + 2 * 3600000); f.setCurrent(43);
+  const held = await f.execute({ GITHUB_OUTPUT: join(f.dir, 'out-43') });
+  assert.equal(held.state, 'providers-held'); assert.equal(held.paid, false); assert.equal(held.holdsExpireAt, iso(now + 5 * 3600000));
+  const holds = [{ provider: 'zai', until: now + 5 * 3600000, reason: 'quota' }, { provider: 'minimax', until: now + 1200000 + 24 * 3600000, reason: 'auth' }];
+  const cp = await f.json('checkpoint.json'); assert.deepEqual(cp.providerHolds, holds); assert.deepEqual(cp.providers.available, ['zai', 'minimax']);
+  assert.equal(cp.environment, null, 'provider-attributed failures never start the shared cooldown');
+  assert.ok((await readFile(join(f.dir, 'out-43'), 'utf8')).includes(`holds=${JSON.stringify(holds)}\n`));
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', cp);
+  f.setClock(now + 2 * 3600000 + 60000); f.setCurrent(44);
+  const rotated = await f.execute({ ANNIE_CONFIG_REVISION: 'rotated-1' });
+  assert.equal(rotated.state, 'admitted'); assert.deepEqual(rotated.providerHolds, []); assert.deepEqual((await f.json('checkpoint.json')).providers.available, []);
+});
+test('provider holds expire, the next provider still runs, and malformed provider evidence fails closed', async t => {
+  const f = await heldFixture(t, [{ provider: 'zai', kind: 'quota', observedAt: iso(now + 600000), resetAt: iso(now + 5 * 3600000) }, { provider: 'minimax', kind: 'transient', observedAt: iso(now + 1200000) }]);
+  f.setClock(now + 2 * 3600000); f.setCurrent(43);
+  const partial = await f.execute({ GITHUB_OUTPUT: join(f.dir, 'out-43') });
+  assert.equal(partial.state, 'admitted'); assert.deepEqual(partial.providerHolds, [{ provider: 'zai', until: iso(now + 5 * 3600000), reason: 'quota' }]);
+  assert.ok((await readFile(join(f.dir, 'out-43'), 'utf8')).includes(`holds=${JSON.stringify([{ provider: 'zai', until: now + 5 * 3600000, reason: 'quota' }])}\n`));
+  const cp = await f.json('checkpoint.json');
+  for (const [failures, error] of [[[{ provider: 'zai', kind: 'quota', observedAt: 'yesterday' }], /malformed settlement provider evidence/], [[{ provider: 'zai', kind: 'gone', observedAt: iso(now) }], /malformed settlement provider evidence/]]) {
+    const bad = await heldFixture(t, failures); bad.setClock(now + 2 * 3600000); bad.setCurrent(43);
+    await assert.rejects(bad.execute(), error);
+  }
+  const forged = await fixture(t); forged.runs.push(forged.run(41)); forged.artifact(41, 'annie-checkpoint-41-1', 'checkpoint.json', { ...cp, runId: 41, providerHolds: [{ provider: 'zai', until: 1, reason: 'quota', extra: true }] });
+  await assert.rejects(forged.execute(), /malformed provider holds/);
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', { ...cp, paid: false, flights: [] });
+  f.setClock(now + 5 * 3600000 + 60000); f.setCurrent(44);
+  const expired = await f.execute(); assert.deepEqual(expired.providerHolds, []); assert.equal(expired.holdsExpireAt, null);
+});

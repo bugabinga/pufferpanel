@@ -5,6 +5,13 @@ export const REF = 'refs/heads/trunk';
 export const PROTECTED_PATHS = Object.freeze(['tools/maintainer', '.github']);
 export const isSha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 export const versionFor = day => day.split('-').map(Number).join('.');
+export const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+export const providerId = value => typeof value === 'string' && PROVIDER_ID.test(value);
+// Cross-run provider holds from trusted observation: unique bounded provider ids, quota|auth, epoch-ms expiry.
+export function validateHolds(value) {
+  if (!Array.isArray(value) || value.length > 64 || value.some(hold => !hold || typeof hold !== 'object' || Object.keys(hold).sort().join() !== 'provider,reason,until' || !providerId(hold.provider) || !['quota', 'auth'].includes(hold.reason) || !Number.isSafeInteger(hold.until) || hold.until <= 0) || new Set(value.map(hold => hold.provider)).size !== value.length) throw Error('malformed provider holds');
+  return value;
+}
 export function validateTask(value) {
   const keys = ['kind', 'day', 'repo', 'ref', 'base', 'upstreamSha', 'upstreamRef', 'number', 'head', 'author', 'fingerprint'];
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !keys.includes(key))) throw Error('invalid selected task fields');

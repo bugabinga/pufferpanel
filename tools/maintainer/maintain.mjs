@@ -16,10 +16,10 @@ import { createCodemodeExtension } from '@earendil-works/pi-durable/codemode';
 import { CodemodeSandbox } from '@earendil-works/pi-codemode';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, resolveModelScopeWithDiagnostics } from '@earendil-works/pi-coding-agent';
 import { redact, reportFor, writeReport } from './report.mjs';
 import { collectGitHubSnapshot, writeIntake, removeIntake, installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
-import { PROTECTED_PATHS, selectedTask, versionFor } from './task.mjs';
+import { PROTECTED_PATHS, selectedTask, validateHolds, versionFor } from './task.mjs';
 import { createGuard } from './guard.mjs';
 import { materializePR } from './pr.mjs';
 import { approvedPlan } from './management.mjs';
@@ -59,11 +59,24 @@ const accountFailedModelTurn = async (run, phase, options) => {
 
 // pi-ai's classification: a provider error it never retries (auth, quota, rejected request) is environmental; overflow compacts.
 export const modelFailureKind = message => message?.stopReason === 'error' && !isRetryableAssistantError(message) && !isContextOverflow(message) ? 'environment' : 'transient';
+// Cross-run evidence, never the error text: auth by status/wording; quota by a stated reset time, quota/billing wording, or a
+// 402/429 that pi-ai does not retry; anything else is transient. Zone-less reset times are read as UTC+8, verified for Z.AI
+// only: its "Usage limit reached for 5 hour" resets fit the 5-hour window only then. Other providers may expire early.
+export function providerFailure(message, now = Date.now()) {
+  const text = message?.stopReason === 'error' && !isContextOverflow(message) ? String(message.errorMessage ?? '') : '';
+  const [, day, clock, zone] = /\breset(?:s)?\s+(?:at|on)\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?\s*(Z|[+-]\d{2}:\d{2})?/i.exec(text) ?? [];
+  const reset = day ? Date.parse(`${day}T${clock}${zone ?? '+08:00'}`) : NaN;
+  const resetAt = reset > now && reset <= now + 31 * 86_400_000 ? new Date(reset).toISOString() : null;
+  const kind = !text ? 'transient' : /(?<![a-z0-9])(?:401|403)(?![a-z0-9])|unauthori[sz]ed|forbidden|authenticat|invalid[ _-]?(?:api[ _-]?)?key|permission denied/i.test(text) ? 'auth' : resetAt || /quota|usage.?limit|limit (?:reached|exhausted)|insufficient[ _-]?(?:balance|credit|funds)|available balance|out of budget|billing/i.test(text) || modelFailureKind(message) === 'environment' && /(?<![a-z0-9])(?:402|429)(?![a-z0-9])/.test(text) ? 'quota' : 'transient';
+  return { kind, observedAt: new Date(now).toISOString(), ...(resetAt ? { resetAt } : {}) };
+}
 export const CallsDoc = defineDoc({ kind: 'pufferpanel.maintenance.calls', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', checkpointWhen: () => false, initial: () => ({ requestId: null, calls: [] }) });
 export function callUsage(doc, requestId) {
   const calls = doc && doc.requestId === requestId && Array.isArray(doc.calls) ? doc.calls : [];
   const knownSubtotal = calls.reduce((sum, call) => sum + (call.cost ?? 0), 0);
-  return { usageComplete: calls.every(call => call.cost !== null), knownSubtotal, cost: calls.every(call => call.cost !== null) ? knownSubtotal : null, held: calls.reduce((sum, call) => sum + (call.cost ?? call.cap), 0), dispatched: calls.length, modelFailure: calls.at(-1)?.failure ?? null };
+  // Each provider's latest call decides its failure summary; a later success or non-provider error clears it.
+  const providers = new Map(calls.map(call => [call.model?.split('/')[0], call.kind ? { provider: call.model.split('/')[0], kind: call.kind, observedAt: call.observedAt, ...(call.resetAt ? { resetAt: call.resetAt } : {}) } : null]));
+  return { usageComplete: calls.every(call => call.cost !== null), knownSubtotal, cost: calls.every(call => call.cost !== null) ? knownSubtotal : null, held: calls.reduce((sum, call) => sum + (call.cost ?? call.cap), 0), dispatched: calls.length, modelFailure: calls.at(-1)?.failure ?? null, providerFailures: [...providers.values()].filter(Boolean) };
 }
 const nativeUsage = async (harness, root, run) => callUsage(await harness.snapshot(CallsDoc, root.id, ctx), run.requestId);
 export const RunDoc = defineDoc({ kind: 'pufferpanel.maintenance.run', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', checkpointWhen: () => false, initial: () => ({ run: null }) });
@@ -77,22 +90,31 @@ const putRun = async (root, run) => {
 };
 export const usageCost = usage => Object.values(usage?.models ?? {}).reduce((sum, value) => sum + value.cost.total, 0);
 
-// Ordered `provider/model[:thinking]` preferences; without `annieModels`, Pi's standard default model settings.
-export const modelRefs = settings => settings.annieModels ?? (settings.defaultProvider && settings.defaultModel ? [`${settings.defaultProvider}/${settings.defaultModel}:${settings.defaultThinkingLevel ?? 'medium'}`] : []);
 export const priced = model => [model.cost, ...(model.cost?.tiers ?? [])].every(cost => ['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isFinite(cost?.[key]) && cost[key] >= 0));
-// An entry is usable when ModelRuntime resolves its provider's auth and its catalog prices are known.
-export async function selectModels(settings, runtime) {
-  const refs = modelRefs(settings);
-  if (!Array.isArray(refs) || !refs.length) fail('no models configured');
-  const available = [];
-  for (const ref of refs) {
-    const [, provider, modelId, level] = /^([^/:]+)\/(.+?)(?::(off|minimal|low|medium|high|xhigh|max))?$/.exec(ref) ?? fail(`invalid model ref: ${ref}`);
-    const model = runtime.getModel(provider, modelId);
-    if (model && priced(model) && await runtime.checkAuth(provider).catch(() => undefined)) available.push({ provider, modelId, thinkingLevel: clampThinkingLevel(model, level ?? 'medium') });
+// Pi exports neither its per-provider default models nor findInitialModel; read them from the pinned package's resolver,
+// proven to be the module behind the public resolveModelScopeWithDiagnostics. A moved export fails loudly at import.
+export const piModelResolver = await import(new URL('./core/model-resolver.js', import.meta.resolve('@earendil-works/pi-coding-agent')));
+if (piModelResolver.resolveModelScopeWithDiagnostics !== resolveModelScopeWithDiagnostics || typeof piModelResolver.findInitialModel !== 'function' || !Object.keys(piModelResolver.defaultModelPerProvider ?? {}).length || Object.values(piModelResolver.defaultModelPerProvider).some(id => typeof id !== 'string' || !id)) fail('Pi default model table moved');
+// Trusted observe output ANNIE_PROVIDER_HOLDS: providers still held after quota/auth failures; malformed input fails closed.
+export const heldProviders = (text, now = Date.now()) => new Set(text ? validateHolds(JSON.parse(text)).filter(hold => hold.until > now).map(hold => hold.provider) : []);
+// Candidates in Pi's order: settings `enabledModels` (globs, `:thinking`) resolved against authenticated models, Pi's saved
+// default model, then each authenticated provider's Pi default model in findInitialModel's provider order. Unknown prices and
+// held providers are skipped; thinking is the pattern suffix, else `defaultThinkingLevel`, else high, clamped to the model.
+export async function selectModels(settings, runtime, held = new Set()) {
+  const patterns = settings.enabledModels ?? [];
+  if (!Array.isArray(patterns) || patterns.some(pattern => typeof pattern !== 'string')) fail('invalid enabledModels');
+  const { scopedModels } = await resolveModelScopeWithDiagnostics(patterns, runtime);
+  const authenticated = await runtime.getAvailable(), find = (provider, id) => authenticated.find(model => model.provider === provider && model.id === id);
+  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...Object.entries(piModelResolver.defaultModelPerProvider).map(([provider, id]) => ({ model: find(provider, id) }))];
+  const candidates = [];
+  for (const { model, thinkingLevel } of ordered) {
+    if (!model || !priced(model) || candidates.some(choice => choice.provider === model.provider && choice.modelId === model.id)) continue;
+    candidates.push({ provider: model.provider, modelId: model.id, thinkingLevel: clampThinkingLevel(model, thinkingLevel ?? settings.defaultThinkingLevel ?? 'high') });
   }
-  if (!available.length) fail(`no configured model available: ${refs.join(', ')}`);
+  const available = candidates.filter(choice => !held.has(choice.provider));
+  if (!available.length) fail(`no configured model available${held.size ? `; held providers: ${[...held].join(', ')}` : ''}`);
   // Independent review prefers another provider when one is available.
-  return { executor: available[0], reviewer: { ...available.find(choice => choice.provider !== available[0].provider) ?? available[0] }, available };
+  return { executor: available[0], reviewer: { ...available.find(choice => choice.provider !== available[0].provider) ?? available[0] }, available, providers: [...new Set(candidates.map(choice => choice.provider))] };
 }
 export function createRuntime(agentDir) {
   return ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), modelsStorePath: join(agentDir, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false });
@@ -342,7 +364,7 @@ export function budgetModels(runtime, state) {
           }
           if (final?.type === 'error') {
             // A provider error ends the call; its full reservation bounds any spend, so it settles at that cap. Aborts stay unknown.
-            await mark(run, callId, call => { call.failure = modelFailureKind(final.error); if (final.error?.stopReason === 'error' && !invalid) call.cost = call.cap; });
+            await mark(run, callId, call => { call.failure = modelFailureKind(final.error); if (final.error?.stopReason === 'error') Object.assign(call, providerFailure(final.error)); if (final.error?.stopReason === 'error' && !invalid) call.cost = call.cap; });
             return { event: final, forwarded };
           }
           const usage = final?.message?.usage;
@@ -455,7 +477,7 @@ export function createHostHooks({ root, harness, worktree, state, models, review
         run.managementApproved = true;
       }
     },
-    reportedUsage: async run => { const value = await usage(run); Object.assign(run, { usageComplete: value.usageComplete, knownSubtotal: value.knownSubtotal ?? value.cost, modelCalls: value.dispatched ?? null, modelFailure: value.modelFailure ?? null }); return value.cost; },
+    reportedUsage: async run => { const value = await usage(run); Object.assign(run, { usageComplete: value.usageComplete, knownSubtotal: value.knownSubtotal ?? value.cost, modelCalls: value.dispatched ?? null, modelFailure: value.modelFailure ?? null, providerFailures: value.providerFailures ?? [] }); return value.cost; },
     resetPlans: async () => root.commit(async tx => { (await tx.doc(GitHubPlansDoc, root.id)).plans = []; }, ctx),
     prepare: async () => {
       // GH_TOKEN exists only in trusted preparation. Its value never enters a durable doc, prompt, report, or tool result.
@@ -469,7 +491,7 @@ export function createHostHooks({ root, harness, worktree, state, models, review
       await git(worktree, 'fetch', '--no-tags', 'upstream', upstreamSha);
       const githubDiagnostics = { issuesDisabled: intake.own?.issues?.disabled === true, truncated: [intake.own?.issues, intake.own?.prs, intake.upstream?.issues, intake.upstream?.prs].some(queue => queue?.truncated === true) };
       if (task?.kind === 'pr') await materializePR(worktree, task, { fetchImpl: snapshotHttp ?? fetch, token: process.env.GH_TOKEN, ownUrl, diagnostics: githubDiagnostics });
-      return { githubDiagnostics, taskKind: task?.kind ?? 'maintenance', fingerprint: task?.fingerprint ?? null, prNumber: task?.number ?? null, prHead: task?.head ?? null, prAuthor: task?.author ?? null, trustedUpstreamPin: upstreamSha, base: await git(worktree, 'rev-parse', 'HEAD'), upstream: `upstream/${branch}`, upstreamRef: `refs/heads/${branch}`, upstreamSha, intakePath: policy.intakePath, usageStart: usageCost(await harness.usage(ctx)) };
+      return { providers: models.providers ?? [], githubDiagnostics, taskKind: task?.kind ?? 'maintenance', fingerprint: task?.fingerprint ?? null, prNumber: task?.number ?? null, prHead: task?.head ?? null, prAuthor: task?.author ?? null, trustedUpstreamPin: upstreamSha, base: await git(worktree, 'rev-parse', 'HEAD'), upstream: `upstream/${branch}`, upstreamRef: `refs/heads/${branch}`, upstreamSha, intakePath: policy.intakePath, usageStart: usageCost(await harness.usage(ctx)) };
     },
     execute: async run => {
       if (run.taskKind === 'pr') {
@@ -571,7 +593,7 @@ async function main() {
   const agentDir = resolve(process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME, '.pi/agent'));
   const runtime = await createRuntime(agentDir);
   const settings = JSON.parse(await readFile(join(agentDir, 'settings.json'), 'utf8'));
-  const models = await selectModels(settings, runtime);
+  const models = await selectModels(settings, runtime, heldProviders(process.env.ANNIE_PROVIDER_HOLDS));
   const registry = createRegistry(); registry.install(ModelCodingTools); registry.install(ModelCodemode);
   // ui_snapshot says so in its result when the configured reviewer model cannot see images.
   const reviewSandbox = createReviewSandbox({ state, vision: runtime.getModel(models.reviewer.provider, models.reviewer.modelId)?.input?.includes('image') === true });

@@ -70,6 +70,7 @@ jobs:
       lease: ${{ steps.observe.outputs.lease }}
       retry: ${{ steps.observe.outputs.retry }}
       republish: ${{ steps.observe.outputs.republish }}
+      holds: ${{ steps.observe.outputs.holds }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -127,6 +128,7 @@ jobs:
     env:
       PUFFER_MAINT_DEFER_PUBLISH: '1'
       PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
+      ANNIE_PROVIDER_HOLDS: ${{ needs.observe.outputs.holds }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,29 +169,108 @@ jobs:
           ANNIE_LEASE_ARTIFACT_ID: ${{ steps.prepaid.outputs.artifact-id }}
           ANNIE_LEASE_ARTIFACT_DIGEST: ${{ steps.prepaid.outputs.artifact-digest }}
         run: node tools/maintainer/controller.mjs verify-upload
-      # Explicit pi-ai provider env names; unset secrets are empty and count as absent. Add a provider here and in ci-settings.json.
+      # Every pi-ai provider env name plus companions, one explicit secret each; unset secrets are empty and count as absent.
+      # Regenerate the three identical blocks with `node tools/maintainer/report.mjs provider-env`; ci.test.mjs enforces the list.
       - name: Validate at least one configured model provider is available
         env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_OAUTH_TOKEN }}
+          ANT_LING_API_KEY: ${{ secrets.ANT_LING_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_DEPLOYMENT_NAME_MAP: ${{ secrets.AZURE_OPENAI_DEPLOYMENT_NAME_MAP }}
+          AZURE_OPENAI_RESOURCE_NAME: ${{ secrets.AZURE_OPENAI_RESOURCE_NAME }}
+          BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_GATEWAY_ID: ${{ secrets.CLOUDFLARE_GATEWAY_ID }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GCLOUD_PROJECT: ${{ secrets.GCLOUD_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_CLOUD_API_KEY: ${{ secrets.GOOGLE_CLOUD_API_KEY }}
+          GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          META_API_KEY: ${{ secrets.META_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          QWEN_TOKEN_PLAN_API_KEY: ${{ secrets.QWEN_TOKEN_PLAN_API_KEY }}
+          QWEN_TOKEN_PLAN_CN_API_KEY: ${{ secrets.QWEN_TOKEN_PLAN_CN_API_KEY }}
+          RADIUS_API_KEY: ${{ secrets.RADIUS_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          XIAOMI_API_KEY: ${{ secrets.XIAOMI_API_KEY }}
+          XIAOMI_TOKEN_PLAN_AMS_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_AMS_API_KEY }}
+          XIAOMI_TOKEN_PLAN_CN_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_CN_API_KEY }}
+          XIAOMI_TOKEN_PLAN_SGP_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_SGP_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_CODING_CN_API_KEY: ${{ secrets.ZAI_CODING_CN_API_KEY }}
         run: |
-          node --input-type=module -e 'import {readFile} from "node:fs/promises"; import {join} from "node:path"; import {createRuntime,selectModels} from "./tools/maintainer/maintain.mjs"; const dir=process.env.PI_CODING_AGENT_DIR; const {executor,reviewer}=await selectModels(JSON.parse(await readFile(join(dir,"settings.json"),"utf8")),await createRuntime(dir)); console.log(JSON.stringify({executor,reviewer}));'
+          node --input-type=module -e 'import {readFile} from "node:fs/promises"; import {join} from "node:path"; import {createRuntime,heldProviders,selectModels} from "./tools/maintainer/maintain.mjs"; const dir=process.env.PI_CODING_AGENT_DIR; const {executor,reviewer}=await selectModels(JSON.parse(await readFile(join(dir,"settings.json"),"utf8")),await createRuntime(dir),heldProviders(process.env.ANNIE_PROVIDER_HOLDS)); console.log(JSON.stringify({executor,reviewer}));'
       - name: Maintain or review selected task
         env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_OAUTH_TOKEN }}
+          ANT_LING_API_KEY: ${{ secrets.ANT_LING_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_DEPLOYMENT_NAME_MAP: ${{ secrets.AZURE_OPENAI_DEPLOYMENT_NAME_MAP }}
+          AZURE_OPENAI_RESOURCE_NAME: ${{ secrets.AZURE_OPENAI_RESOURCE_NAME }}
+          BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_GATEWAY_ID: ${{ secrets.CLOUDFLARE_GATEWAY_ID }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GCLOUD_PROJECT: ${{ secrets.GCLOUD_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_CLOUD_API_KEY: ${{ secrets.GOOGLE_CLOUD_API_KEY }}
+          GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          META_API_KEY: ${{ secrets.META_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          QWEN_TOKEN_PLAN_API_KEY: ${{ secrets.QWEN_TOKEN_PLAN_API_KEY }}
+          QWEN_TOKEN_PLAN_CN_API_KEY: ${{ secrets.QWEN_TOKEN_PLAN_CN_API_KEY }}
+          RADIUS_API_KEY: ${{ secrets.RADIUS_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          XIAOMI_API_KEY: ${{ secrets.XIAOMI_API_KEY }}
+          XIAOMI_TOKEN_PLAN_AMS_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_AMS_API_KEY }}
+          XIAOMI_TOKEN_PLAN_CN_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_CN_API_KEY }}
+          XIAOMI_TOKEN_PLAN_SGP_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_SGP_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_CODING_CN_API_KEY: ${{ secrets.ZAI_CODING_CN_API_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/run.sh
       - name: Export only approved candidates or valid rejection feedback
@@ -206,14 +287,53 @@ jobs:
       - name: Collect sanitized maintenance report
         if: always()
         env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_OAUTH_TOKEN }}
+          ANT_LING_API_KEY: ${{ secrets.ANT_LING_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_DEPLOYMENT_NAME_MAP: ${{ secrets.AZURE_OPENAI_DEPLOYMENT_NAME_MAP }}
+          AZURE_OPENAI_RESOURCE_NAME: ${{ secrets.AZURE_OPENAI_RESOURCE_NAME }}
+          BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_GATEWAY_ID: ${{ secrets.CLOUDFLARE_GATEWAY_ID }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GCLOUD_PROJECT: ${{ secrets.GCLOUD_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_CLOUD_API_KEY: ${{ secrets.GOOGLE_CLOUD_API_KEY }}
+          GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          META_API_KEY: ${{ secrets.META_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          QWEN_TOKEN_PLAN_API_KEY: ${{ secrets.QWEN_TOKEN_PLAN_API_KEY }}
+          QWEN_TOKEN_PLAN_CN_API_KEY: ${{ secrets.QWEN_TOKEN_PLAN_CN_API_KEY }}
+          RADIUS_API_KEY: ${{ secrets.RADIUS_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          XIAOMI_API_KEY: ${{ secrets.XIAOMI_API_KEY }}
+          XIAOMI_TOKEN_PLAN_AMS_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_AMS_API_KEY }}
+          XIAOMI_TOKEN_PLAN_CN_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_CN_API_KEY }}
+          XIAOMI_TOKEN_PLAN_SGP_API_KEY: ${{ secrets.XIAOMI_TOKEN_PLAN_SGP_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_CODING_CN_API_KEY: ${{ secrets.ZAI_CODING_CN_API_KEY }}
         run: |
           day=$(node -p 'JSON.parse(process.env.PUFFER_MAINT_TASK).day')
           node tools/maintainer/report.mjs collect --report "$PUFFER_MAINT_RESULT" --reportdir "$RUNNER_TEMP/honest-annie-report" --gate-events "$PUFFER_MAINT_STATE/runs/$day/gate-events.jsonl"

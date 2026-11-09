@@ -3,7 +3,7 @@ import { inflateRawSync } from 'node:zlib';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { OWN, REF, isSha, validateTask, versionFor } from './task.mjs';
+import { OWN, REF, isSha, providerId, validateHolds, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
@@ -14,6 +14,9 @@ const fail = reason => { throw Error(reason); };
 const integer = value => Number.isSafeInteger(value) && value > 0;
 const time = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : fail('invalid ledger timestamp');
 const allowedEvents = ['schedule', 'push', 'issues', 'workflow_dispatch', 'workflow_run'];
+const iso = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && new Date(Date.parse(value)).toISOString() === value;
+const providerList = value => Array.isArray(value) && value.length <= 64 && value.every(providerId) && new Set(value).size === value.length;
+const failureList = value => Array.isArray(value) && value.length <= 64 && value.every(item => item && Object.keys(item).every(key => ['provider', 'kind', 'observedAt', 'resetAt'].includes(key)) && providerId(item.provider) && ['quota', 'auth', 'transient'].includes(item.kind) && iso(item.observedAt) && (item.resetAt === undefined || iso(item.resetAt) && Date.parse(item.resetAt) > Date.parse(item.observedAt) && Date.parse(item.resetAt) <= Date.parse(item.observedAt) + 31 * DAY));
 export function prFingerprint({ number, head, base, policy }) { return digest({ number, head, base, policy }); }
 export function makeLease({ run, repoId, workflowId, task, cap, now = Date.now() }) {
   if (run.run_attempt !== 1 || !integer(run.id) || !integer(repoId) || !integer(workflowId) || !isSha(run.head_sha) || !allowedEvents.includes(run.event)) fail('ineligible paid execution');
@@ -173,13 +176,15 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
     let decision = null;
     if (cp && !cp.expired) {
       const value = await api.artifact(cp, 'checkpoint.json');
-      const keys = ['schema', 'runId', 'repoId', 'handled', 'slots', 'paid', 'queue', 'pendingRuns', 'lastMaintenance', 'upstream', 'inputBase', 'flights', 'outcomes', 'environment', 'receipts', 'blocked', 'republish'];
+      const keys = ['schema', 'runId', 'repoId', 'handled', 'slots', 'paid', 'queue', 'pendingRuns', 'lastMaintenance', 'upstream', 'inputBase', 'flights', 'outcomes', 'environment', 'receipts', 'blocked', 'republish', 'providers', 'providerHolds'];
       if (!value || Object.keys(value).some(key => !keys.includes(key)) || ['queue', 'lastMaintenance'].some(key => value[key] !== undefined && !/^[a-f0-9]{64}$/.test(value[key])) || ['upstream', 'inputBase'].some(key => value[key] !== undefined && !isSha(value[key])) || value.paid !== undefined && typeof value.paid !== 'boolean') fail('malformed decision checkpoint fields');
       if (value.pendingRuns !== undefined && (!Array.isArray(value.pendingRuns) || value.pendingRuns.length > 20 || value.pendingRuns.some(id => !integer(id)))) fail('malformed pending checkpoint');
       if (value.schema !== 1 || value.runId !== run.id || value.repoId !== repo.id || !Array.isArray(value.handled) || value.handled.length > 200 || value.handled.some(v => !/^[a-f0-9]{64}$/.test(v)) || !Array.isArray(value.slots) || value.slots.length > 32 || value.slots.some(v => !/^\d{4}-\d{2}-\d{2}$/.test(v))) fail('malformed decision checkpoint');
       if (value.flights !== undefined && (!Array.isArray(value.flights) || value.flights.length > 20 || value.flights.some(f => !integer(f.runId) || !/^[a-f0-9]{64}$/.test(f.queue) || !validateTask(f.task)))) fail('malformed flights');
       if (value.outcomes !== undefined && (!Array.isArray(value.outcomes) || value.outcomes.length > 200 || value.outcomes.some(o => !/^[a-f0-9]{64}$/.test(o.fingerprint) || !integer(o.runId) || !integer(o.attempts) || !Number.isFinite(o.nextAt) || !['environment', 'zero-dispatch', 'transient'].includes(o.kind)))) fail('malformed outcomes');
       if (value.environment != null && (!/^[a-f0-9]{64}$/.test(value.environment.signal) || !Number.isFinite(value.environment.nextAt))) fail('malformed environment cooldown');
+      if (value.providers !== undefined && (!value.providers || Object.keys(value.providers).sort().join() !== 'available,signal' || !/^[a-f0-9]{64}$/.test(value.providers.signal) || !providerList(value.providers.available))) fail('malformed provider scope');
+      if (value.providerHolds !== undefined) validateHolds(value.providerHolds);
       if (value.blocked !== undefined && (!Array.isArray(value.blocked) || value.blocked.length > 20 || value.blocked.some(b => !integer(b.runId) || !['expired-candidate-identity', 'admission-unreconciled'].includes(b.reason)))) fail('malformed blocked receipts');
       if (value.republish !== undefined && (!Array.isArray(value.republish) || value.republish.length > 20 || value.republish.some(r => !r || Object.keys(r).sort().join(',') !== 'attempts,nextAt,runId' || !integer(r.runId) || !integer(r.attempts) || r.attempts > 3 || !Number.isFinite(r.nextAt)) || new Set(value.republish.map(r => r.runId)).size !== value.republish.length)) fail('malformed republish attempts');
       if (value.receipts !== undefined && (!Array.isArray(value.receipts) || value.receipts.length > 20 || value.receipts.some(r => !integer(r.runId) || r.runId !== r.lease?.runId))) fail('malformed pending receipts');
@@ -243,6 +248,7 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
           if (settlement.ledgerReservation !== lease.hash || settlement.fingerprint !== lease.task.fingerprint || time(reportMeta.created_at) < time(leaseMeta.created_at)) fail('settlement provenance mismatch');
           if (settlement.taskKind !== lease.task.kind || settlement.day !== lease.task.day || settlement.base !== lease.task.base || typeof settlement.managementApproved !== 'boolean' || !['admitted', 'executing', 'reviewing', 'gating', 'committing', 'publishing', 'published', 'rejected', 'failed', 'managing'].includes(settlement.phase) || settlement.commit !== null && !isSha(settlement.commit) || settlement.releaseCommit !== null && !isSha(settlement.releaseCommit) || Boolean(settlement.commit) !== Boolean(settlement.releaseCommit) || !['known', 'unknown'].includes(settlement.reportedUsage?.status) || settlement.usageComplete !== null && typeof settlement.usageComplete !== 'boolean' || settlement.reportedUsage.status === 'known' && (!Number.isFinite(settlement.reportedUsage.cost) || settlement.reportedUsage.cost < 0)) fail('malformed settlement schema');
           if (settlement.sourceIdentity && ['base', 'commit', 'releaseCommit'].some(key => settlement[key] !== settlement.sourceIdentity[key])) fail('inconsistent settlement source identity');
+          if (settlement.providers !== undefined && !providerList(settlement.providers) || settlement.providerFailures !== undefined && !failureList(settlement.providerFailures)) fail('malformed settlement provider evidence');
         }
       }
       if (run.run_attempt > 1) {
@@ -392,6 +398,22 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   fresh.outcomes = [...checkpoint.outcomes ?? []];
   const configSignal = digest({ policy, enabled: env.HONEST_ANNIE_ENABLED, repair: env.ANNIE_CONFIG_REVISION ?? '' });
   fresh.environment = checkpoint.environment?.signal === configSignal ? checkpoint.environment : null;
+  // Provider holds: quota/auth failures from model reports settled since the previous checkpoint, until the stated reset or 24h.
+  // A changed config signal (policy, enablement, ANNIE_CONFIG_REVISION) drops every hold and the known provider set.
+  const sameProviders = !checkpoint.providers || checkpoint.providers.signal === configSignal;
+  fresh.providers = sameProviders && checkpoint.providers ? checkpoint.providers : { signal: configSignal, available: [] };
+  const holds = new Map((sameProviders ? checkpoint.providerHolds ?? [] : []).map(hold => [hold.provider, hold]));
+  if (sameProviders) for (const record of ledger.records.filter(r => r.settlement && r.run.id >= (checkpoint.runId ?? 0)).sort((a, b) => a.run.id - b.run.id)) {
+    if (record.settlement.providers?.length) fresh.providers = { signal: configSignal, available: record.settlement.providers };
+    for (const failure of record.settlement.providerFailures ?? []) {
+      const until = failure.resetAt ? Date.parse(failure.resetAt) : Date.parse(failure.observedAt) + DAY;
+      if (failure.kind !== 'transient' && !(holds.get(failure.provider)?.until >= until)) holds.set(failure.provider, { provider: failure.provider, until, reason: failure.kind });
+    }
+  }
+  fresh.providerHolds = [...holds.values()].filter(hold => hold.until > now).slice(0, 64);
+  const heldProviders = new Set(fresh.providerHolds.map(hold => hold.provider));
+  const providersHeld = fresh.providers.available.length > 0 && fresh.providers.available.every(provider => heldProviders.has(provider));
+  const holdsExpireAt = providersHeld ? new Date(Math.min(...fresh.providerHolds.filter(hold => fresh.providers.available.includes(hold.provider)).map(hold => hold.until))).toISOString() : null;
   for (const record of ledger.records) {
     const selected = record.lease?.task ?? record.task;
     if (!selected || record.run.status !== 'completed') continue;
@@ -404,7 +426,8 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
       const existing = fresh.outcomes.find(o => o.fingerprint === selected.fingerprint);
       if (existing?.runId >= record.run.id) continue;
       // modelFailure carries pi-ai's retry classification; failed preparation steps are environmental too.
-      const environment = result?.modelFailure === 'environment' || record.environmentFailure;
+      // Provider-attributed quota/auth failures become provider holds instead of the shared cooldown.
+      const environment = result?.modelFailure === 'environment' && !result.providerFailures?.some(failure => failure.kind !== 'transient') || record.environmentFailure;
       const outcome = { fingerprint: selected.fingerprint, runId: record.run.id, attempts: (existing?.attempts ?? 0) + 1, nextAt: time(record.run.updated_at) + (environment ? DAY : HOUR), kind: environment ? 'environment' : record.zeroDispatch ? 'zero-dispatch' : 'transient' };
       fresh.outcomes = fresh.outcomes.filter(o => o.fingerprint !== selected.fingerprint); fresh.outcomes.push(outcome);
       if (environment) fresh.environment = { signal: configSignal, nextAt: outcome.nextAt };
@@ -430,7 +453,8 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   let state = republish ? 'republishing' : pending.length || ledger.blockers.length ? 'effects-pending' : task ? 'useful-input' : 'no-op';
   let lease = null;
   if (mode === 'maintain' && task && !republish && !pending.length && !ledger.blockers.length && !(fresh.environment?.nextAt > now) && env.HONEST_ANNIE_ENABLED === 'true' && env.GITHUB_RUN_ATTEMPT === '1' && ledger.allowance > 0) {
-    if (task.kind !== 'management' && (fresh.slots.includes(day) || branch.protected !== false || !await publicationAvailable(fetchImpl, day))) state = 'source-slot-unavailable';
+    if (providersHeld) state = 'providers-held';
+    else if (task.kind !== 'management' && (fresh.slots.includes(day) || branch.protected !== false || !await publicationAvailable(fetchImpl, day))) state = 'source-slot-unavailable';
     else {
       const rules = await api.pages(`/repos/${OWN}/rules/branches/trunk`);
       if (rules.length) state = 'protected-policy';
@@ -463,10 +487,10 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   }
   const output = outputs(env);
   await output('retry', retry ? JSON.stringify(retry) : ''); await output('republish', republish ? JSON.stringify(republish) : '');
-  await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state);
-  const summary = { state, mode, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint };
+  await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state); await output('holds', JSON.stringify(fresh.providerHolds));
+  const summary = { state, mode, providerHolds: fresh.providerHolds.map(hold => ({ ...hold, until: new Date(hold.until).toISOString() })), holdsExpireAt, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint };
   await writeFile(join(dir, 'observer.json'), JSON.stringify(summary));
-  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}; republish: ${republish ? republish.version : 'none'}; held: ${held.length}; abandoned: ${abandoned.length}.\n${abandoned.map(a => `\n- abandoned run ${a.runId} (${a.source?.slice(0, 12) ?? 'no source'}): ${a.reason}`).join('')}\n`, { flag: 'a' });
+  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}; republish: ${republish ? republish.version : 'none'}; held: ${held.length}; abandoned: ${abandoned.length}; provider holds: ${fresh.providerHolds.map(hold => `${hold.provider} ${hold.reason}`).join(', ') || 'none'}${holdsExpireAt ? `, all providers held until ${holdsExpireAt}` : ''}.\n${abandoned.map(a => `\n- abandoned run ${a.runId} (${a.source?.slice(0, 12) ?? 'no source'}): ${a.reason}`).join('')}\n`, { flag: 'a' });
   return summary;
 }
 export async function verifyUploadedLease({ env = process.env, fetchImpl = fetch, now = Date.now() } = {}) {

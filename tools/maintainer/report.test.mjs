@@ -3,7 +3,9 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collect, providerKeyNames, redact, reportFor } from './report.mjs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { PROVIDER_COMPANIONS, collect, providerEnvNames, providerKeyNames, redact, reportFor } from './report.mjs';
 
 async function scratch(t) { const dir = await mkdtemp(join(tmpdir(), 'maintainer-report-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
 test('report labels no-op as not released and preserves bounded review diagnostics', () => {
@@ -149,4 +151,24 @@ test('missing report creates truthful interrupted fallback only in explicit arti
   const dir = await scratch(t); const out = join(dir, 'artifact');
   const result = await collect({ reportPath: join(dir, 'missing.json'), reportDir: out });
   assert.equal(result.outcome, 'unknown/interrupted'); assert.equal(JSON.parse(await readFile(join(out, 'report.json'), 'utf8')).outcome, 'unknown/interrupted');
+});
+test('provider env names are pi-ai credential names plus companions pi-ai actually reads; companions are redacted too', () => {
+  const names = providerEnvNames(); assert.ok(names.includes('ZAI_API_KEY') && names.includes('MINIMAX_API_KEY') && names.includes('CLOUDFLARE_GATEWAY_ID'));
+  const dist = fileURLToPath(new URL('.', import.meta.resolve('@earendil-works/pi-ai')));
+  const source = readdirSync(dist, { recursive: true }).filter(file => file.endsWith('.js')).map(file => readFileSync(join(dist, file), 'utf8')).join('\n');
+  for (const name of PROVIDER_COMPANIONS) assert.ok(source.includes(`"${name}"`), name);
+  assert.equal(redact('endpoint for account-sentinel-1234', { CLOUDFLARE_ACCOUNT_ID: 'account-sentinel-1234' }), 'endpoint for [redacted]');
+});
+test('provider evidence is bounded, strictly shaped, and stable through the collector', () => {
+  const observedAt = '2026-04-18T23:41:53.000Z';
+  const report = reportFor({ phase: 'failed', providers: ['zai', 'minimax', 'zai', 'Bad/Id', 7], providerFailures: [
+    { provider: 'zai', kind: 'quota', observedAt, resetAt: '2026-04-19T01:29:51.000Z', errorMessage: 'never copied' },
+    { provider: 'minimax', kind: 'auth', observedAt, resetAt: '2026-04-18T00:00:00.000Z' },
+    { provider: 'deepseek', kind: 'quota', observedAt, resetAt: '2026-06-30T00:00:00.000Z' },
+    { provider: 'zai', kind: 'unknown', observedAt }, { provider: 'x', kind: 'auth', observedAt: 'yesterday' },
+  ] });
+  assert.deepEqual(report.providers, ['zai', 'minimax']);
+  assert.deepEqual(report.providerFailures, [{ provider: 'zai', kind: 'quota', observedAt, resetAt: '2026-04-19T01:29:51.000Z' }, { provider: 'minimax', kind: 'auth', observedAt }, { provider: 'deepseek', kind: 'quota', observedAt }]);
+  const again = reportFor(report); assert.deepEqual([again.providers, again.providerFailures], [report.providers, report.providerFailures]);
+  assert.deepEqual([reportFor(null, { interrupted: true }).providers, reportFor(null, { interrupted: true }).providerFailures], [[], []]);
 });

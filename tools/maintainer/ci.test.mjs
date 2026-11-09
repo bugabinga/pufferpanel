@@ -5,11 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import YAML from 'yaml';
-import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
-import { findEnvKeys } from '@earendil-works/pi-ai/compat';
-import { createRuntime, priced, selectModels, snapshot } from './maintain.mjs';
+import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
+import { resolveModelScopeWithDiagnostics } from '@earendil-works/pi-coding-agent';
+import { createRuntime, piModelResolver, selectModels, snapshot } from './maintain.mjs';
 import { pinnedRunroot } from './fake-podman.mjs';
-import { providerKeyNames } from './report.mjs';
+import { providerEnvNames } from './report.mjs';
 
 const moduleDir = new URL('.', import.meta.url).pathname;
 function fixture(t, protectedEdit = false) {
@@ -39,52 +39,48 @@ function fixture(t, protectedEdit = false) {
   return { dir, source, state, artifact, base, commit, tree, result, output, git, command, imported, origin };
 }
 
-// Non-key provider settings pi-ai reads beside a credential (Cloudflare fills the account into its endpoint URL).
-const companions = ['CLOUDFLARE_ACCOUNT_ID'];
-const ambientNames = () => [...providerKeyNames(), ...companions];
 // Hide ambient provider credentials and companions so selection sees exactly the fixture's values.
-function providerEnv(t, vars = {}) {
-  const saved = Object.fromEntries(ambientNames().filter(name => name in process.env).map(name => [name, process.env[name]]));
-  for (const name of ambientNames()) delete process.env[name];
-  Object.assign(process.env, vars);
-  t.after(() => { for (const name of ambientNames()) delete process.env[name]; Object.assign(process.env, saved); });
+function providerEnv(t) {
+  const saved = Object.fromEntries(providerEnvNames().filter(name => name in process.env).map(name => [name, process.env[name]]));
+  const set = vars => { for (const name of providerEnvNames()) delete process.env[name]; Object.assign(process.env, vars); };
+  set({}); t.after(() => set(saved));
+  return set;
 }
-test('CI model refs resolve offline to distinct providers with known nonzero prices and supported thinking', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const refs = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json'))).annieModels;
-  const runtime = await createRuntime(dir);
-  assert.equal(refs[0], 'zai/glm-5.3:high'); assert.equal(new Set(refs.map(ref => ref.split('/')[0])).size, refs.length);
-  for (const ref of refs) {
-    const [, provider, id, level] = /^([^/]+)\/(.+):(\w+)$/.exec(ref); const model = runtime.getModel(provider, id);
-    assert.ok(model && priced(model) && model.cost.input > 0 && model.cost.output > 0, ref); assert.ok(getSupportedThinkingLevels(model).includes(level), ref);
-  }
-  assert.equal(runtime.getModel('zai', 'glm-5.3').baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+test('Pi default model table comes from the pinned resolver behind the public scope API and covers only built-in providers', () => {
+  assert.equal(piModelResolver.resolveModelScopeWithDiagnostics, resolveModelScopeWithDiagnostics);
+  assert.equal(typeof piModelResolver.findInitialModel, 'function');
+  const providers = getBuiltinProviders(), table = Object.entries(piModelResolver.defaultModelPerProvider);
+  assert.ok(table.length > 0); for (const [provider, id] of table) assert.ok(providers.includes(provider) && typeof id === 'string' && id, provider);
 });
-test('selection uses providers with standard env credentials, prefers an independent reviewer, and fails closed without any', async t => {
+test('selection takes the Pi default of each credentialed provider in findInitialModel order, prefers an independent reviewer, and fails closed', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
-  const select = async vars => { for (const name of ambientNames()) delete process.env[name]; Object.assign(process.env, vars); return selectModels(settings, await createRuntime(dir)); };
-  providerEnv(t);
+  const set = providerEnv(t), table = piModelResolver.defaultModelPerProvider, settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
+  const select = async (vars, extra = {}, held) => { set(vars); return selectModels({ ...settings, ...extra }, await createRuntime(dir), held); };
+  // Pi's own first choice for the same credentials, as an interactive session without settings would start.
+  const piFirst = async vars => { set(vars); const runtime = await createRuntime(dir); await runtime.getAvailable(); const { model } = await piModelResolver.findInitialModel({ scopedModels: [], isContinuing: false, modelRuntime: runtime }); return { provider: model.provider, modelId: model.id }; };
+  const first = choices => ({ provider: choices.executor.provider, modelId: choices.executor.modelId });
+  assert.deepEqual(settings, {});
   await assert.rejects(select({}), /no configured model available/);
-  let choices = await select({ ZAI_API_KEY: 'zai-only' });
-  assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
-  choices = await select({ DEEPSEEK_API_KEY: 'deepseek-only' });
-  assert.deepEqual(choices.executor, { provider: 'deepseek', modelId: 'deepseek-v4-pro', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
-  choices = await select({ ZAI_API_KEY: 'zai', DEEPSEEK_API_KEY: 'deepseek', ANTHROPIC_API_KEY: 'anthropic' });
-  assert.equal(choices.executor.provider, 'zai'); assert.deepEqual(choices.reviewer, { provider: 'anthropic', modelId: 'claude-sonnet-5-5', thinkingLevel: 'high' });
-  assert.deepEqual(choices.available.map(choice => choice.provider), ['zai', 'anthropic', 'deepseek']);
-  choices = await select({ ZAI_API_KEY: 'zai', MINIMAX_API_KEY: 'minimax' });
-  assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' });
-  // Cloudflare is wired for classifiers only: it never becomes a coding model, but its classifiers resolve with key + account.
-  choices = await select({ ZAI_API_KEY: 'zai', CLOUDFLARE_API_KEY: 'cf', CLOUDFLARE_ACCOUNT_ID: 'acct' });
-  assert.deepEqual(choices.available.map(choice => choice.provider), ['zai']);
-  const runtime = await createRuntime(dir);
-  assert.ok(runtime.getModelOfType('classifier', 'cloudflare-workers-ai', '@cf/cloudflare/clef-flash'));
-  assert.ok(await runtime.checkAuth('cloudflare-workers-ai'));
-  await select({ ZAI_API_KEY: 'zai', CLOUDFLARE_API_KEY: 'cf' });
-  assert.equal(await (await createRuntime(dir)).checkAuth('cloudflare-workers-ai'), undefined, 'key without account is unusable');
-  choices = await select({ MINIMAX_API_KEY: 'minimax-only' });
-  assert.deepEqual(choices.executor, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
+  for (const [vars, provider] of [[{ ZAI_API_KEY: 'zai-only' }, 'zai'], [{ MINIMAX_API_KEY: 'minimax-only' }, 'minimax'], [{ DEEPSEEK_API_KEY: 'deepseek-only' }, 'deepseek']]) {
+    const choices = await select(vars);
+    assert.deepEqual(choices.executor, { provider, modelId: table[provider], thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
+    assert.deepEqual(first(choices), await piFirst(vars));
+  }
+  const both = { ZAI_API_KEY: 'zai', MINIMAX_API_KEY: 'minimax' };
+  let choices = await select(both);
+  assert.deepEqual(choices.executor, { provider: 'zai', modelId: table.zai, thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' });
+  assert.deepEqual(first(choices), await piFirst(both));
+  // A Pi enabledModels preference (glob, thinking suffix) leads; the remaining Pi defaults follow as fallbacks.
+  choices = await select(both, { enabledModels: ['minimax/*M3:medium'] });
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), [`minimax/MiniMax-M3:medium`, `zai/${table.zai}:high`, `minimax/${table.minimax}:high`]);
+  assert.equal(choices.reviewer.provider, 'zai');
+  choices = await select(both, {}, new Set(['zai']));
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  await assert.rejects(select(both, {}, new Set(['zai', 'minimax'])), /held providers/);
+  // Cloudflare is an ordinary provider: unusable without its account companion, a coding candidate with it.
+  await assert.rejects(select({ CLOUDFLARE_API_KEY: 'cf' }), /no configured model available/);
+  choices = await select({ CLOUDFLARE_API_KEY: 'cf', CLOUDFLARE_ACCOUNT_ID: 'acct' });
+  assert.deepEqual(first(choices), { provider: 'cloudflare-workers-ai', modelId: table['cloudflare-workers-ai'] });
 });
 test('CI initialization confines runtime paths to runner temp and prepare sets bot identity', t => {
   const f = fixture(t); const envFile = join(f.dir, 'github-env'), agent = join(f.dir, 'agent');
@@ -98,7 +94,7 @@ test('CI initialization confines runtime paths to runner temp and prepare sets b
   result = f.command('prepare', { PI_CODING_AGENT_DIR: agent }); assert.equal(result.status, 0, result.stderr);
   assert.equal(f.git('config', 'user.name'), 'honest_annie');
   assert.equal(f.git('remote', 'get-url', 'upstream'), 'https://github.com/pufferpanel/pufferpanel.git');
-  assert.equal(JSON.parse(readFileSync(join(agent, 'settings.json'))).annieModels[0], 'zai/glm-5.3:high');
+  assert.deepEqual(JSON.parse(readFileSync(join(agent, 'settings.json'))), {});
   assert.equal(existsSync(join(agent, 'auth.json')), false);
 });
 test('CI allocates a short private runroot and cleanup refuses arbitrary paths', t => {
@@ -128,14 +124,17 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   const release = workflow.slice(workflow.indexOf('  release:'), workflow.indexOf('  retry-effects:'));
   assert.doesNotMatch(check, /secrets\.|contents: write/);
   assert.match(maintain, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(maintain, /github\.ref == 'refs\/heads\/trunk'/);
-  assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.doesNotMatch(workflow, /toJSON\(secrets\)|ANNIE_MODEL_SECRETS|GITHUB_TOKEN: \$\{\{ secrets/);
-  // GitHub flags whole-secrets dumps as malicious: model steps name each pi-ai provider credential explicitly, covering every configured provider.
-  const named = [...maintain.matchAll(/^ {10}([A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$/gm)];
-  assert.ok(named.length > 0 && named.every(([, env, secret]) => env === secret));
-  const forwarded = Object.fromEntries(named.map(([, name]) => [name, 'set']));
-  assert.deepEqual([...providerKeyNames(forwarded), ...companions.filter(name => name in forwarded)].sort(), Object.keys(forwarded).sort(), 'only pi-ai provider credential names and their companions');
-  const settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
-  for (const ref of settings.annieModels) assert.ok(findEnvKeys(ref.split('/')[0], forwarded)?.length, ref);
+  assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.doesNotMatch(workflow, /toJSON\(secrets\)|ANNIE_MODEL_SECRETS|(?<![A-Z_])GITHUB_TOKEN: \$\{\{ secrets/);
+  // GitHub flags whole-secrets dumps as malicious: each model step names every pi-ai provider env name explicitly, nothing else.
+  // A pi upgrade that adds a provider fails here until `node report.mjs provider-env` regenerates the three blocks.
+  const parsed = YAML.parse(workflow), modelSteps = parsed.jobs.maintain.steps.filter(step => Object.values(step.env ?? {}).some(value => /secrets\./.test(value)));
+  assert.deepEqual(modelSteps.map(step => step.name), ['Validate at least one configured model provider is available', 'Maintain or review selected task', 'Collect sanitized maintenance report']);
+  for (const step of modelSteps) {
+    const named = Object.entries(step.env).filter(([name]) => name !== 'GH_TOKEN');
+    assert.deepEqual(named.map(([name]) => name).sort(), providerEnvNames(), step.name);
+    for (const [name, value] of named) assert.equal(value, `\${{ secrets.${name} }}`);
+  }
+  assert.equal(parsed.jobs.observe.outputs.holds, '${{ steps.observe.outputs.holds }}'); assert.equal(parsed.jobs.maintain.env.ANNIE_PROVIDER_HOLDS, '${{ needs.observe.outputs.holds }}');
   assert.doesNotMatch(maintain, /REGISTRY_PASSWORD|ANNIE_GH_TOKEN|contents: write|issues: write|pull-requests: write/);
   assert.match(maintain, /GH_TOKEN: \$\{\{ github.token \}\}/); // Native read-only preparation only.
   assert.match(maintain, /github.run_attempt == 1/);

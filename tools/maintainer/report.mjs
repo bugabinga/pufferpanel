@@ -2,10 +2,15 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { findEnvKeys } from '@earendil-works/pi-ai/compat';
 import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
+import { providerId } from './task.mjs';
 
 const text = (value, limit = 500) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\\`*_{}[\]()<>#+!|]/g, '\\$&').slice(0, limit).trim();
-// Names from pi-ai's standard provider env-var mapping that are set in env; no provider is special-cased.
-export const providerKeyNames = (env = process.env) => [...new Set(getBuiltinProviders().flatMap(provider => findEnvKeys(provider, env) ?? []))].filter(name => typeof env[name] === 'string' && env[name]);
+// Non-key settings pi-ai reads beside a provider credential: Cloudflare account/gateway, Vertex project/location, Azure endpoint.
+export const PROVIDER_COMPANIONS = ['AZURE_OPENAI_API_VERSION', 'AZURE_OPENAI_BASE_URL', 'AZURE_OPENAI_DEPLOYMENT_NAME_MAP', 'AZURE_OPENAI_RESOURCE_NAME', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_GATEWAY_ID', 'GCLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION', 'GOOGLE_CLOUD_PROJECT'];
+// Every credential env name in pi-ai's built-in provider mapping (an env reporting each name as set), plus companions.
+export const providerEnvNames = () => [...new Set([...getBuiltinProviders().flatMap(provider => findEnvKeys(provider, new Proxy({}, { get: () => 'set' })) ?? []), ...PROVIDER_COMPANIONS])].sort();
+// Provider env names set in env; unset workflow secrets are empty and count as absent. No provider is special-cased.
+export const providerKeyNames = (env = process.env) => providerEnvNames().filter(name => typeof env[name] === 'string' && env[name]);
 const secretValues = env => [...providerKeyNames(env), 'GH_TOKEN', 'ANNIE_GH_TOKEN', 'REGISTRY_PASSWORD'].map(key => env[key]).filter(value => typeof value === 'string' && value.length >= 4);
 export function redact(value, env = process.env) {
   let result = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
@@ -23,6 +28,7 @@ const safePhase = (value, env = process.env) => typeof value === 'string' && /^[
 const safeNumber = value => Number.isFinite(value) && value >= 0 ? value : null;
 const sha = (value, length = 40, env = process.env) => typeof value === 'string' && new RegExp(`^[a-f0-9]{${length}}$`).test(value) && redact(value, env) === value ? value : null;
 const STOP_REASONS = ['stop', 'length', 'toolUse', 'error', 'aborted'];
+const isoTime = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && new Date(Date.parse(value)).toISOString() === value;
 // Visual review evidence: closed status, bounded redacted reason, recorded browser version, ui_snapshot call count.
 const visualReport = (value, env) => !['available', 'unavailable', 'skipped'].includes(value?.status) ? null : {
   status: value.status,
@@ -79,6 +85,9 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     githubDiagnostics: run?.githubDiagnostics ? { issuesDisabled: run.githubDiagnostics.issuesDisabled === true, truncated: run.githubDiagnostics.truncated === true, authorRole: /^permission-(write|maintain|admin|push)$/.test(run.githubDiagnostics.authorRole ?? '') ? run.githubDiagnostics.authorRole : null, checks: run.githubDiagnostics.checks === 'satisfied' ? 'satisfied' : 'unknown', policy: run.githubDiagnostics.policy === 'unprotected' ? 'unprotected' : 'unknown' } : null,
     sourceRejection: ['unsupported-history', 'protected-history', 'non-descendant'].includes(run?.sourceRejection) ? run.sourceRejection : null,
     modelFailure: ['environment', 'transient'].includes(run?.modelFailure) ? run.modelFailure : null,
+    // Cross-run provider evidence: authenticated candidate providers and each provider's last failure kind, never error text.
+    providers: Array.isArray(run?.providers) ? [...new Set(run.providers.filter(value => providerId(value) && redact(value, env) === value))].slice(0, 64) : [],
+    providerFailures: Array.isArray(run?.providerFailures) ? run.providerFailures.filter(item => providerId(item?.provider) && redact(item.provider, env) === item.provider && ['quota', 'auth', 'transient'].includes(item.kind) && isoTime(item.observedAt)).slice(0, 64).map(item => ({ provider: item.provider, kind: item.kind, observedAt: item.observedAt, ...(isoTime(item.resetAt) && Date.parse(item.resetAt) > Date.parse(item.observedAt) && Date.parse(item.resetAt) <= Date.parse(item.observedAt) + 31 * 86_400_000 ? { resetAt: item.resetAt } : {}) })) : [],
     gateRepair: (run?.gateRepairs ?? run?.gateRepair?.attempts) === 1 ? { attempts: 1, gate: ['whitespace', 'node', 'ace', 'tests-image', 'go-normal', 'go-race', 'go-vet', 'actionlint'].includes(run?.gateFailure?.name ?? run?.gateRepair?.gate) ? (run?.gateFailure?.name ?? run.gateRepair.gate) : 'unknown' } : null,
     gateRepairSkipped: run?.gateRepairSkipped === 'insufficient-time' ? 'insufficient-time' : null,
     usageComplete: modelPending ? false : typeof run?.usageComplete === 'boolean' ? run.usageComplete : null,
@@ -142,8 +151,9 @@ function markdown(report) {
   const blocker = report.blocker ? `\nBlocker: ${text(report.blocker)}\n` : '';
   const sandbox = report.sandbox ? `Reviewer sandbox: ${text(report.sandbox.status)} (${text(report.sandbox.reason ?? 'no reason recorded')}; podman ${text(report.sandbox.podmanVersion ?? '?')}; ${report.sandbox.runCalls ?? '?'} runs, ${report.sandbox.runSeconds ?? '?'} s${report.sandbox.cleanupFailed ? '; container cleanup failed' : ''})  \n${report.sandbox.visual ? `Visual review: ${text(report.sandbox.visual.status)} (${text(report.sandbox.visual.reason ?? report.sandbox.visual.browser ?? 'no reason recorded')}; ${report.sandbox.visual.snapshotCalls ?? '?'} snapshots)  \n` : ''}` : '';
   const capped = report.executorDiagnostics?.filter(entry => entry.lengthCapped).map(entry => entry.turn) ?? [];
+  const providers = report.providerFailures?.length ? `Provider failures: ${report.providerFailures.map(item => `${text(item.provider, 64)} ${item.kind}${item.resetAt ? ` until ${item.resetAt}` : ''}`).join(', ')}  \n` : '';
   const executor = capped.length ? `Executor: final answer hit the output cap (${capped.map(turn => text(turn)).join(', ')}); a script may not have run  \n` : '';
-  return `## ☠️ Annie's incident ledger: ${badge}\n\n${aside}\n\nOutcome: **${text(report.outcome)}**  \nReason: ${text(report.reason ?? 'none recorded')}  \nKind: ${text(report.kind)}  \nGitHub: ${text(report.githubState)}  \nSource changed: ${report.sourceChanged ? 'yes' : 'no'}  \nSource: ${text(hashes, 500)}  \nModel usage: ${text(usage)}  \n${executor}${sandbox}Image digest: ${report.publicationDigest ?? 'not verified'}\n${blocker}${details}${gates}${proposals}${receipts}`;
+  return `## ☠️ Annie's incident ledger: ${badge}\n\n${aside}\n\nOutcome: **${text(report.outcome)}**  \nReason: ${text(report.reason ?? 'none recorded')}  \nKind: ${text(report.kind)}  \nGitHub: ${text(report.githubState)}  \nSource changed: ${report.sourceChanged ? 'yes' : 'no'}  \nSource: ${text(hashes, 500)}  \nModel usage: ${text(usage)}  \n${providers}${executor}${sandbox}Image digest: ${report.publicationDigest ?? 'not verified'}\n${blocker}${details}${gates}${proposals}${receipts}`;
 }
 export async function collect({ reportPath, gateEventsPath, publishedPath, sourceReceiptPath, actionReceiptsPath, reportDir, summaryPath }) {
   if (!reportDir) throw Error('explicit --reportdir is required');
@@ -171,7 +181,9 @@ export async function collect({ reportPath, gateEventsPath, publishedPath, sourc
 function arg(name) { const index = process.argv.indexOf(name); return index < 0 ? null : process.argv[index + 1] ?? null; }
 async function main() {
   const command = process.argv[2];
-  if (!['render', 'collect'].includes(command)) throw Error('usage: report.mjs render|collect --report PATH --reportdir PATH [--gate-events PATH] [--summary PATH]');
+  // The workflow's model-step env block, one explicit secret per pi-ai provider env name.
+  if (command === 'provider-env') { console.log(providerEnvNames().map(name => `          ${name}: \${{ secrets.${name} }}`).join('\n')); return; }
+  if (!['render', 'collect'].includes(command)) throw Error('usage: report.mjs render|collect --report PATH --reportdir PATH [--gate-events PATH] [--summary PATH] | provider-env');
   await collect({ reportPath: arg('--report') ?? process.argv[3], gateEventsPath: arg('--gate-events'), publishedPath: arg('--published'), sourceReceiptPath: arg('--source-receipt'), actionReceiptsPath: arg('--action-receipts'), reportDir: arg('--reportdir'), summaryPath: arg('--summary') ?? process.env.GITHUB_STEP_SUMMARY });
 }
 if (process.argv[1] && resolve(process.argv[1]) === new URL(import.meta.url).pathname) main().catch(() => { process.exitCode = 1; });

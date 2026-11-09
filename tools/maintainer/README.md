@@ -52,14 +52,18 @@ One local flock owns the storage; do not run this storage from multiple processe
 
 ## Models and limits
 
-Models come from an ordered `annieModels` list of `provider/model[:thinking]` refs in the Pi agent `settings.json`.
-Without `annieModels`, desktop uses Pi's standard `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` (default `medium`).
-An entry is available when it resolves in the pinned catalog, has known prices, and `ModelRuntime.checkAuth` finds credentials for its provider; thinking is clamped to the model.
-The executor uses the first available entry; the separate reviewer conversation prefers the next available entry from a different provider, else the executor's model.
-No available entry, an empty list, or a malformed ref fails closed before any model request.
-CI uses checked-in `ci-settings.json`: `zai/glm-5.3:high` first, then Anthropic Claude Sonnet 5.5, Moonshot Kimi K3.1 Pro, DeepSeek V4 Pro, and OpenCode Go GLM-5.3, each only when its provider credential exists.
-An offline test resolves every CI ref with nonzero catalog prices and supported thinking.
-CI authenticates through pi-ai's standard provider environment variables, such as `ZAI_API_KEY` or `ANTHROPIC_API_KEY`; no desktop auth/settings files are copied.
+There is no hand-curated model list: every provider with usable credentials contributes Pi's own default model for that provider.
+Candidates follow Pi's `findInitialModel` order: models matching the Pi agent `settings.json` `enabledModels` patterns first, then Pi's saved `defaultProvider`/`defaultModel`, then each authenticated provider's Pi default in Pi's provider order.
+`enabledModels` uses Pi's standard patterns, including globs and `:thinking` suffixes, resolved by Pi's public `resolveModelScopeWithDiagnostics` against authenticated models; a non-array or non-string entry fails closed.
+Thinking is the pattern suffix, else `defaultThinkingLevel`, else `high`, clamped to the model, so non-reasoning models run with `off`.
+Candidates without known catalog prices are skipped; a zero price counts as known, as for subscription token plans.
+The executor uses the first candidate; the separate reviewer conversation prefers the first candidate from a different provider, else the executor's model.
+No candidate fails closed before any model request.
+Providers without a Pi default model, such as custom `models.json` providers, take part only through `enabledModels` or the saved default.
+Pi exports neither its per-provider default table nor `findInitialModel`, and its package `exports` allow only `.` and `./rpc-entry`.
+`maintain.mjs` therefore imports `dist/core/model-resolver.js` beside the pinned package entry and refuses to load unless that module's `resolveModelScopeWithDiagnostics` is the public one and the table is a non-empty provider→id map; a test also checks every table key is a built-in pi-ai provider.
+CI uses checked-in `ci-settings.json`, which is empty: Pi defaults decide, and an `enabledModels` entry there would take precedence.
+CI authenticates through pi-ai's standard provider environment variables, such as `ZAI_API_KEY` or `MINIMAX_API_KEY`; no desktop auth/settings files or OAuth logins are copied.
 Existing Pi OAuth/API credentials and model overrides are accessed through `ModelRuntime`, never copied into prompts or logs.
 Provider errors are classified by pi-ai: errors it would retry are `transient`; other errors, such as rejected auth or exhausted quota, are `environment`; context overflow stays with Pi's compaction.
 Pi's normal conversation retry policy (`settings.retry`: two retries, 2s base backoff) retries transient errors on the same model; every attempt passes the same admission.
@@ -83,6 +87,22 @@ Code mode replays a script after a restart from its journal; per Pi Durable's re
 The budget is based on provider-reported usage and quoted prices, not a guarantee about subscription billing or unreported work interrupted before a usage receipt.
 The wrapper's two-hour process-group timeout includes tools, tests, builds, and publication; subsequent invocations may reconcile an already pending publication without spending on new model work.
 
+### Provider holds
+
+Each dispatch failure also records sanitized cross-run evidence, never error text: `{provider, kind, observedAt, resetAt?}` with `kind` `auth`, `quota`, or `transient`.
+`auth` is 401/403 or authentication wording; `quota` is a stated reset time, quota/billing/usage-limit wording, or a 402/429 that pi-ai does not retry; everything else is `transient`.
+An explicit reset such as Z.AI's `Your limit will reset at 2026-10-30 04:10:13` becomes `resetAt` when it lies within 31 days.
+Zone-less reset times are read as UTC+8.
+That is verified for Z.AI only: four observed "Usage limit reached for 5 hour" errors fit the 5-hour window only at UTC+8, never at UTC.
+A provider in an earlier zone would release its hold early and cost one failed attempt before the next hold.
+The model report carries each provider's last failure in the run (`providerFailures`) and the authenticated candidate providers (`providers`), at most 64 each.
+Observe folds quota/auth failures from model reports settled since its previous checkpoint into checkpoint `providerHolds` `[{provider, until, reason}]`: `until` is `resetAt`, else `observedAt` + 24h.
+Expired holds drop out; a changed config signal (trusted policy, enablement, or `ANNIE_CONFIG_REVISION`) drops every hold and the known provider set, so bump `ANNIE_CONFIG_REVISION` after changing model secrets.
+Observe passes active holds to the maintain job as `ANNIE_PROVIDER_HOLDS`; maintain validates them strictly and selection skips held providers, so the run starts on the next provider.
+When every known candidate provider is held, observe admits no paid work, reports `providers-held`, and names when the earliest hold expires.
+Provider-attributed quota/auth failures replace the shared 24-hour environment cooldown for that run; other environment failures keep it.
+Per-run failover is unchanged.
+
 ## GitHub setup
 
 Repository: `bugabinga/pufferpanel`; maintained default branch: `trunk`.
@@ -97,10 +117,10 @@ Manual `observe` or `sweep` refreshes cheap read-only discovery/checkpoint evide
 
 Configure two environments, each restricted to deployment branch `trunk`:
 
-- `honest-annie-model`: a provider API key secret enables that provider: `ZAI_API_KEY` (Z.AI account entitled to GLM-5.3 on its coding endpoint), `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`, or `MINIMAX_API_KEY` (MiniMax M Plan key on the international `api.minimax.io` endpoint).
-  `CLOUDFLARE_API_KEY` plus `CLOUDFLARE_ACCOUNT_ID` make Cloudflare Workers AI classifiers available; no harness code calls a classifier yet, so until one does this only exposes an unused credential to the model steps.
-  A new coding-model provider needs its pi-ai env name added to the three model steps in the workflow and a model ref in `ci-settings.json`; a test enforces both.
-  Non-key provider settings such as `CLOUDFLARE_ACCOUNT_ID` must also be listed as companions in `ci.test.mjs`.
+- `honest-annie-model`: any secret named after a pi-ai provider credential variable enables that provider, for example `ZAI_API_KEY` or `MINIMAX_API_KEY`.
+  Non-key companions pi-ai reads beside a key, such as `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_GATEWAY_ID`, Vertex project/location, or the Azure endpoint, are secrets of the same name.
+  Providers authenticated only by ambient cloud identity, such as Bedrock IAM or Vertex application default credentials, are out of scope.
+  The three model steps list every name from pi-ai's mapping plus `PROVIDER_COMPANIONS` in `report.mjs`; regenerate the block with `node tools/maintainer/report.mjs provider-env`, and a test fails when a pi upgrade changes the mapping.
 - `honest-annie-release`: secrets `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, scoped to publishing `registry.bugabinga.net/pufferpanel`.
 
 Ordinary source/PR/issue operations and model-free retry use native workflow tokens, not a PAT.
@@ -118,7 +138,7 @@ The whole secrets context is never dumped: GitHub flags `toJSON(secrets)` as a p
 Keep model credentials in `honest-annie-model` and repository-level secrets empty (currently none).
 Ancestor process environments remain readable to same-user model shells on hosted runners, so this is policy isolation, not a credential boundary.
 Model shells still receive only `PATH`, `HOME`, `TMPDIR`, and `PUFFER_MAINT_INTAKE`.
-Report redaction masks values of every set variable in pi-ai's provider env-var mapping, plus `GH_TOKEN`, `ANNIE_GH_TOKEN`, and `REGISTRY_PASSWORD`.
+Report redaction masks values of every set variable in pi-ai's provider env-var mapping and its companions, plus `GH_TOKEN`, `ANNIE_GH_TOKEN`, and `REGISTRY_PASSWORD`.
 It exports a prerequisite Git bundle, candidate metadata, and exact-tree gate receipt, not SQLite, transcripts, credential files, or Podman storage.
 The fresh release runner checks parent/base/SHA/tree, clean source, unchanged `.github` and `tools/maintainer`, and candidate gate identity.
 It discards the imported success marker and independently reruns every fixed gate before registry login, Git push, or image publication.
@@ -288,7 +308,7 @@ Only a valid completed response settles, at pi-ai's normal final `usage.cost.tot
 A response without prompt and output tokens is treated as missing usage; missing, invalid, aborted, or interrupted usage never settles and keeps its reservation held.
 A provider error response settles at that call's full reservation, a conservative upper bound, so a recovered retry or failover keeps usage complete without refunding the failed call.
 Provider client retries are disabled with `maxRetries: 0`; Pi conversation retries and failover are separate admitted dispatches inside the original run.
-`usageComplete`, `knownSubtotal`, call count, cap, absolute deadline, lease hash, and optional `modelFailure` of the last call (`environment` | `transient`, null after a recovered failure) are sanitized report metadata.
+`usageComplete`, `knownSubtotal`, call count, cap, absolute deadline, lease hash, and optional `modelFailure` of the last call (`environment` | `transient`, null after a recovered failure) are sanitized report metadata, as are bounded `providers` and `providerFailures` (see Provider holds).
 Default desktop limits remain $15/2h; hosted allowance can only tighten them.
 These are configured token/pricing statistics, not authoritative provider invoices or a tamper-proof financial ledger.
 Artifacts and prompts are not an OS sandbox; repository administrators deleting history or changing trusted policy cross the operational boundary.
@@ -313,7 +333,8 @@ Admission records an in-flight task, not terminal handling; verified original-at
 Manual check mode itself remains fully offline; later native observers establish zero dispatch from job metadata, never from the event name alone.
 Only valid no-op, substantive rejection, or approved work acknowledges maintenance inputs; invalid review output and transient failures remain bot retries, bounded to three attempts per fingerprint with one-hour backoff.
 Exact host-classified PR source refusals (`sourceRejection`: `unsupported-history`, `protected-history`, `non-descendant`) cache until source input changes; stale qualification and transport errors do not.
-Environment failures, a pi-ai non-retryable last model failure or a failed preparation/provider-availability step, share a 24-hour cooldown across candidates; actual trusted policy/enablement/config-revision changes reset environment gating.
+Environment failures, a pi-ai non-retryable last model failure without a provider quota/auth hold or a failed preparation/provider-availability step, share a 24-hour cooldown across candidates; actual trusted policy/enablement/config-revision changes reset environment gating.
+Provider quota/auth failures instead hold only that provider until its stated reset or 24h; when every known candidate provider is held, observe reports `providers-held` without a lease.
 After repairing configuration, an operator may change `ANNIE_CONFIG_REVISION` and manually select `maintain`; remaining allowance, immutable leases, current source qualification, fixed gates, and source-before-auth checks still apply.
 Unknown calls retain their full lease cap independently of later known retries; no refund funds a same-day replacement.
 Effects recovery finds the last failed isolated effects job across at most two prior attempts, even when the latest attempt contains only check/skipped jobs.
