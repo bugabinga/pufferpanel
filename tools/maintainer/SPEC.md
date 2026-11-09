@@ -44,15 +44,17 @@ A failed or rejected candidate cannot release.
 
 Actions summaries and explicitly selected sanitized artifacts are the reporting surface.
 Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, republishing, abandoned, and verified release.
-Require a complete reviewer response matching the strict JSON verdict schema.
-Allow reviewer responses up to 32,768 output tokens, clamped to the selected model's limit; executor responses remain capped at 4,000 tokens.
-Reserve the full phase-specific output ceiling before dispatch, inside the unchanged shared budget and original deadline.
-Permit at most one same-reviewer format correction for malformed or incomplete output, within the original paid budget and deadline; never retry substantive rejection or contradictory findings as formatting.
-Retain bounded stop-reason, text-length, and verdict diagnostics, not raw reviewer answers.
-Recognizable substantive or contradictory rejection remains terminal even when the provider marks that response truncated.
+Executor and reviewer models are offered only the durable `codemode` tool, plus `submit_verdict` for the reviewer; their other tools are callable only from scripts, scripts cannot start scripts, and script `models.*` is disabled so every model request crosses the budgeted provider boundary.
+Nested shell calls use the same credential-free prepared environment as before.
+The reviewer ends its review by calling `submit_verdict` once with a closed bounded schema: findings (`id`, `severity` blocking|advisory, optional `file`/`line`, `impact`, `evidence`, `correction`) and what it `checked`.
+The host derives approval from the durable tool record, never from answer text: approve iff exactly one valid call recorded no blocking finding.
+A reviewer run ending without a verdict gets exactly one reminder within the same run, paid budget, and deadline; a second miss, or a repeated verdict, is invalid review output.
+Allow reviewer responses up to 32,768 output tokens and executor responses up to 16,000, each clamped to the selected model's limit.
+Reserve an upper bound on the maximum output the provider adapter sends before dispatch, phase ceiling plus any thinking budget it may add, inside the unchanged shared budget and original deadline; provider errors settle at that reservation.
+Retain bounded stop-reason, text-length, verdict, and verdict-call-count diagnostics, not raw reviewer answers.
 Clear prior usage completeness before model dispatch or resume; active-model and explicitly interrupted reports cannot settle partial subtotals.
-Intermediate review/format-correction checkpoints remain unknown-cost until final accounting is refreshed.
-A second invalid or incomplete response remains a bot failure with no gate, source commit, or publication.
+Intermediate review checkpoints remain unknown-cost until final accounting is refreshed.
+Invalid review output remains a bot failure with no gate, source commit, or publication.
 Permit at most one in-run fixed-gate diagnosis/repair for an approved maintenance source candidate, never a PR or management-only task.
 Require unchanged candidate identity, a failure event from that exact gate invocation, and a bounded regular private log inside the owned run directory; missing, stale, symlinked, or ambiguous evidence cannot authorize repair.
 Name private evidence by the gate invocation's event boundary so a pre-checkpoint orphan cannot block a later fresh capture or be reused as current evidence.

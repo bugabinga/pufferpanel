@@ -80,7 +80,7 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     outcome: outcomeFor(run, interrupted),
     reason: reason ? redact(reason, env).slice(0, 500) : null,
     findings: findings(run?.review?.findings ?? run?.findings, env),
-    reviewDiagnostics: Array.isArray(run?.reviewDiagnostics) ? run.reviewDiagnostics.slice(0, 2).map(entry => ({ stopReason: ['stop', 'length', 'toolUse', 'error', 'aborted'].includes(entry?.stopReason) ? entry.stopReason : 'unknown', textLength: Number.isSafeInteger(entry?.textLength) && entry.textLength >= 0 ? entry.textLength : null, verdict: ['approved', 'review-rejected', 'invalid-review', 'contradictory-review', 'incomplete-review'].includes(entry?.verdict) ? entry.verdict : 'unknown' })) : [],
+    reviewDiagnostics: Array.isArray(run?.reviewDiagnostics) ? run.reviewDiagnostics.slice(0, 1).map(entry => ({ stopReason: ['stop', 'length', 'toolUse', 'error', 'aborted'].includes(entry?.stopReason) ? entry.stopReason : 'unknown', textLength: Number.isSafeInteger(entry?.textLength) && entry.textLength >= 0 ? entry.textLength : null, verdict: ['approved', 'review-rejected', 'invalid-review'].includes(entry?.verdict) ? entry.verdict : 'unknown', verdictCalls: Number.isSafeInteger(entry?.verdictCalls) && entry.verdictCalls >= 0 ? entry.verdictCalls : null })) : [],
     timeline: Array.isArray(run?.timeline) ? run.timeline.slice(0, 30).map(entry => ({ phase: safePhase(entry?.phase), at: safeNumber(entry?.at) })) : [],
     modelPhaseCost: phaseCosts,
     reportedUsage: modelPending || run?.usageComplete === false || safeNumber(run?.reportedUsage) === null ? { status: 'unknown' } : { status: 'known', cost: safeNumber(run.reportedUsage) },

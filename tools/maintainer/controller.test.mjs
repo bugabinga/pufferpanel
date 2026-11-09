@@ -220,7 +220,7 @@ async function modelFixture(t, behavior, extra = {}, selectedModel = null, { mod
 const goodMessage = { role: 'assistant', content: [], stopReason: 'stop', usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 200, cost: { total: 0.0002 } } };
 function stream(events) { const result = createAssistantMessageEventStream(); queueMicrotask(() => { for (const event of events) result.push(event); result.end(); }); return result; }
 test('review reasoning capacity reserves full phase-specific output cost before dispatch', async t => {
-  for (const [phase, ceiling, expected] of [['executing', 65536, 4000], ['reviewing', 65536, 32768], ['reviewing', 8192, 8192]]) {
+  for (const [phase, ceiling, expected] of [['executing', 65536, 16000], ['reviewing', 65536, 32768], ['reviewing', 8192, 8192]]) {
     const model = { api: 'test', provider: 'test', id: 'test', contextWindow: 1000, maxTokens: ceiling, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } };
     const fixture = await modelFixture(t, (selected, transcript, options) => {
       assert.equal(options.maxTokens, expected); assert.equal(options.maxRetries, 0);
@@ -243,7 +243,7 @@ test('durable provider accounting settles real done and provider errors at their
   // A provider error never refunds: the call settles at its full reservation, keeping usage complete.
   const errored = await modelFixture(t, () => stream([{ type: 'error', reason: 'error', error: { ...goodMessage, stopReason: 'error', errorMessage: '401 Incorrect API key provided', usage: { ...goodMessage.usage, cost: { total: 0 } } } }]));
   const settled = await errored.execute();
-  assert.deepEqual(settled.usage, { usageComplete: true, knownSubtotal: 0.005, cost: 0.005, held: 0.005, dispatched: 1, modelFailure: 'environment' });
+  assert.deepEqual(settled.usage, { usageComplete: true, knownSubtotal: 0.017, cost: 0.017, held: 0.017, dispatched: 1, modelFailure: 'environment' });
 });
 test('installed OpenAI SDK adapter: pi-ai usage.cost.total settles accounting; missing usage stays unknown', async t => {
   const runtime = await createRuntime(await scratch(t));
@@ -268,9 +268,30 @@ test('installed OpenAI SDK adapter: pi-ai usage.cost.total settles accounting; m
     assert.equal(requests, 1);
     assert.equal(result.result.stopReason, raw?.partial || raw?.http ? 'error' : 'stop');
     if (raw?.http) assert.equal(result.usage.modelFailure, raw.http === 401 ? 'environment' : 'transient');
-    if (raw?.partial || raw?.http) assert.equal(result.usage.cost, 0.005); // provider errors settle at the call reservation
+    if (raw?.partial || raw?.http) assert.equal(result.usage.cost, 0.017); // provider errors settle at the call reservation
     else if (raw?.prompt_tokens !== undefined && raw?.completion_tokens !== undefined) assert.ok(Math.abs(result.usage.cost - 0.0002) < 1e-12, raw);
     else assert.equal(result.usage.cost, null);
+  }
+});
+test('reservation equals the max output real pi-ai adapters send: budget thinking adds its budget, adaptive and openai-compatible do not; errors settle at that cap', async t => {
+  const runtime = await createRuntime(await scratch(t));
+  const anthropic = [['message_start', { type: 'message_start', message: { id: 'm', type: 'message', role: 'assistant', model: 'fixture', content: [], stop_reason: null, usage: { input_tokens: 100, output_tokens: 1 } } }], ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }], ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }], ['content_block_stop', { type: 'content_block_stop', index: 0 }], ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 100 } }], ['message_stop', { type: 'message_stop' }]].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+  const openai = [{ id: 'x', choices: [{ index: 0, delta: { role: 'assistant', content: 'ok' }, finish_reason: null }] }, { id: 'x', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 100 } }].map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n';
+  for (const [ref, phase, expected, http] of [
+    ['minimax/MiniMax-M3', 'reviewing', 32768 + 16384], ['minimax/MiniMax-M3', 'executing', 16000 + 16384], ['minimax/MiniMax-M3', 'reviewing', 32768 + 16384, 529],
+    ['anthropic/claude-sonnet-5-5', 'reviewing', 32768], ['zai/glm-5.3', 'executing', 16000], ['zai/glm-5.3', 'reviewing', 32768], ['zai/glm-5.3', 'executing', 16000, 503],
+  ]) {
+    const [provider, id] = ref.split('/'), catalog = runtime.getModel(provider, id); let sent = null;
+    const model = { ...catalog, baseUrl: 'https://offline.invalid/v1', cost: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0 } };
+    const fixture = await modelFixture(t, (selected, transcript, options) => runtime.streamSimple(selected, { messages: [{ role: 'user', content: 'fixture', timestamp: Date.now() }] }, { ...options, apiKey: 'offline-key', fetch: async (url, init) => {
+      sent = JSON.parse(init?.body ?? await url.text());
+      if (http) return new Response(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'overloaded' } }), { status: http, headers: { 'content-type': 'application/json' } });
+      return new Response(catalog.api === 'anthropic-messages' ? anthropic : openai, { headers: { 'content-type': 'text/event-stream' } });
+    } }), { phase }, model);
+    const { result } = await fixture.execute({ reasoning: 'high' });
+    const [call] = (await fixture.harness.snapshot(CallsDoc, fixture.root.id, ctx)).calls;
+    assert.equal(sent.max_tokens, expected, ref); assert.equal(call.cap, expected / 1_000_000, ref);
+    if (http) { assert.equal(result.stopReason, 'error'); assert.equal(call.cost, call.cap); } else { assert.equal(result.stopReason, 'stop', ref); assert.ok(call.cost < call.cap); }
   }
 });
 test('non-retryable provider errors fail over inside the lease, pricing the dispatched model; retryable errors use Pi retry first', async t => {
@@ -290,9 +311,9 @@ test('non-retryable provider errors fail over inside the lease, pricing the disp
     const f = await scenario([quota]);
     let result = await f.execute();
     assert.equal(result.result.stopReason, 'stop'); assert.equal(result.result.provider, 'b');
-    assert.deepEqual(result.usage, { usageComplete: true, knownSubtotal: 0.005 + 0.0004, cost: 0.005 + 0.0004, held: 0.005 + 0.0004, dispatched: 2, modelFailure: null });
+    assert.deepEqual(result.usage, { usageComplete: true, knownSubtotal: 0.017 + 0.0004, cost: 0.017 + 0.0004, held: 0.017 + 0.0004, dispatched: 2, modelFailure: null });
     result = await f.execute();
-    assert.deepEqual(f.dispatched, ['a/x:high', 'b/y:low', 'b/y:low']); assert.equal(result.usage.knownSubtotal, 0.005 + 0.0004 + 0.0004);
+    assert.deepEqual(f.dispatched, ['a/x:high', 'b/y:low', 'b/y:low']); assert.equal(result.usage.knownSubtotal, 0.017 + 0.0004 + 0.0004);
   }
   const retry = await scenario(['503 Service temporarily unavailable', '503 Service temporarily unavailable', '503 Service temporarily unavailable']);
   let result = await retry.execute();

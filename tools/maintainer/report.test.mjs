@@ -100,16 +100,15 @@ test('gate repair report preserves bounded metadata without private evidence or 
   assert.deepEqual(reportFor(report).gateRepair, report.gateRepair);
   assert.doesNotMatch(JSON.stringify(report), /private|command output/);
 });
-test('review format diagnostics remain bounded and exclude model text', () => {
+test('review verdict diagnostics remain bounded and exclude model text', () => {
   const report = reportFor({ reviewDiagnostics: [
-    { stopReason: 'stop', textLength: 80, verdict: 'invalid-review', answer: 'private reviewer body' },
-    { stopReason: 'stop', textLength: 30, verdict: 'approved' },
-    { stopReason: 'error', textLength: 100, verdict: 'unknown' },
+    { stopReason: 'toolUse', textLength: 0, verdict: 'invalid-review', verdictCalls: 2, answer: 'private reviewer body' },
+    { stopReason: 'stop', textLength: 30, verdict: 'approved', verdictCalls: 1 },
   ] });
-  assert.equal(report.reviewDiagnostics.length, 2);
+  assert.deepEqual(report.reviewDiagnostics, [{ stopReason: 'toolUse', textLength: 0, verdict: 'invalid-review', verdictCalls: 2 }]);
   assert.deepEqual(reportFor(report).reviewDiagnostics, report.reviewDiagnostics);
   assert.doesNotMatch(JSON.stringify(report), /private reviewer body/);
-  assert.deepEqual(reportFor({ reviewDiagnostics: [{ stopReason: 'untrusted body', textLength: -1, verdict: 'untrusted body' }] }).reviewDiagnostics, [{ stopReason: 'unknown', textLength: null, verdict: 'unknown' }]);
+  assert.deepEqual(reportFor({ reviewDiagnostics: [{ stopReason: 'untrusted body', textLength: -1, verdict: 'contradictory-review', verdictCalls: 'x' }] }).reviewDiagnostics, [{ stopReason: 'unknown', textLength: null, verdict: 'unknown', verdictCalls: null }]);
 });
 test('sarcastic voice keeps no-op and failed outcomes explicit', async t => {
   const dir = await scratch(t); const input = join(dir, 'input.json'); const summary = join(dir, 'summary.md');

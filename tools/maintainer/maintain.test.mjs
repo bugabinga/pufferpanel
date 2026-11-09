@@ -10,13 +10,16 @@ import { calculateCost, createModels } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
-import { CodingTools } from '@earendil-works/pi-durable/tools';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY } from './maintain.mjs';
+import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
+const blocking = { id: 'unsafe-change', severity: 'blocking', file: 'value.txt', line: 1, impact: 'breaks fixture', evidence: 'diff sets after', correction: 'revert it' };
+const advisory = { id: 'naming', severity: 'advisory', impact: 'unclear name', evidence: 'value.txt', correction: 'rename later' };
+const recorded = (...calls) => Object.fromEntries(calls.map((call, index) => [`call-${index}`, call]));
+const approval = recorded({ findings: [], checked: ['diff'] });
 async function scratch(t) { const dir = await mkdtemp(join(tmpdir(), 'maintainer-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
 async function open(database, models = createModels()) {
   const harness = await Harness.open(await openNodeSqliteStorage(database), { models, registry: createRegistry() }, ctx);
@@ -24,7 +27,7 @@ async function open(database, models = createModels()) {
 }
 function hooks(overrides = {}) {
   const state = { admitted: 0, gate: 0, publish: 0, commit: 'c2', inspection: { head: 'c1', tree: 't1', diff: 'x', protected: false } };
-  return { state, admit: async () => { state.admitted++; }, execute: async () => ({ base: 'c0', head: 'c1', tree: 't1', diff: 'x', changed: true, cost: 1 }), inspect: async () => state.inspection, review: async () => ({ answer: '{"approve":true,"findings":[]}', cost: 1 }), gate: async () => { state.gate++; }, commit: async () => { state.inspection.head = state.commit; return state.commit; }, publish: async () => { state.publish++; }, ...overrides };
+  return { state, admit: async () => { state.admitted++; }, execute: async () => ({ base: 'c0', head: 'c1', tree: 't1', diff: 'x', changed: true, cost: 1 }), inspect: async () => state.inspection, review: async () => ({ verdicts: approval, cost: 1 }), gate: async () => { state.gate++; }, commit: async () => { state.inspection.head = state.commit; return state.commit; }, publish: async () => { state.publish++; }, ...overrides };
 }
 
 test('actual SQLite resumes old run without duplicate admission', async t => {
@@ -69,17 +72,24 @@ test('approved management-only run defers gates, commit, and publication', async
   assert.equal(run.phase, 'managing'); assert.equal(h.state.gate + h.state.publish, 0);
   await harness.close(ctx);
 });
-test('malformed, rejecting, and contradictory reviews never reach gate', async t => {
-  for (const answer of ['approve', '{"approve":false,"findings":[]}', '{"approve":true,"findings":["bug"]}']) {
+test('host derives verdict: exactly one recorded call, approved iff no blocking finding, bounded mapped findings', () => {
+  assert.deepEqual(reviewVerdict(approval), { approve: true, findings: [], checked: ['diff'], reason: 'approved' });
+  assert.deepEqual(reviewVerdict(recorded({ findings: [advisory, blocking], checked: ['diff'] })).findings, ['[blocking] unsafe-change (value.txt:1): breaks fixture — diff sets after — revert it', '[advisory] naming: unclear name — value.txt — rename later']);
+  assert.equal(reviewVerdict(recorded({ findings: [advisory], checked: ['diff'] })).approve, true);
+  assert.equal(reviewVerdict(recorded({ findings: [{ ...blocking, evidence: 'x'.repeat(600) }], checked: ['diff'] })).findings[0].length, 500);
+  for (const calls of [undefined, {}, recorded({ findings: [], checked: ['diff'] }, { findings: [], checked: ['diff'] }), recorded({ findings: 'none', checked: [] }), recorded({ findings: [{ ...blocking, severity: 'fatal' }], checked: ['diff'] })]) assert.deepEqual(reviewVerdict(calls), { approve: false, findings: [], checked: [], reason: 'invalid-review' });
+});
+test('missing, repeated, malformed, and blocking verdicts never reach gate', async t => {
+  for (const verdicts of [{}, recorded({ findings: [], checked: ['diff'] }, { findings: [], checked: ['diff'] }), recorded({ findings: 'none', checked: [] }), recorded({ findings: [blocking], checked: ['diff'] })]) {
     const { harness, root } = await open(join(await scratch(t), 'run.sqlite'));
-    const h = hooks({ review: async () => ({ answer, cost: 0 }) });
+    const h = hooks({ review: async () => ({ verdicts, cost: 0 }) });
     assert.equal((await advance(root, { ...h, day: '2026-04-03' })).phase, 'rejected');
     assert.equal(h.state.gate + h.state.publish, 0); await harness.close(ctx);
   }
 });
 test('review checkpoint distinguishes invalid output from findings and retains findings without gates', async t => {
-  for (const [answer, reason, findings] of [['not json', 'invalid-review', []], ['{"approve":false,"findings":["unsafe change"]}', 'review-rejected', ['unsafe change']], ['{"approve":true,"findings":["unsafe change"]}', 'contradictory-review', ['unsafe change']]]) {
-    const { harness, root } = await open(join(await scratch(t), 'run.sqlite')); const h = hooks({ review: async () => ({ answer, cost: 1 }) });
+  for (const [verdicts, reason, findings] of [[{}, 'invalid-review', []], [recorded({ findings: [blocking], checked: ['diff'] }), 'review-rejected', ['[blocking] unsafe-change (value.txt:1): breaks fixture — diff sets after — revert it']]]) {
+    const { harness, root } = await open(join(await scratch(t), 'run.sqlite')); const h = hooks({ review: async () => ({ verdicts, cost: 1 }) });
     const run = await advance(root, { ...h, day: '2026-04-03' });
     assert.equal(run.phase, 'rejected'); assert.equal(run.review.reason, reason); assert.deepEqual(run.review.findings, findings); assert.equal(run.modelPhaseCost.reviewing.cost, 1); assert.equal(h.state.gate, 0);
     await harness.close(ctx);
@@ -97,7 +107,7 @@ test('resumed model work invalidates old settlement before dispatch and phase tr
   const resumed = hooks({ reportedUsage, review: async () => {
     const beforeDispatch = await getRun(root, harness);
     assert.equal(beforeDispatch.usageComplete, false); assert.equal(beforeDispatch.reportedUsage, null);
-    return { answer: '{"approve":true,"findings":[]}', cost: 0 };
+    return { verdicts: approval, cost: 0 };
   } });
   const done = await advance(root, { ...resumed, day: '2026-04-03' });
   assert.equal(done.phase, 'published'); assert.equal(done.usageComplete, true); assert.equal(done.reportedUsage, 2);
@@ -161,7 +171,7 @@ test('one gate repair revokes approval and accumulates both cycles without expan
       if (run.gateRepairs) { assert.equal(run.reviewer, null); assert.equal(run.review, null); assert.equal(run.managementApproved, false); assert.equal(run.usageComplete, false); }
       return { base: 'c0', head: 'c1', tree: 't1', diff: 'x', changed: true, cost: executions === 1 ? 1 : 3 };
     },
-    review: async run => { run.reviewer = `reviewer-${++reviews}`; return { answer: '{"approve":true,"findings":[]}', cost: reviews === 1 ? 2 : 4 }; },
+    review: async run => { run.reviewer = `reviewer-${++reviews}`; return { verdicts: approval, cost: reviews === 1 ? 2 : 4 }; },
     approvePlans: async run => { run.managementApproved = true; },
     gate: async () => { if (++gates === 1) throw Object.assign(Error('gate failed'), { gateFailure: evidence }); },
     commit: async () => { commits++; h.state.inspection.head = 'c2'; return 'c2'; },
@@ -282,21 +292,25 @@ function repo(path) {
   const command = (...args) => execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
   return command;
 }
-test('real faux coding/reviewer turns, bounded format correction, host commit, and SQLite idempotency', async t => {
-  const approval = '{"approve":true,"findings":[]}';
+const codemode = code => fauxToolCall('codemode', { code });
+const verdict = (findings = [], checked = ['diff', 'plans']) => fauxToolCall('submit_verdict', { findings, checked });
+const round = (...calls) => fauxAssistantMessage(calls, { stopReason: 'toolUse' });
+test('real faux codemode executor/reviewer, verdict tool, host commit, and SQLite idempotency', async t => {
+  const submit = round(verdict());
   for (const scenario of [
-    { name: 'valid final verdict after tool rounds', answers: [approval], approved: true },
-    { name: 'failed gate gets one repair and a genuinely fresh reviewer', answers: [approval], approved: true, repair: true },
-    { name: 'one format correction preserves strict JSON gate', answers: ['```json\n' + approval + '\n```', approval], approved: true },
-    { name: 'second malformed verdict stays rejected', answers: ['not JSON', 'still not JSON'], approved: false, reason: 'invalid-review' },
-    { name: 'truncated valid-looking JSON needs complete final verdict', answers: [approval, approval], firstStop: 'length', approved: true },
-    { name: 'genuine findings never trigger format correction', answers: ['{"approve":false,"findings":["unsafe change"]}'], approved: false, reason: 'review-rejected' },
-    { name: 'truncated rejection never triggers format correction', answers: ['{"approve":false,"findings":["unsafe change"]}'], firstStop: 'length', approved: false, reason: 'review-rejected' },
-    { name: 'contradictory findings never trigger format correction', answers: ['{"approve":true,"findings":["unsafe change"]}'], approved: false, reason: 'contradictory-review' },
-    { name: 'truncated contradiction never triggers format correction', answers: ['{"approve":true,"findings":["unsafe change"]}'], firstStop: 'length', approved: false, reason: 'contradictory-review' },
-    { name: 'non-retryable provider error fails over to the next model and still publishes', answers: [approval], approved: true, firstError: '401 Incorrect API key provided' },
-    { name: 'one retryable provider error recovers on Pi retry and still publishes', answers: [approval], approved: true, firstError: '503 Service temporarily unavailable', retryable: true },
-    { name: 'recovered failover then an unrelated gate failure is not an environment failure', answers: [approval], approved: true, firstError: '401 Incorrect API key provided', gateFails: true },
+    { name: 'codemode review then submit_verdict approves', review: [submit], approved: true, verdictCalls: 1 },
+    { name: 'failed gate gets one repair and a genuinely fresh reviewer', review: [submit], approved: true, verdictCalls: 1, repair: true },
+    { name: 'advisory-only finding approves and keeps the finding', review: [round(verdict([advisory]))], approved: true, verdictCalls: 1, findings: ['[advisory] naming: unclear name — value.txt — rename later'] },
+    { name: 'verdict beside codemode in one round counts once', review: [round(codemode('console.log("last look")'), verdict()), fauxAssistantMessage('Reviewed.')], approved: true, verdictCalls: 1 },
+    { name: 'one reminder recovers a missing verdict', review: [fauxAssistantMessage('Looks fine.'), submit], approved: true, verdictCalls: 1, reminded: true },
+    { name: 'second missing verdict is a bot failure', review: [fauxAssistantMessage('Looks fine.'), fauxAssistantMessage('Still fine.')], approved: false, reason: 'invalid-review', verdictCalls: 0, reminded: true },
+    { name: 'repeated verdict invalidates review', review: [round(verdict(), verdict())], approved: false, reason: 'invalid-review', verdictCalls: 2 },
+    // Round-local provider IDs (e.g. `functions.name:0`) repeat across rounds; a second verdict must not overwrite the first.
+    { name: 'later verdict reusing a provider call id still invalidates review', review: [round(fauxToolCall('submit_verdict', { findings: [blocking], checked: ['diff'] }, { id: 'functions.submit_verdict:0' }), codemode('console.log("more")')), round(fauxToolCall('submit_verdict', { findings: [], checked: ['diff'] }, { id: 'functions.submit_verdict:0' }))], approved: false, reason: 'invalid-review', verdictCalls: 2 },
+    { name: 'blocking finding rejects with mapped findings', review: [round(verdict([blocking]))], approved: false, reason: 'review-rejected', verdictCalls: 1, findings: ['[blocking] unsafe-change (value.txt:1): breaks fixture — diff sets after — revert it'] },
+    { name: 'non-retryable provider error fails over to the next model and still publishes', review: [submit], approved: true, verdictCalls: 1, firstError: '401 Incorrect API key provided' },
+    { name: 'one retryable provider error recovers on Pi retry and still publishes', review: [submit], approved: true, verdictCalls: 1, firstError: '503 Service temporarily unavailable', retryable: true },
+    { name: 'recovered failover then an unrelated gate failure is not an environment failure', review: [submit], approved: true, verdictCalls: 1, firstError: '401 Incorrect API key provided', gateFails: true },
   ]) await t.test(scenario.name, async t => {
   const dir = await scratch(t); const source = join(dir, 'source'); await mkdir(source);
   const git = repo(source); git('init', '-q', '-b', 'main'); git('config', 'user.name', 'test'); git('config', 'user.email', 'test@example.test');
@@ -313,28 +327,37 @@ test('real faux coding/reviewer turns, bounded format correction, host commit, a
   Object.assign(process.env, { GH_TOKEN: 'gh-sentinel', ANNIE_GH_TOKEN: 'annie-sentinel', ZAI_API_KEY: 'zai-sentinel', OPENAI_API_KEY: 'openai-sentinel', REGISTRY_PASSWORD: 'registry-sentinel' });
   t.after(() => { for (const [key, value] of Object.entries(savedSecrets)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
   if (failover) faux.setResponses([fauxAssistantMessage('', { stopReason: 'error', errorMessage: scenario.firstError })]);
-  (failover ? backup : faux).setResponses([
+  // Nested bash must see only the prepared model env; the write proves the script passed that check.
+  const executorScript = `const env = await tools.bash({ command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$ZAI_API_KEY$OPENAI_API_KEY$REGISTRY_PASSWORD" && test -n "$PATH$HOME$TMPDIR" && test -n "$PUFFER_MAINT_INTAKE"' });
+if (env.exitCode !== 0) throw new Error('model shell env leaked: ' + env.exitCode);
+const [current, listing] = await Promise.all([tools.read({ path: 'value.txt' }), tools.bash({ command: 'git status --porcelain' })]);
+if (!current.includes('before') || listing.exitCode !== 0) throw new Error('unexpected base');
+await tools.write({ path: 'value.txt', content: 'after' });
+await tools.propose_github({ actions: [{ kind: 'create-issue', title: 'Track fixture', body: 'Known body' }] });
+console.log('edited');`;
+  const reviewerScript = `const [plans, diff] = await Promise.all([tools.read_github_plans({}), tools.diff({})]);
+console.log(JSON.parse(plans).length, diff.includes('after'));`;
+  const offered = [];
+  // Transcript contexts carry tools as positional system deltas; replay them to get what this request offered.
+  const offeredNames = context => { const names = new Set(); for (const message of context.messages ?? []) { for (const tool of message.toolsRemoved ?? []) names.delete(tool.name); for (const tool of message.toolsAdded ?? []) names.add(tool.name); } return [...names].sort().join(); };
+  const watched = steps => steps.map(step => context => { offered.push(offeredNames(context)); return step; });
+  (failover ? backup : faux).setResponses(watched([
     ...(scenario.retryable ? [fauxAssistantMessage('', { stopReason: 'error', errorMessage: scenario.firstError })] : []),
-    fauxAssistantMessage(fauxToolCall('bash', { command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$ZAI_API_KEY$OPENAI_API_KEY$REGISTRY_PASSWORD" && test -n "$PATH$HOME$TMPDIR" && test -n "$PUFFER_MAINT_INTAKE"' }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('write', { path: 'value.txt', content: 'after' }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('propose_github', { actions: [{ kind: 'create-issue', title: 'Track fixture', body: 'Known body' }] }), { stopReason: 'toolUse' }),
+    round(codemode(executorScript)),
     fauxAssistantMessage('Fixed value.'),
-    fauxAssistantMessage(fauxToolCall('read_github_plans', {}), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('diff', {}), { stopReason: 'toolUse' }),
-    ...scenario.answers.map((answer, index) => fauxAssistantMessage(answer, index === 0 && scenario.firstStop ? { stopReason: scenario.firstStop } : {})),
+    round(codemode(reviewerScript)),
+    ...scenario.review,
     ...(scenario.repair ? [
-      fauxAssistantMessage(fauxToolCall('read', { path: privateLog }), { stopReason: 'toolUse' }),
-      fauxAssistantMessage(fauxToolCall('write', { path: 'value.txt', content: 'after-gate-repair' }), { stopReason: 'toolUse' }),
+      round(codemode(`const log = await tools.read({ path: ${JSON.stringify(privateLog)} });\nif (!log.includes('private fixture failure')) throw new Error('evidence unavailable');\nawait tools.write({ path: 'value.txt', content: 'after-gate-repair' });`)),
       fauxAssistantMessage('Corrected the fixture failure.'),
-      fauxAssistantMessage(fauxToolCall('read_github_plans', {}), { stopReason: 'toolUse' }),
-      fauxAssistantMessage(fauxToolCall('diff', {}), { stopReason: 'toolUse' }),
-      fauxAssistantMessage(approval),
+      round(codemode(reviewerScript)),
+      submit,
     ] : []),
-  ]);
-  const registry = createRegistry(); registry.install(CodingTools); const reviewerExtension = installReviewer(registry, worktree);
+  ]));
+  const registry = createRegistry(); registry.install(ModelCodingTools); registry.install(ModelCodemode); const reviewerExtension = installReviewer(registry, worktree);
   const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: failover ? 'faux-backup' : 'faux', modelId: 'faux-1' } };
   const policy = { models: [choices.executor, { provider: 'faux-backup', modelId: 'faux-1' }] };
-  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(pricedFaux(models), policy), registry, settings: { extensions: [CodingTools], retry: { ...RETRY, baseDelayMs: 1 } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
+  const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(pricedFaux(models), policy), registry, settings: { extensions: [ModelCodingTools], retry: { ...RETRY, baseDelayMs: 1 } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
   const root = await harness.root(ctx); Object.assign(policy, { root, harness });
   const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc }); const githubPlanReader = installGitHubPlanReader(registry, root);
   const fixtureFetch = async url => ({ ok: true, status: 200, headers: new Headers(), json: async () => url.includes('/git/ref/') ? { object: { sha: git('rev-parse', 'HEAD') } } : url.includes('/repos/') && !url.includes('/issues') && !url.includes('/pulls') ? { default_branch: 'main' } : [] });
@@ -366,10 +389,18 @@ test('real faux coding/reviewer turns, bounded format correction, host commit, a
     assert.ok(Math.abs(run.spent - total(recorded)) < 1e-12 && run.spent > first.cap); assert.equal(run.knownSubtotal, total(recorded)); assert.equal(run.modelFailure, null);
   }
   assert.equal(run.phase, scenario.approved ? 'published' : 'rejected'); assert.equal(gated, scenario.repair ? 2 : Number(scenario.approved)); assert.equal(published, Number(scenario.approved)); assert.ok(run.reviewer);
-  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 6 + scenario.answers.length + (scenario.repair ? 6 : 0) + (scenario.firstError ? 1 : 0));
-  assert.equal(run.reviewDiagnostics.length, scenario.answers.length);
+  // Every provider request offered only codemode (executor) or codemode plus submit_verdict (reviewer).
+  assert.deepEqual([...new Set(offered)].sort(), ['codemode', 'codemode,submit_verdict']);
+  assert.equal(offered.filter(names => names === 'codemode').length, (scenario.repair ? 4 : 2) + (scenario.retryable ? 1 : 0));
+  const reviewer = await harness.conversation(run.reviewer, ctx), executorAgent = await root.agent(ctx), reviewerAgent = await reviewer.agent(ctx);
+  assert.deepEqual(executorAgent.callable.map(tool => tool.name).sort(), ['bash', 'edit', 'merge_upstream', 'propose_github', 'read', 'write']);
+  assert.deepEqual(reviewerAgent.callable.map(tool => tool.name).sort(), ['diff', 'read', 'read_github_plans']);
+  const reminders = (await reviewer.entries({}, 1000, undefined, ctx)).items.filter(entry => entry.model?.[0]?.role === 'user' && entry.model[0].content === VERDICT_REMINDER);
+  assert.equal(reminders.length, scenario.reminded ? 1 : 0);
+  assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 3 + scenario.review.length + (scenario.repair ? 4 : 0) + (scenario.firstError ? 1 : 0));
+  assert.deepEqual(run.reviewDiagnostics.map(entry => [entry.verdict, entry.verdictCalls]), [[scenario.approved ? 'approved' : scenario.reason, scenario.verdictCalls]]);
+  assert.deepEqual(run.review.findings, scenario.findings ?? []);
   if (!scenario.approved) { assert.equal(run.review.reason, scenario.reason); assert.equal(run.commit, undefined); }
-  if (scenario.reason === 'review-rejected') assert.deepEqual(run.review.findings, ['unsafe change']);
   assert.equal(await readFile(join(worktree, 'value.txt'), 'utf8'), scenario.repair ? 'after-gate-repair' : 'after'); assert.equal(await readFile(join(source, 'value.txt'), 'utf8'), 'before');
   assert.equal((await harness.snapshot(GitHubPlansDoc, root.id, ctx)).plans.length, 1);
   if (scenario.approved) assert.equal(await reconcileCommit(worktree, { ...run, head: run.base }), run.commit);

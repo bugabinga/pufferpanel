@@ -69,7 +69,15 @@ pi-ai `1.5.0` marks Z.AI `1308` as non-retryable, while a `1310` weekly/monthly 
 Existing coding-agent extensions cannot be loaded unchanged into Pi Durable's distinct extension API.
 Policies reuse Oliver's small-change preference, selected model tier, independent review, Git protection, and verified-release discipline.
 Provider admission checks reported spend against `$15` and the persisted `2h` deadline before every request.
-Requests reserve worst-case context/input plus 4000 output tokens using the model's quoted prices; unknown prices block dispatch.
+Requests reserve worst-case context/input plus the phase output ceiling (executor 16000, reviewer 32768 tokens, clamped to the model) using the model's quoted prices; unknown prices block dispatch.
+With reasoning, pi-ai sends that ceiling plus the thinking budget as max output for anthropic-messages models without adaptive thinking, such as MiniMax-M3, and for non-adaptive Claude on bedrock-converse-stream.
+The reservation adds that budget with pi-ai's own `adjustMaxTokensForThinking` (high: +16384), for every bedrock-converse-stream model as an upper bound.
+pi-ai may still clamp the sent value to the remaining context, so the reservation is an upper bound on the adapter's max output.
+An offline test drives the real pi-ai anthropic-messages and openai-completions adapters and fails if the sent `max_tokens` differs from the reservation; bedrock is not covered.
+Both conversations are offered only Pi Durable's `codemode` tool (QuickJS sandbox, 256 MiB VM memory limit); the reviewer also gets `submit_verdict`.
+Scripts call the other tools as nested calls; `codemode` and `submit_verdict` are model-only, and script `models.*` is disabled because it would bypass this provider boundary.
+Nested `bash` uses the same prepared credential-free shell environment.
+Code mode replays a script after a restart from its journal; per Pi Durable's replay policy a nested `bash` interrupted mid-run is not replay-safe, so it rejects in the script as interrupted instead of rerunning.
 The budget is based on provider-reported usage and quoted prices, not a guarantee about subscription billing or unreported work interrupted before a usage receipt.
 The wrapper's two-hour process-group timeout includes tools, tests, builds, and publication; subsequent invocations may reconcile an already pending publication without spending on new model work.
 
@@ -220,7 +228,7 @@ Labels read current desired state; posts use stable markers excluding volatile t
 Read/post races cannot be made atomic by GitHub comments API; timestamps are re-fetched immediately before mutation.
 No automatic issue enabling or repository-setting change occurs by default.
 Optional `ci.sh feedback` consumes only substantive rejected read-only reviewer findings, posts idempotent `COMMENT` review at exact current H, and rechecks lifecycle/head.
-Malformed/contradictory review output never blames the PR or executes rejected proposals.
+Missing or repeated reviewer verdicts never blame the PR or execute rejected proposals.
 Feedback export outputs `feedback=true` only for substantive PR rejection; the trusted effects job invokes it only for that host-validated category.
 
 Public report preserves `taskKind`, `prNumber`, `prHead`, `prAuthor`, `fingerprint`, C, `releaseCommit` H, B/T, ordered parents, trusted upstream pin, model phase costs, `budgetRemainder`, and opaque 64-hex `ledgerReservation`.
@@ -318,7 +326,9 @@ Offline fixtures do not establish those production seams.
 Host gates run pinned frozen frontend install/tests/lint/build, byte-check vendored Ace, full uncached Go normal/race suites, vet, actionlint, and first-party whitespace checks.
 Go runs in the glibc Docker test stage with built frontend embeds, not an Alpine container missing gcc/game compatibility/assets.
 The successful gate receipt identifies the exact Git tree, not a reusable boolean success marker.
-Only the host creates a commit after independent JSON approval with zero findings and unchanged candidate identity.
+Only the host creates a commit after an independent `submit_verdict` with zero blocking findings and unchanged candidate identity.
+The reviewer submits closed bounded findings and what it checked; a run without a verdict gets one reminder, then counts as invalid review output.
+Findings map to report strings `[severity] id (file:line): impact — evidence — correction`, blocking first, each cut to 500 characters.
 Bot edits to the maintenance harness or any `.github` configuration are rejected before gates and again during CI artifact import.
 Numeric calendar SemVer: `2026.10.13`, for example.
 The publisher builds a fresh archive of that clean commit, embeds version/SHA, checks the executable version, and verifies remote manifest/config identity.
@@ -335,9 +345,9 @@ Host Podman uses its own retained storage; publishing uses the operator's existi
 The executor uses an operator-trusted local shell with the operator's OS permissions.
 Prompts and protected-path checks are policy defenses, not an OS sandbox or credential-isolation boundary.
 Use a dedicated restricted account/environment before enabling this against untrusted projects if stronger isolation is needed.
-The reviewer has only a confined read tool and fixed diff tool, with no arbitrary shell or write tool.
+The reviewer's scripts have only a confined read tool, fixed diff tool, and plan reader, with no arbitrary shell or write tool.
 Host gate/publisher copies come from the original harness directory, not the candidate checkout.
-Offline tests use real SQLite and faux model/tool turns, real temporary Git worktrees/commits, and stubbed external publisher commands.
+Offline tests use real SQLite and faux model turns that drive real codemode scripts and nested tools, real temporary Git worktrees/commits, and stubbed external publisher commands.
 No paid maintenance run, live gate build, registry publication, system installation, or deployment is performed by those tests.
 A separate live gate validation built the real node/glibc test images and passed frontend checks, Ace identity, full Go race tests, vet, and actionlint.
 The uncached normal suite exposed an intermittent existing `TestServers_Restarts` failure (`server running`); the gate stopped without a release receipt, demonstrating fail-closed behavior.

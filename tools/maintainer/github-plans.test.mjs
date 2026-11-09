@@ -10,7 +10,7 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-work
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { advance, RunDoc, createHostHooks, ModelCodingTools, installReviewer, snapshot } from './maintain.mjs';
+import { advance, RunDoc, createHostHooks, ModelCodingTools, ModelCodemode, installReviewer, snapshot } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
@@ -33,7 +33,7 @@ async function fixture(t, responses) {
   const models = createModels();
   models.setProvider(faux.provider);
   const registry = createRegistry();
-  registry.install(ModelCodingTools);
+  registry.install(ModelCodingTools); registry.install(ModelCodemode);
   const reviewerExtension = installReviewer(registry, worktree);
   const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), {
     models,
@@ -58,9 +58,11 @@ async function fixture(t, responses) {
   hooks.publish = async () => assert.fail('management-only plan must not publish');
   return { dir, state, worktree, harness, root, hooks };
 }
-const plan = actions => fauxAssistantMessage(fauxToolCall('propose_github', { actions }), { stopReason: 'toolUse' });
+const script = code => fauxAssistantMessage(fauxToolCall('codemode', { code }), { stopReason: 'toolUse' });
+// Each attempt runs as a nested call; refusals reject inside the script and later attempts still run.
+const plan = (...attempts) => script(attempts.map(actions => `try { console.log(await tools.propose_github({ actions: ${JSON.stringify(actions)} })); } catch (error) { console.log('refused:', error.message); }`).join('\n'));
 const end = () => fauxAssistantMessage('proposal recorded');
-const readPlans = () => fauxAssistantMessage(fauxToolCall('read_github_plans', {}), { stopReason: 'toolUse' });
+const review = () => [script('console.log(await tools.read_github_plans({}));'), fauxAssistantMessage(fauxToolCall('submit_verdict', { findings: [], checked: ['read_github_plans'] }), { stopReason: 'toolUse' })];
 const issue = (title, body = 'A bounded request.') => ({ kind: 'create-issue', title, body });
 
 test('real faux SDK executor persists proposals, redacts sentinels, reviewer reads ownerless plans, management phase has no side effects', async t => {
@@ -70,8 +72,10 @@ test('real faux SDK executor persists proposals, redacts sentinels, reviewer rea
   t.after(() => { for (const key of secretNames) if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; });
   const actions = [issue('Known ' + sentinels.ZAI_API_KEY, `body ${sentinels.GH_TOKEN} ${sentinels.ANNIE_GH_TOKEN} ${sentinels.REGISTRY_PASSWORD}`)];
   const f = await fixture(t, [
-    fauxAssistantMessage(fauxToolCall('bash', { command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$REGISTRY_PASSWORD$ZAI_API_KEY" && test -n "$PATH$HOME$TMPDIR$PUFFER_MAINT_INTAKE"' }), { stopReason: 'toolUse' }),
-    plan(actions), end(), readPlans(), fauxAssistantMessage('{"approve":true,"findings":[]}'),
+    script(`const env = await tools.bash({ command: 'test -z "$GH_TOKEN$ANNIE_GH_TOKEN$REGISTRY_PASSWORD$ZAI_API_KEY" && test -n "$PATH$HOME$TMPDIR$PUFFER_MAINT_INTAKE"' });
+if (env.exitCode !== 0) throw new Error('model shell env leaked');
+await tools.propose_github({ actions: ${JSON.stringify(actions)} });`),
+    end(), ...review(),
   ]);
   await f.root.commit(async tx => { (await tx.doc(RunDoc, f.root.id)).run = { day: '2026-04-03', requestId: 'request-one', startedAt: Date.now(), spent: 0, usageStart: 0, phase: 'admitted', timeline: [] }; }, ctx);
   const run = await advance(f.root, { harness: f.harness, ...f.hooks, day: '2026-04-03' });
@@ -87,7 +91,7 @@ test('real faux SDK executor persists proposals, redacts sentinels, reviewer rea
 test('same proposal replay deduplicates within run; tomorrow fresh request retires old proposals', async t => {
   const common = [issue('Repeated proposal')];
   const next = [issue('Next day proposal')];
-  const f = await fixture(t, [plan(common), plan(common), end(), fauxAssistantMessage('{"approve":true,"findings":[]}'), plan(next), end(), fauxAssistantMessage('{"approve":true,"findings":[]}')]);
+  const f = await fixture(t, [plan(common, common), end(), ...review(), plan(next), end(), ...review()]);
   await f.root.commit(async tx => { (await tx.doc(RunDoc, f.root.id)).run = { day: '2026-04-03', requestId: 'request-one', startedAt: Date.now(), spent: 0, usageStart: 0, phase: 'admitted', timeline: [] }; }, ctx);
   await advance(f.root, { harness: f.harness, ...f.hooks, day: '2026-04-03' });
   let stored = (await f.harness.snapshot(GitHubPlansDoc, f.root.id, ctx)).plans;
@@ -103,7 +107,7 @@ test('same proposal replay deduplicates within run; tomorrow fresh request retir
 test('active plans remain bounded across distinct proposals; invalid and destructive actions are rejected', async t => {
   const actions = Array.from({ length: 10 }, (_, index) => issue(`Proposal ${index}`));
   const destructive = [{ kind: 'delete-repository' }];
-  const f = await fixture(t, [plan(actions), fauxAssistantMessage(fauxToolCall('propose_github', { actions: [issue('Second batch')] }), { stopReason: 'toolUse' }), fauxAssistantMessage(fauxToolCall('propose_github', { actions: destructive }), { stopReason: 'toolUse' }), end(), fauxAssistantMessage('{"approve":true,"findings":[]}')]);
+  const f = await fixture(t, [plan(actions, [issue('Second batch')], destructive), end(), ...review()]);
   await f.root.commit(async tx => { (await tx.doc(RunDoc, f.root.id)).run = { day: '2026-04-03', requestId: 'request-one', startedAt: Date.now(), spent: 0, usageStart: 0, phase: 'admitted', timeline: [] }; }, ctx);
   await advance(f.root, { harness: f.harness, ...f.hooks, day: '2026-04-03' });
   const stored = (await f.harness.snapshot(GitHubPlansDoc, f.root.id, ctx)).plans;
@@ -113,7 +117,7 @@ test('active plans remain bounded across distinct proposals; invalid and destruc
 
 test('disabled issues: propose_github refuses create-issue and non-PR comment/label targets, stores only PR actions', async t => {
   const at = '2026-04-03T00:00:00Z';
-  const f = await fixture(t, [plan([issue('Cannot exist')]), plan([{ kind: 'comment', number: 9, body: 'issue', expectedUpdatedAt: at }]), plan([{ kind: 'add-label', number: 9, labels: ['x'], expectedUpdatedAt: at }]), plan([{ kind: 'comment', number: 7, body: 'pull request', expectedUpdatedAt: at }]), end(), fauxAssistantMessage('{"approve":true,"findings":[]}')]);
+  const f = await fixture(t, [plan([issue('Cannot exist')], [{ kind: 'comment', number: 9, body: 'issue', expectedUpdatedAt: at }], [{ kind: 'add-label', number: 9, labels: ['x'], expectedUpdatedAt: at }], [{ kind: 'comment', number: 7, body: 'pull request', expectedUpdatedAt: at }]), end(), ...review()]);
   const intakePath = join(f.dir, 'disabled-intake.json');
   await import('node:fs/promises').then(({ writeFile }) => writeFile(intakePath, JSON.stringify({ own: { issues: { disabled: true, items: [] }, prs: { items: [{ number: 7 }] } } })));
   const prepare = f.hooks.prepare; f.hooks.prepare = async run => ({ ...await prepare(run), githubDiagnostics: { issuesDisabled: true, truncated: false }, intakePath });
@@ -130,7 +134,7 @@ test('invalid issue title, labels, number, and updatedAt are rejected by actual 
     [{ kind: 'comment', number: 0, body: 'valid', expectedUpdatedAt: '2026-04-03T00:00:00Z' }],
     [{ kind: 'comment', number: 1, body: 'valid', expectedUpdatedAt: 'not-a-date' }],
   ];
-  const f = await fixture(t, [...invalid.map(actions => fauxAssistantMessage(fauxToolCall('propose_github', { actions }), { stopReason: 'toolUse' })), end()]);
+  const f = await fixture(t, [plan(...invalid), end()]);
   await f.root.commit(async tx => { (await tx.doc(RunDoc, f.root.id)).run = { day: '2026-04-03', requestId: 'request-one', startedAt: Date.now(), spent: 0, usageStart: 0, phase: 'admitted', timeline: [] }; }, ctx);
   await advance(f.root, { harness: f.harness, ...f.hooks, day: '2026-04-03' });
   assert.deepEqual((await f.harness.snapshot(GitHubPlansDoc, f.root.id, ctx))?.plans ?? [], []);

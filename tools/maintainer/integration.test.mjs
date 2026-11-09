@@ -10,7 +10,7 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-work
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { createHostHooks, installReviewer, advance, snapshot, reconcileCommit } from './maintain.mjs';
+import { createHostHooks, installReviewer, advance, snapshot, reconcileCommit, ModelCodemode } from './maintain.mjs';
 import { validateTask, selectedTask, bindTask } from './task.mjs';
 import { materializePR, verifyPRHistory, checkPR, git } from './pr.mjs';
 import { pushSource, metadata, verifyCandidate } from './ci-source.mjs';
@@ -63,8 +63,8 @@ test('selected task strictly pins repo/ref/day/IDs and excludes body/snapshot fi
 
 test('actual faux PR route executes ZERO coding turns, reviewer reads complete B→T once, gates synthetic C with source H', async t => {
   const f = await fixture(t); const faux = fauxProvider();
-  faux.setResponses([fauxAssistantMessage(fauxToolCall('diff', {}), { stopReason: 'toolUse' }), fauxAssistantMessage('{"approve":true,"findings":[]}')]);
-  const models = createModels(); models.setProvider(faux.provider); const registry = createRegistry();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall('codemode', { code: "const diff = await tools.diff({}); if (!diff.includes('PR full change')) throw new Error('incomplete diff'); console.log(diff.length);" }), { stopReason: 'toolUse' }), fauxAssistantMessage(fauxToolCall('submit_verdict', { findings: [], checked: ['complete B→T diff'] }), { stopReason: 'toolUse' })]);
+  const models = createModels(); models.setProvider(faux.provider); const registry = createRegistry(); registry.install(ModelCodemode);
   const reviewerExtension = installReviewer(registry, f.worktree);
   const harness = await Harness.open(await openNodeSqliteStorage(join(f.state, 'test.sqlite')), { models, registry, settings: { retry: { enabled: false } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd }) }, ctx);
   t.after(() => harness.close(ctx)); const root = await harness.root(ctx);
