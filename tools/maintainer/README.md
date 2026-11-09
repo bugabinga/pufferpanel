@@ -87,7 +87,8 @@ Manual `observe` or `sweep` refreshes cheap read-only discovery/checkpoint evide
 
 Configure two environments, each restricted to deployment branch `trunk`:
 
-- `honest-annie-model`: any pi-ai provider API key secret enables that provider, for example `ZAI_API_KEY` (Z.AI account entitled to GLM-5.3 on its coding endpoint), `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, or `OPENCODE_API_KEY`.
+- `honest-annie-model`: a provider API key secret enables that provider: `ZAI_API_KEY` (Z.AI account entitled to GLM-5.3 on its coding endpoint), `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, or `OPENCODE_API_KEY`.
+  A new provider needs its pi-ai env name added to the three model steps in the workflow and a model ref in `ci-settings.json`; a test enforces both.
 - `honest-annie-release`: secrets `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, scoped to publishing `registry.bugabinga.net/pufferpanel`.
 
 Ordinary source/PR/issue operations and model-free retry use native workflow tokens, not a PAT.
@@ -100,9 +101,8 @@ If future trunk protection requires PRs or rejects GitHub Actions pushes, switch
 Commit display name is `honest_annie`; GitHub authentication/attribution remains the native `github-actions[bot]` identity.
 
 The maintenance job has a read-only GitHub token; model provider credentials reach only the availability check, model step, and report collector.
-Those steps receive `toJSON(secrets)` as one `ANNIE_MODEL_SECRETS` value; Node removes it from its own `process.env` and copies only names from pi-ai's standard provider env-var mapping, never `github_token`; the original exec environments of the step shell, wrapper, and Node process still contain it.
-That JSON contains every secret visible to the job: `honest-annie-model` environment secrets, repository secrets, and any organization secrets shared with this repository.
-Only provider-named keys are copied into the process; the full JSON still remains in those steps' environment.
+Those steps name each provider credential explicitly as an environment variable that pi-ai reads natively; an unset secret is empty and counts as absent.
+The whole secrets context is never dumped: GitHub flags `toJSON(secrets)` as a possibly malicious workflow and refuses to run it without manual approval.
 Keep model credentials in `honest-annie-model` and repository-level secrets empty (currently none).
 Ancestor process environments remain readable to same-user model shells on hosted runners, so this is policy isolation, not a credential boundary.
 Model shells still receive only `PATH`, `HOME`, `TMPDIR`, and `PUFFER_MAINT_INTAKE`.

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import YAML from 'yaml';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import { findEnvKeys } from '@earendil-works/pi-ai/compat';
 import { createRuntime, priced, selectModels, snapshot } from './maintain.mjs';
 import { providerKeyNames } from './report.mjs';
 
@@ -109,7 +110,14 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   const release = workflow.slice(workflow.indexOf('  release:'), workflow.indexOf('  retry-effects:'));
   assert.doesNotMatch(check, /secrets\.|contents: write/);
   assert.match(maintain, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(maintain, /github\.ref == 'refs\/heads\/trunk'/);
-  assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(maintain, /ANNIE_MODEL_SECRETS: \$\{\{ toJSON\(secrets\) \}\}/); assert.doesNotMatch(maintain, /ZAI_API_KEY|GITHUB_TOKEN: \$\{\{ secrets/);
+  assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.doesNotMatch(workflow, /toJSON\(secrets\)|ANNIE_MODEL_SECRETS|GITHUB_TOKEN: \$\{\{ secrets/);
+  // GitHub flags whole-secrets dumps as malicious: model steps name each pi-ai provider credential explicitly, covering every configured provider.
+  const named = [...maintain.matchAll(/^ {10}([A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$/gm)];
+  assert.ok(named.length > 0 && named.every(([, env, secret]) => env === secret));
+  const forwarded = Object.fromEntries(named.map(([, name]) => [name, 'set']));
+  assert.deepEqual(providerKeyNames(forwarded).sort(), Object.keys(forwarded).sort(), 'only pi-ai provider credential names');
+  const settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
+  for (const ref of settings.annieModels) assert.ok(findEnvKeys(ref.split('/')[0], forwarded)?.length, ref);
   assert.doesNotMatch(maintain, /REGISTRY_PASSWORD|ANNIE_GH_TOKEN|contents: write|issues: write|pull-requests: write/);
   assert.match(maintain, /GH_TOKEN: \$\{\{ github.token \}\}/); // Native read-only preparation only.
   assert.match(maintain, /github.run_attempt == 1/);

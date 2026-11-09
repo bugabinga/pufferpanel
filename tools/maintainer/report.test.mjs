@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collect, loadModelSecrets, redact, reportFor } from './report.mjs';
+import { collect, providerKeyNames, redact, reportFor } from './report.mjs';
 
 async function scratch(t) { const dir = await mkdtemp(join(tmpdir(), 'maintainer-report-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
 test('report labels no-op as not released and preserves bounded review diagnostics', () => {
@@ -22,14 +22,12 @@ test('sanitizes explicit, encoded, token, control, and markdown secrets from JSO
   assert.doesNotMatch(written, /ghp_abcdefghijklmnopqrstuvwxyz123456/);
   assert.match(written, /\\\*/);
 });
-test('model secret JSON yields only pi-ai provider credentials, never GitHub tokens, and redaction follows the same mapping', () => {
-  const env = { ANNIE_MODEL_SECRETS: JSON.stringify({ github_token: 'ghs_native_sentinel', GITHUB_TOKEN: 'github-token-sentinel', REGISTRY_PASSWORD: 'registry-sentinel', OPENAI_API_KEY: 'openai-key-sentinel', DEEPSEEK_API_KEY: 'deepseek-key-sentinel', UNRELATED: 'unrelated-sentinel' }) };
-  assert.deepEqual(loadModelSecrets(env).sort(), ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY']);
-  assert.deepEqual(Object.keys(env).sort(), ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY']);
+test('provider key names follow pi-ai mapping, ignore unset (empty) workflow secrets and GitHub tokens; redaction follows the same mapping', () => {
+  const env = { GITHUB_TOKEN: 'github-token-sentinel', GH_TOKEN: 'gh-sentinel', REGISTRY_PASSWORD: 'registry-sentinel', OPENAI_API_KEY: 'openai-key-sentinel', DEEPSEEK_API_KEY: 'deepseek-key-sentinel', ANTHROPIC_API_KEY: '', ZAI_API_KEY: '', UNRELATED: 'unrelated-sentinel' };
+  assert.deepEqual(providerKeyNames(env).sort(), ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY']);
   assert.equal(redact('leak openai-key-sentinel and deepseek-key-sentinel', env), 'leak [redacted] and [redacted]');
   assert.equal(redact('moonshot-key-sentinel', { MOONSHOT_API_KEY: 'moonshot-key-sentinel' }), '[redacted]');
-  assert.deepEqual(loadModelSecrets({}), []);
-  assert.throws(() => loadModelSecrets({ ANNIE_MODEL_SECRETS: 'not json' }));
+  assert.deepEqual(providerKeyNames({}), []);
 });
 test('collector parses JSONL timings and marks release only from verified publish receipt', async t => {
   const dir = await scratch(t); const reportPath = join(dir, 'input.json'); const gates = join(dir, 'gates.jsonl'); const published = join(dir, 'publish.ok');

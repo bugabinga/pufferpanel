@@ -167,15 +167,23 @@ jobs:
           ANNIE_LEASE_ARTIFACT_ID: ${{ steps.prepaid.outputs.artifact-id }}
           ANNIE_LEASE_ARTIFACT_DIGEST: ${{ steps.prepaid.outputs.artifact-digest }}
         run: node tools/maintainer/controller.mjs verify-upload
-      # Node keeps only pi-ai provider credential names from this JSON; GitHub tokens are never copied.
+      # Explicit pi-ai provider env names; unset secrets are empty and count as absent. Add a provider here and in ci-settings.json.
       - name: Validate at least one configured model provider is available
         env:
-          ANNIE_MODEL_SECRETS: ${{ toJSON(secrets) }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
-          node --input-type=module -e 'import {readFile} from "node:fs/promises"; import {join} from "node:path"; import {loadModelSecrets} from "./tools/maintainer/report.mjs"; import {createRuntime,selectModels} from "./tools/maintainer/maintain.mjs"; loadModelSecrets(); const dir=process.env.PI_CODING_AGENT_DIR; const {executor,reviewer}=await selectModels(JSON.parse(await readFile(join(dir,"settings.json"),"utf8")),await createRuntime(dir)); console.log(JSON.stringify({executor,reviewer}));'
+          node --input-type=module -e 'import {readFile} from "node:fs/promises"; import {join} from "node:path"; import {createRuntime,selectModels} from "./tools/maintainer/maintain.mjs"; const dir=process.env.PI_CODING_AGENT_DIR; const {executor,reviewer}=await selectModels(JSON.parse(await readFile(join(dir,"settings.json"),"utf8")),await createRuntime(dir)); console.log(JSON.stringify({executor,reviewer}));'
       - name: Maintain or review selected task
         env:
-          ANNIE_MODEL_SECRETS: ${{ toJSON(secrets) }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/run.sh
       - name: Export only approved candidates or valid rejection feedback
@@ -192,7 +200,11 @@ jobs:
       - name: Collect sanitized maintenance report
         if: always()
         env:
-          ANNIE_MODEL_SECRETS: ${{ toJSON(secrets) }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
           day=$(node -p 'JSON.parse(process.env.PUFFER_MAINT_TASK).day')
           node tools/maintainer/report.mjs collect --report "$PUFFER_MAINT_RESULT" --reportdir "$RUNNER_TEMP/honest-annie-report" --gate-events "$PUFFER_MAINT_STATE/runs/$day/gate-events.jsonl"

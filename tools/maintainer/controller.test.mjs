@@ -336,7 +336,7 @@ test('workflow isolates secretless PR wake, trusted observation, prepaid attempt
   assert.match(main, /cron: '7,37 \* \* \* \*'/); assert.doesNotMatch(main, /date -u/);
   const model = main.slice(main.indexOf('  maintain:'), main.indexOf('  release:'));
   assert.ok(model.indexOf('ci.sh preflight') < model.indexOf('name: annie-lease-'));
-  assert.ok(model.indexOf('name: annie-lease-') < model.indexOf('toJSON(secrets)'));
+  assert.ok(model.indexOf('name: annie-lease-') < model.indexOf('secrets.ZAI_API_KEY'));
   assert.doesNotMatch(model, /ANNIE_GH_TOKEN|REGISTRY_PASSWORD|contents: write/);
   const release = main.slice(main.indexOf('  release:'), main.indexOf('  retry-effects:'));
   assert.ok(release.indexOf('ci.sh push') < release.indexOf('ci.sh registry-login'));

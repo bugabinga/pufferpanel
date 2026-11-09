@@ -14,7 +14,7 @@ import { createBashTool, createEditTool, createReadTool, createWriteTool } from 
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { loadModelSecrets, redact, reportFor, writeReport } from './report.mjs';
+import { redact, reportFor, writeReport } from './report.mjs';
 import { collectGitHubSnapshot, writeIntake, installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 import { selectedTask, versionFor } from './task.mjs';
 import { materializePR } from './pr.mjs';
@@ -486,8 +486,6 @@ export function createHostHooks({ root, harness, worktree, state, models, review
 }
 
 async function main() {
-  // Drop the step's secret JSON before any child process (git, podman) inherits it.
-  loadModelSecrets();
   if (process.argv.includes('--help')) { console.log('Run through bash tools/maintainer/run.sh. PUFFER_MAINT_SOURCE and PUFFER_MAINT_STATE override source/state paths. PUFFER_MAINT_TASK accepts strict trusted JSON (README schema); selected tasks require PUFFER_MAINT_DEFER_PUBLISH=1 and trusted ci.sh release/management. $15 and 2h daily model budget; publishing is host-controlled.'); return; }
   const task = selectedTask();
   let lease = null;
