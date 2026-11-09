@@ -378,7 +378,11 @@ test('workflow isolates secretless PR wake, trusted observation, prepaid attempt
   assert.equal(jobs.observe.outputs.republish, '${{ steps.observe.outputs.republish }}');
   assert.match(release, /PUFFER_MAINT_TASK: \$\{\{ needs.observe.outputs.task \}\}/);
   assert.match(release, /honest-annie-candidate-\$\{\{ github.run_id \}\}-1/);
-  assert.equal((main.match(/secrets.ANNIE_GH_TOKEN/g) ?? []).length, 1);
+  // The PAT reaches exactly two model-free steps: reviewed enable-issues, and harness-fix delivery, which never runs candidate code.
+  assert.equal((main.match(/secrets.ANNIE_GH_TOKEN/g) ?? []).length, 2);
+  const holders = Object.entries(jobs).flatMap(([id, job]) => job.steps.filter(step => step.env?.ANNIE_GH_TOKEN).map(step => `${id}: ${step.run}`));
+  assert.deepEqual(holders, ['release: bash tools/maintainer/ci.sh management', 'harness-deliver: bash tools/maintainer/ci.sh deliver']);
+  assert.match(steps.find(step => step.env?.ANNIE_GH_TOKEN).if, /adminAction == 'true'/);
 });
 
 test('hosted provider runtime rejects attempt2 before dispatch even with a copied lease hash', async t => {

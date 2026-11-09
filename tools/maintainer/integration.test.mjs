@@ -21,7 +21,8 @@ import { fakeReviewSandbox, pinnedRunroot } from './fake-podman.mjs';
 const moduleDir = new URL('.', import.meta.url).pathname;
 const response = (body, status = 200, link = '') => ({ ok: status === 200, status, headers: new Headers({ link }), json: async () => body });
 const apiData = task => ({
-  [`/pulls/${task.number}`]: { number: task.number, state: 'open', draft: false, user: { login: task.author }, head: { sha: task.head }, base: { ref: 'trunk', repo: { full_name: task.repo } } },
+  [`/pulls/${task.number}`]: { number: task.number, state: 'open', draft: false, user: { login: task.author }, head: { sha: task.head, ref: 'feature' }, base: { ref: 'trunk', repo: { full_name: task.repo } } },
+  [`/pulls/${task.number}/files?per_page=100`]: [{ filename: 'value.txt' }],
   [`/collaborators/${task.author}/permission`]: { permission: 'write' },
   [`/commits/${task.head}/status?per_page=100`]: { statuses: [], total_count: 0 },
   [`/commits/${task.head}/check-runs?per_page=100&filter=latest`]: { total_count: 1, check_runs: [{ status: 'completed', conclusion: 'success' }] },
@@ -90,7 +91,7 @@ test('actual faux PR route executes ZERO coding turns, reviewer reads complete B
 test('PR target, author role, lifecycle, checks, pagination, rules unknown matrices fail before materialization', async t => {
   const f = await fixture(t), data = apiData(f.task), p = `/pulls/7`, c = `/commits/${f.head}/check-runs?per_page=100&filter=latest`, s = `/commits/${f.head}/status?per_page=100`;
   for (const changes of [
-    { [p]: { ...data[p], head: { sha: f.base } } }, { [p]: { ...data[p], draft: true } }, { [p]: { ...data[p], state: 'closed' } }, { [p]: { ...data[p], user: { login: 'other' } } }, { [p]: { ...data[p], base: { ref: 'other', repo: { full_name: f.task.repo } } } },
+    { [p]: { ...data[p], head: { sha: f.base, ref: 'feature' } } }, { [p]: { ...data[p], draft: true } }, { [p]: { ...data[p], state: 'closed' } }, { [p]: { ...data[p], user: { login: 'other' } } }, { [p]: { ...data[p], base: { ref: 'other', repo: { full_name: f.task.repo } } } },
     { '/collaborators/trusted/permission': { permission: 'read' } }, { '/collaborators/trusted/permission': { http: 403 } },
     { [s]: { statuses: [{ state: 'pending' }], total_count: 1 } }, { [s]: { statuses: [{ state: 'failure' }], total_count: 1 } },
     { [c]: { check_runs: [], total_count: 0 } }, { [c]: { check_runs: [], total_count: 1 } },
@@ -237,7 +238,7 @@ test('new integration rechecks PR lifecycle/head/role/checks/rules immediately b
   const f = await fixture(t), run = await candidate(f), data = apiData(f.task);
   for (const changes of [
     { '/pulls/7': { ...data['/pulls/7'], state: 'closed' } },
-    { '/pulls/7': { ...data['/pulls/7'], head: { sha: f.base } } },
+    { '/pulls/7': { ...data['/pulls/7'], head: { sha: f.base, ref: 'feature' } } },
     { '/collaborators/trusted/permission': { permission: 'read' } },
     { [`/commits/${f.head}/status?per_page=100`]: { total_count: 1, statuses: [{ state: 'pending' }] } },
     { '/branches/trunk': { protected: true } },

@@ -1,7 +1,7 @@
 import { execFile as callback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { authorTrust } from './github.mjs';
-import { OWN, PROTECTED_PATHS, isSha } from './task.mjs';
+import { HARNESS_BRANCH_PREFIX, OWN, PROTECTED_PATHS, isSha } from './task.mjs';
 const execFile = promisify(callback);
 export const git = async (cwd, ...args) => (await execFile('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })).stdout.trim();
 export const ancestor = async (cwd, a, b) => { try { await git(cwd, 'merge-base', '--is-ancestor', a, b); return true; } catch { return false; } };
@@ -32,6 +32,13 @@ export async function checkPR(task, options = {}) {
   const read = path => githubRead(path, options);
   const pr = await read(`/pulls/${task.number}`);
   if (pr.number !== task.number || pr.state !== 'open' || pr.draft !== false || pr.head?.sha !== task.head || pr.user?.login !== task.author || pr.base?.repo?.full_name !== OWN || pr.base?.ref !== 'trunk') throw Error('PR head/target/author/lifecycle changed');
+  // Never self-integrate: harness repair PRs and any PR touching the trusted harness or CI are Oliver's to merge, refused before
+  // any paid admission. The net file list is an early screen; verifyPRHistory still rejects reverted introductions.
+  if (typeof pr.head?.ref !== 'string' || pr.head.ref.startsWith(HARNESS_BRANCH_PREFIX)) throw Error('PR from harness repair branch is never integrated by Annie');
+  // One complete page only: a full page may hide more files, so it fails closed like a continuation (githubRead).
+  const files = await read(`/pulls/${task.number}/files?per_page=100`);
+  if (!Array.isArray(files) || files.length >= 100) throw Error('PR file list too large to screen');
+  if ( files.some(file => typeof file?.filename !== 'string' || [file.filename, file.previous_filename].some(name => typeof name === 'string' && PROTECTED_PATHS.some(path => name === path || name.startsWith(`${path}/`))))) throw Error('PR changes trusted harness or CI');
   const trust = await authorTrust(task.author, options);
   if (!trust.eligible) throw Error(`PR author blocked: ${trust.reason}`);
   const statuses = await read(`/commits/${task.head}/status?per_page=100`);

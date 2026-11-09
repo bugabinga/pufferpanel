@@ -115,9 +115,9 @@ test('infrastructure failures reject instead of resolving', async t => {
   const podmanError = await fixture(t, { run: { broken: { output: 'Error: image not known', exitCode: 125 } } });
   await assert.rejects(podmanError.run({ command: 'broken' }), /sandbox infrastructure failure \(podman exit 125\): Error: image not known/);
   const builds = async () => (await podmanError.fake.calls()).filter(call => call.args[6] === 'build').length, before = await builds();
-  assert.deepEqual(await podmanError.sandbox.prepare({ worktree: podmanError.worktree, tree: podmanError.tree, deadline: Date.now() + 7_200_000, log: podmanError.log, sourceChanged: false }), { status: 'unavailable', reason: 'management-only candidate has no source change to run', podmanVersion: null, runCalls: 0, runSeconds: 0, visual: { status: 'skipped', reason: 'candidate changes no frontend or web-layer path', browser: null, snapshotCalls: 0 } });
+  assert.deepEqual(await podmanError.sandbox.prepare({ worktree: podmanError.worktree, tree: podmanError.tree, deadline: Date.now() + 7_200_000, log: podmanError.log, sourceChanged: false }), { status: 'unavailable', reason: 'candidate has no product source change to run', podmanVersion: null, runCalls: 0, runSeconds: 0, visual: { status: 'skipped', reason: 'candidate changes no frontend or web-layer path', browser: null, snapshotCalls: 0 } });
   assert.equal(await builds(), before);
-  await assert.rejects(podmanError.run({ command: 'broken' }), /unavailable: management-only candidate has no source change to run/);
+  await assert.rejects(podmanError.run({ command: 'broken' }), /unavailable: candidate has no product source change to run/);
   const dir = await mkdtemp(join(tmpdir(), 'annie-sandbox-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const unpinned = createReviewSandbox({ state: dir, env: { PATH: process.env.PATH } });
   execFileSync('git', ['init', '-q', dir]);

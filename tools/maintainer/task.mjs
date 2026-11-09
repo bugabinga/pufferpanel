@@ -3,6 +3,12 @@ export const OWN = 'bugabinga/pufferpanel';
 export const REF = 'refs/heads/trunk';
 // Trusted harness and CI policy: bot edits are refused here (guard.mjs) and by every post-hoc source check.
 export const PROTECTED_PATHS = Object.freeze(['tools/maintainer', '.github']);
+// Harness self-repair: a $5 cap, delivery only as a PR from its own branch, never trunk; Annie never integrates these PRs.
+export const HARNESS_CAP = 5;
+export const HARNESS_BRANCH_PREFIX = 'annie/harness/';
+export const harnessBranch = fingerprint => `${HARNESS_BRANCH_PREFIX}${fingerprint.slice(0, 12)}`;
+// Every fixed gate step name: product gate.sh, then harness-gate.sh.
+export const GATE_NAMES = Object.freeze(['whitespace', 'node', 'ace', 'tests-image', 'go-normal', 'go-race', 'go-vet', 'actionlint', 'harness-scope', 'harness-whitespace', 'harness-npm-ci', 'harness-test', 'harness-shell', 'harness-yaml', 'harness-actionlint']);
 export const isSha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 export const versionFor = day => day.split('-').map(Number).join('.');
 export const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -13,17 +19,18 @@ export function validateHolds(value) {
   return value;
 }
 export function validateTask(value) {
-  const keys = ['kind', 'day', 'repo', 'ref', 'base', 'upstreamSha', 'upstreamRef', 'number', 'head', 'author', 'fingerprint'];
+  const keys = ['kind', 'day', 'repo', 'ref', 'base', 'upstreamSha', 'upstreamRef', 'number', 'head', 'author', 'fingerprint', 'incident'];
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !keys.includes(key))) throw Error('invalid selected task fields');
-  if (!['maintenance', 'pr', 'management'].includes(value.kind) || value.repo !== OWN || value.ref !== REF || !/^\d{4}-\d{2}-\d{2}$/.test(value.day ?? '') || new Date(value.day + 'T00:00:00Z').toISOString().slice(0, 10) !== value.day || !isSha(value.base) || !isSha(value.upstreamSha) || !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value.upstreamRef ?? '') || value.upstreamRef.includes('..') || value.upstreamRef.includes('//') || value.upstreamRef.endsWith('/') || value.upstreamRef.split('/').some(part => part.startsWith('.') || part.endsWith('.') || part.endsWith('.lock')) || !/^[a-f0-9]{64}$/.test(value.fingerprint ?? '')) throw Error('invalid selected task identity');
+  if (!['maintenance', 'pr', 'management', 'harness'].includes(value.kind) || value.repo !== OWN || value.ref !== REF || !/^\d{4}-\d{2}-\d{2}$/.test(value.day ?? '') || new Date(value.day + 'T00:00:00Z').toISOString().slice(0, 10) !== value.day || !isSha(value.base) || !isSha(value.upstreamSha) || !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value.upstreamRef ?? '') || value.upstreamRef.includes('..') || value.upstreamRef.includes('//') || value.upstreamRef.endsWith('/') || value.upstreamRef.split('/').some(part => part.startsWith('.') || part.endsWith('.') || part.endsWith('.lock')) || !/^[a-f0-9]{64}$/.test(value.fingerprint ?? '')) throw Error('invalid selected task identity');
   if (value.kind === 'pr') {
     if (!Number.isSafeInteger(value.number) || value.number < 1 || value.number > 2147483647 || !isSha(value.head) || !/^[A-Za-z0-9-]{1,39}$/.test(value.author ?? '')) throw Error('invalid selected PR');
   } else if (['number', 'head', 'author'].some(key => key in value)) throw Error('unexpected PR fields');
+  if (value.kind === 'harness' ? !/^[a-f0-9]{64}$/.test(value.incident ?? '') : 'incident' in value) throw Error('invalid harness incident');
   return Object.freeze({ ...value });
 }
 export const selectedTask = (env = process.env) => env.PUFFER_MAINT_TASK ? validateTask(JSON.parse(env.PUFFER_MAINT_TASK)) : null;
 export function bindTask(run, task) {
   if (!task) { if (run.taskKind === 'pr') throw Error('trusted PR task required'); return; }
-  if (run.taskKind !== task.kind || run.day !== task.day || run.base !== task.base || run.upstreamSha !== task.upstreamSha || run.upstreamRef !== task.upstreamRef || run.fingerprint !== task.fingerprint || (task.kind === 'pr' && (run.prNumber !== task.number || run.prHead !== task.head || run.prAuthor !== task.author || run.releaseCommit !== task.head))) throw Error('candidate differs from trusted task');
+  if (run.taskKind !== task.kind || run.day !== task.day || run.base !== task.base || run.upstreamSha !== task.upstreamSha || run.upstreamRef !== task.upstreamRef || run.fingerprint !== task.fingerprint || (task.kind === 'pr' && (run.prNumber !== task.number || run.prHead !== task.head || run.prAuthor !== task.author || run.releaseCommit !== task.head)) || (task.kind === 'harness' && run.incident !== task.incident)) throw Error('candidate differs from trusted task');
 }
 export const readJSON = async path => JSON.parse(await readFile(path, 'utf8'));

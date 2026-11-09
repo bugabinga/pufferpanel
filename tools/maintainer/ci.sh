@@ -65,8 +65,8 @@ case "${1:-}" in
     puffer_podman_init "$state"
     printf '%s' "$REGISTRY_PASSWORD" | "${PUFFER_MAINT_PODMAN[@]}" login --username "$REGISTRY_USERNAME" --password-stdin "${registry%%/*}"
     ;;
-  export|import|gate|push|publish|management-check|management|feedback)
+  export|import|gate|push|publish|management-check|management|feedback|deliver)
     node "$module/ci-source.mjs" "$1"
     ;;
-  *) echo 'usage: ci.sh init|prepare|preflight|cleanup|export|import|gate|push|registry-login|publish|management-check|management|feedback' >&2; exit 64;;
+  *) echo 'usage: ci.sh init|prepare|preflight|cleanup|export|import|gate|push|registry-login|publish|management-check|management|feedback|deliver' >&2; exit 64;;
 esac

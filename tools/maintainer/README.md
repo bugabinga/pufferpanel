@@ -124,8 +124,8 @@ Configure two environments, each restricted to deployment branch `trunk`:
 - `honest-annie-release`: secrets `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, scoped to publishing `registry.bugabinga.net/pufferpanel`.
 
 Ordinary source/PR/issue operations and model-free retry use native workflow tokens, not a PAT.
-Optional `ANNIE_GH_TOKEN` belongs only to `honest-annie-release`, exposed solely when a selected management task explicitly approves `enable-issues`.
-Issues remain disabled and trunk remains unprotected unless separately reviewed policy changes say otherwise.
+Optional `ANNIE_GH_TOKEN` belongs only to `honest-annie-release`, exposed solely when a selected management task explicitly approves `enable-issues` and to harness-fix delivery (see Harness self-repair).
+Issues are enabled for incident reports; trunk remains unprotected unless separately reviewed policy changes say otherwise.
 Only the release job requests `contents: write`; repository default workflow permissions can remain read-only.
 Do not enable Actions permission to approve pull requests.
 Required reviewers are intentionally absent for unattended operation; adding an environment approval pauses the corresponding job.
@@ -200,7 +200,8 @@ Required exact JSON fields:
 {"kind":"pr","day":"2026-04-03","repo":"bugabinga/pufferpanel","ref":"refs/heads/trunk","base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","upstreamSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","upstreamRef":"refs/heads/trunk","number":7,"head":"cccccccccccccccccccccccccccccccccccccccc","author":"trusted-author","fingerprint":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
 ```
 
-`kind` is `maintenance`, `pr`, or `management`; non-PR tasks omit `number`, `head`, and `author` entirely.
+`kind` is `maintenance`, `pr`, `management`, or `harness`; non-PR tasks omit `number`, `head`, and `author` entirely.
+Only `harness` tasks carry, and must carry, `incident`: the 64-hex incident fingerprint.
 `day` is a real UTC calendar date; all object IDs are lowercase 40-hex; fingerprint is lowercase 64-hex; PR numbers are positive 32-bit integers.
 Unknown fields, alternate repos/target refs, malformed upstream refs, body data, and snapshot paths are rejected.
 Fingerprint is a trusted opaque admission identity, not a self-authenticating authorization signature.
@@ -425,6 +426,83 @@ A cached re-prime with the visual image took 30 to 44 s, one public route took 2
 A local end-to-end run against this repository rendered `/auth/login`, then after login `/servers` and `/self`, with no console errors, exceptions, or failed requests; only the Gravatar avatar request failed offline.
 Unverified on the hosted runner: Podman 4.9's `COPY --chmod` with a local `--from` image, subordinate-ID mapping for uid 65534, and disk headroom for the extra image of about 1 GB.
 
+## Harness self-repair
+
+Observe derives incidents model-free from evidence it already reads, plus failed jobs of trusted runs within 24h.
+Kinds: `effects-abandoned`, `effects-held`, `observation-blocked`, `run-stuck` (over 6h), `environment-cooldown`, `providers-held` (every known provider), `job-failed`, `sandbox-unavailable`, `visual-unavailable`, `sandbox-cleanup-failed`, and `gate-harness` (actionlint failing on trunk policy).
+Sandbox, visual, cleanup, and gate kinds follow the latest reviewed maintenance or PR report; harness and management runs skip the sandbox by design.
+Normal outcomes are not incidents: review rejections, product gate failures, and model failures all end in the model step, honest no-ops fail nothing, and one held provider while another works is not all providers held.
+The `Annie harness gate (model-free)` job judges a repair candidate, not trunk, so its failures are not incidents.
+Each fingerprint hashes kind and identity: run ID and reason for per-run kinds, masked job and step names or reasons otherwise, never timestamps or counters.
+Checkpoint key `incidents` holds at most 20 strictly validated `{fingerprint, kind, detail, runs, firstSeen, since, lastSeen, count, status}` entries.
+A cleared entry stays seven days so its issue closes idempotently.
+An incident is reported after two observations; a failed job needs two failing runs within 24h.
+
+Job `Annie incidents (model-free)` runs with the native token, `issues: write`, and enablement.
+It creates, updates, reopens after recurrence, or closes once cleared one issue per fingerprint, labelled `annie-incident`.
+It finds issues by a hidden `<!-- annie-incident:FP -->` marker on a bot-authored issue through complete bounded pagination; a foreign issue with the marker is ignored.
+A maintainer closing an ongoing incident is respected until it clears and recurs.
+Bodies hold kind, detail, counts, times, and run links, never raw logs; failed receipts fail the job visibly.
+
+Repairable kinds (`job-failed`, `gate-harness`, sandbox, visual, cleanup, `effects-abandoned`) admit a `harness` task before PRs and maintenance.
+Its fingerprint hashes the incident and the trusted harness policy, so it is admitted once per incident, and merging any harness change permits one more attempt for a recurring incident.
+It needs allowance, unheld providers, no pending effects, and no environment cooldown, has a $5 lease cap, and never holds a calendar image slot.
+Any settled harness outcome except an environment failure is handled.
+Observe then fetches the incident runs' failing jobs and steps plus two job log tails with the read-only token.
+It strips timestamps, redacts every line, bounds the digest to 48 KiB, and passes it as `ANNIE_INCIDENT`.
+The maintain job validates the digest against the task and adds it to the untrusted intake file as `incident`, so model reads are spotlit.
+The executor gets `HARNESS_INSTRUCTIONS`, the harness guard, and no `merge_upstream` or `propose_github`.
+Its prompt asks for a root-cause diagnosis and the smallest fix with tests, and forbids weakening checks, budgets, or security boundaries.
+Harness tasks obey one scope rule, `harnessScopeViolation` in `scope.mjs`, described under Harness PR threat below; it replaces the protected-path check in execute, review, gate, commit, export, import, and delivery.
+The fresh reviewer reads the full diff read-only, because priming product sandbox images cannot run harness tests; `run` and `ui_snapshot` are unavailable, and the harness gate executes the tests.
+`harness-gate.sh WORKTREE RUN_DIR BASE` replaces the product gates for this kind: scope against the explicit base, whitespace, `npm ci --ignore-scripts` and `npm test` in an exported `tools/maintainer`, and `bash -n` on every tracked script.
+The base is explicit because the release-side worktree is detached at the candidate, where `HEAD` is not the base; the scope step must also print its verdict, so a silently skipped check cannot pass.
+It also parses every workflow with the trusted harness's own `yaml` package and runs actionlint v1.7.12 through `go run` with private caches.
+Actionlint needs Go and network, which hosted runners have; without them the gate fails closed.
+Candidate `npm ci` and `npm test` run under `env -i` with only `PATH`, `HOME`, a private `TMPDIR`, and npm cache settings, so provider keys and tokens are not inherited by the harness gate's environment; a test with sentinel values checks that.
+The YAML parser is the trusted checkout's `yaml`, a locked transitive dependency of the pinned pi packages; losing it fails the gate closed.
+One in-run gate repair follows the maintenance rules.
+
+Approved candidates export `harness=true`, never `candidate=true`, so the trunk release job never sees them; `ci.sh push`, `publish`, `registry-login`, and management refuse them.
+Job `Annie harness gate (model-free)` imports the bundle and reruns the harness gate on a fresh runner with `contents: read` and no secrets, because that gate executes candidate code.
+Job `harness-deliver` holds `ANNIE_GH_TOKEN` and runs no candidate code; it is named `Annie effects (model-free)` so the bounded effects retry covers it.
+It checks the bundle by Git plumbing (commit C, parents `[B]`, tree T) and the scope rule before any PAT use, pushes C without force to `annie/harness/` plus the first 12 hex of the task fingerprint, and opens a PR against trunk.
+The same branch only recurs on an effects retry of the same task, which reuses an existing branch or PR and distinguishes open, merged, and closed-unmerged.
+The PR body links the incident with Refs, not Closes, quotes the model's diagnosis as unverified, and lists review findings, changed files, and gates.
+Every outcome is commented on the incident issue: ready for review, ready on the branch but PR creation failed, or could not be delivered with the reason.
+Receipts `harness-branch`, `harness-pr`, and `incident-comment` reach the release report and Actions summary.
+The release report is uploaded only once the outcome is visible as a PR or comment; otherwise the record stays pending for at most three effects attempts and then raises `effects-abandoned`.
+
+Annie never integrates these PRs.
+The controller skips `annie/harness/*` heads, and `checkPR` refuses them and any PR whose files touch `tools/maintainer` or `.github`, before any paid admission.
+That file screen reads one page; a full page of 100 files or a continuation fails closed rather than screening only the first page.
+`verifyPRHistory` still rejects reverted introductions during paid preparation; that refusal alone ran after admission, so it never covered this before pay.
+`ANNIE_GH_TOKEN` must be a fine-grained PAT for `bugabinga/pufferpanel` only, with Contents, Pull requests, Workflows, and Issues read/write.
+The native token cannot push workflow changes or create PRs under current repository settings.
+Missing or insufficient permissions show as failed receipts and an incident comment, never a silent drop.
+PAT pushes and PRs do trigger workflows: `annie-pr-wake.yml` stays secretless, the main workflow observes the wake and never admits the PR, and the other PR workflows target `v3`.
+
+### Harness PR threat
+
+The harness PR comes from a same-repository branch, so GitHub runs `pull_request` workflows from the PR's own workflow definitions, with a `GITHUB_TOKEN` and without Oliver's review.
+The repository's Actions default token permission is read, but a workflow's `permissions:` key overrides it, for example to `contents: write`.
+Trunk is deliberately unprotected, so such a token could push to trunk before Oliver sees the PR.
+Repository-level secrets stay empty and both environments deploy from trunk only; keep it so, but that limits secrets, not the token.
+The rule: a harness candidate may change only `tools/maintainer/**` and `.github/workflows/honest-annie.yml`.
+Every other `.github` change is refused: other workflows edited, added, or removed (including upstream `arch.yml`, `build.yml`, `formatter.yml`, `run-template-tester.yml`, `tester.yml`, and `annie-pr-wake.yml`), `actionlint.yaml`, issue templates, and anything else.
+In `honest-annie.yml`, the parsed top-level `on:` must deeply equal the base's, and the top-level key set must not change, because YAML 1.1 parsers read `true:` or `yes:` as `on`.
+Adding, deleting, or breaking the YAML of `honest-annie.yml` is refused too.
+With triggers frozen, the branch's `honest-annie.yml` never runs: its `push` trigger names trunk only, and `workflow_run`, `issues`, `schedule`, and `workflow_dispatch` run trunk's definition.
+Enforcement uses the same function at five layers: the executor guard refuses writes outside the allowed paths, and the maintain snapshot, the harness gate, CI import, and delivery (before any PAT use) apply the whole rule.
+
+### Harness risks
+
+The harness gate's candidate `npm ci` and `npm test` run natively as the runner user, not in the network-less Podman sandbox the product gate uses; that is a weaker posture and a known, accepted residual.
+On the maintain side they share the model job's runner with its credentials; `env -i` keeps those out of their environment, but same-user processes can still read ancestor environments through `/proc`, as for model shells.
+On the release side they run in a separate job with no secrets and a read-only token.
+Annie cannot report or repair a harness that cannot observe, such as `check` or observe failing on every run.
+A crashed observe run without a checkpoint also holds the full allowance for a day, so its repair waits.
+
 ## Trust and tests
 
 The executor uses an operator-trusted local shell with the operator's OS permissions.
@@ -437,8 +515,8 @@ Before a `bash` call it rejects, with a corrective reason, quote-aware command s
 Known gaps include variables, aliases, generated scripts, interpreters such as `python -c`, `cd` before relative redirects, redirects to quoted paths with spaces, unlisted option-argument pairs before a subcommand, and copy commands; the post-hoc checks still catch their source effects.
 A push those gaps let through has no post-hoc undo; the model shell's credential-free environment is the backstop there.
 The shell gate in `gate.sh` keeps its own literal copy of the protected list.
-PR tasks have no executor conversation; maintenance, management, and gate-repair executor turns all select the guard.
-A later harness-repair task kind would install another guard name with `protectedPaths: []`; confinement and `.git` protection stay.
+PR tasks have no executor conversation; maintenance, management, harness, and gate-repair executor turns all select a guard.
+Harness tasks install `pufferpanel-harness-guard` with `protectedPaths: []`; confinement, `.git` protection, and every command block stay.
 Results of reviewer `run`, `ui_snapshot`, `read_github_plans`, executor reads outside the worktree (intake, private gate log), and executor `bash` that fetches, reads the intake, or names `upstream` are wrapped in `<untrusted id=…>` … `</untrusted id=…>` with a random per-process id.
 Look-alike markers inside are escaped, so content cannot close the block; JSON stays parseable because only non-token strings are wrapped in place.
 Scripts receive the wrapping in the `output` field or string value they would print; exit codes and other structured fields are unchanged.

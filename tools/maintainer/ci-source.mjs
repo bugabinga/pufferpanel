@@ -9,6 +9,9 @@ import { git, ancestor, verifyPRHistory, checkPR, checkBranchPolicy, githubRead,
 import { reportFor } from './report.mjs';
 import { reviewFeedback } from './feedback.mjs';
 import { validatePlan, executePlan } from './management.mjs';
+import { deliverHarness } from './incident.mjs';
+import { harnessScope } from './scope.mjs';
+import { GitHub } from './controller.mjs';
 const execFile = promisify(callback);
 const here = dirname(fileURLToPath(import.meta.url));
 export async function metadata(artifact, task, githubSha) {
@@ -31,7 +34,8 @@ export async function metadata(artifact, task, githubSha) {
 export async function verifyCandidate(worktree, run, task) {
   const parents = (await git(worktree, 'show', '-s', '--format=%P', run.commit)).split(' ').filter(Boolean);
   if (parents.length !== run.expectedParents.length || parents.some((p, i) => p !== run.expectedParents[i]) || await git(worktree, 'rev-parse', 'HEAD') !== run.commit || await git(worktree, 'rev-parse', 'HEAD^{tree}') !== run.tree || await git(worktree, 'status', '--porcelain')) throw Error('candidate identity mismatch');
-  if (await git(worktree, 'diff', '--name-only', run.base, run.commit, '--', ...PROTECTED_PATHS)) throw Error('candidate changed trusted harness or CI');
+  if (run.taskKind === 'harness') { const reason = await harnessScope(worktree, run.base, run.commit); if (reason) throw Error(reason); }
+  else if (await git(worktree, 'diff', '--name-only', run.base, run.commit, '--', ...PROTECTED_PATHS)) throw Error('candidate changed trusted harness or CI');
   if (run.taskKind === 'pr') await verifyPRHistory(worktree, task, run.tree);
 }
 export function allowedOld(cwd, run, old) {
@@ -66,6 +70,7 @@ export async function pushSource(source, run, task, { fetchImpl = fetch, beforeP
 export async function ciSource(command, env = process.env) {
   const source = resolve(env.PUFFER_MAINT_SOURCE), state = resolve(env.PUFFER_MAINT_STATE), artifact = resolve(env.HONEST_ANNIE_ARTIFACT);
   const task = selectedTask(env);
+  if (env.GITHUB_ACTIONS === 'true' && command === 'deliver' && (env.HONEST_ANNIE_ENABLED !== 'true' || !task)) throw Error('trusted effects disabled or task missing');
   if (env.GITHUB_ACTIONS === 'true' && ['push', 'management', 'feedback', 'authorize-publication', 'publish'].includes(command)) {
     if (env.HONEST_ANNIE_ENABLED !== 'true' || !task) throw Error('trusted effects disabled or task missing');
     const options = { token: env.GH_TOKEN };
@@ -105,7 +110,21 @@ export async function ciSource(command, env = process.env) {
     }
   }
   const run = await metadata(artifact, task, env.GITHUB_SHA);
-  const runDir = join(state, 'runs', run.day), worktree = join(state, 'worktree');
+  const runDir = join(state, 'runs', run.day), worktree = join(state, 'worktree'), harness = run.taskKind === 'harness';
+  // Harness candidates leave only as a PR from their own branch: never trunk, registry, or management effects.
+  if (harness && ['push', 'publish', 'authorize-publication', 'management', 'management-check', 'feedback'].includes(command)) throw Error('harness candidates are delivered only as a PR, never pushed to trunk or published');
+  if (command === 'deliver') {
+    if (!harness || run.phase !== 'publishing') throw Error('harness delivery requires an approved harness candidate');
+    const result = await deliverHarness({ source, bundle: join(artifact, 'candidate.bundle'), run, task, gate: env.ANNIE_HARNESS_GATE, native: new GitHub(env.GH_TOKEN), pat: new GitHub(env.ANNIE_GH_TOKEN), hasPat: Boolean(env.ANNIE_GH_TOKEN) });
+    await mkdir(runDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(runDir, 'action-receipts.json'), JSON.stringify(result.receipts), { mode: 0o600 });
+    const line = `harness delivery ${result.delivered ? 'done' : 'FAILED'} for branch ${result.branch}: ${result.message ?? 'unknown'}`.replace(/[^A-Za-z0-9 :;,.()#/_-]/g, '_').slice(0, 500);
+    console.error(line);
+    if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `\n${line}\n`, { flag: 'a' });
+    // Exit 0 only once the outcome is visible as a PR or an incident comment; otherwise the effects retry tries again.
+    if (!result.communicated) throw Error('harness delivery outcome not communicated');
+    return;
+  }
   const gateReceipt = async path => { if ((await readFile(path, 'utf8')).trim() !== run.tree) throw Error('clean, gated candidate required'); };
   if (command === 'export') {
     if (run.managementApproved) {
@@ -119,7 +138,8 @@ export async function ciSource(command, env = process.env) {
       if (task?.kind === 'pr') { await git(worktree, 'update-ref', 'refs/maintainer/pr-head', task.head); refs.push('refs/maintainer/pr-head'); }
       await git(worktree, 'bundle', 'create', join(artifact, 'candidate.bundle'), ...refs, `^${run.base}`);
     }
-    await writeFile(env.GITHUB_OUTPUT, `candidate=${run.phase === 'publishing'}\n${task ? `sourcecandidate=${run.phase === 'publishing'}\nmanagement=${Boolean(run.managementApproved)}\n` : ''}`, { flag: 'a' }); return;
+    const sourceCandidate = run.phase === 'publishing' && !harness;
+    await writeFile(env.GITHUB_OUTPUT, `candidate=${sourceCandidate}\n${task ? `sourcecandidate=${sourceCandidate}\nmanagement=${Boolean(run.managementApproved)}\nharness=${harness && run.phase === 'publishing'}\n` : ''}`, { flag: 'a' }); return;
   }
   if (command === 'management-check') {
     if (!run.managementApproved) throw Error('no approved management artifact');
@@ -161,7 +181,7 @@ export async function ciSource(command, env = process.env) {
     await rm(join(runDir, 'gate.ok'), { force: true }); return;
   }
   await verifyCandidate(worktree, run, task); await gateReceipt(join(artifact, 'gate.ok'));
-  if (command === 'gate') { await execFile('bash', [join(here, 'gate.sh'), worktree, runDir], { env: { ...env, TMPDIR: tmpdir() } }); return; }
+  if (command === 'gate') { await execFile('bash', [join(here, harness ? 'harness-gate.sh' : 'gate.sh'), worktree, runDir, ...(harness ? [run.base] : [])], { env: { ...env, TMPDIR: tmpdir() } }); return; }
   try { await gateReceipt(join(runDir, 'gate.ok')); } catch { throw Error('independent release gate required'); }
   if (command === 'push') {
     const proof = await pushSource(source, run, task);

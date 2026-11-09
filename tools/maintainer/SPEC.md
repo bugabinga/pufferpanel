@@ -13,7 +13,7 @@ Recheck author permission, PR head, target, checks, and applicable repository ru
 Never force-push, bypass protections, silently replace reviewed source, or automatically integrate changes to the trusted maintainer harness or GitHub workflow policy.
 Do not change repository visibility, delete the repository, expose credentials, or perform production administration.
 Normal GitHub access uses the short-lived workflow token.
-Optional ANNIE_GH_TOKEN belongs only to trusted release/management steps; model tools never receive it.
+Optional ANNIE_GH_TOKEN belongs only to trusted release/management and harness-delivery steps; model tools and candidate code never receive it.
 Repository-administration capability is not permission to perform arbitrary destructive actions.
 
 ## Work and triggers
@@ -101,6 +101,22 @@ Prefer an honest no-op over speculative changes or decorative activity.
 Use Annie's concise, cheerful maintainer voice in summaries while keeping failures and consequences unmistakable.
 Never describe a no-op as a source or image publication.
 
+## Harness self-repair
+
+When Annie's own machinery fails, she reports it and, where she can, proposes a reviewed fix that only Oliver merges.
+Observe derives incidents model-free from trusted evidence it already holds and failed jobs of trusted runs within 24h; review rejections, product gate failures, model failures, honest no-ops, and a quota hold while another provider works are not incidents.
+Incident fingerprints cover kind and identity, never timestamps; the checkpoint deduplicates at most 20 strictly validated entries.
+After two observations, a model-free job with the native token and `issues: write` keeps one `annie-incident` issue per fingerprint by hidden marker and complete bounded lookup, with sanitized facts only, and closes it once the incident clears.
+A repairable incident admits a `harness` task at most once per incident and trusted policy, within allowance and providers, under a $5 cap and without a calendar slot.
+Its executor sees a bounded redacted incident digest as untrusted spotlit data and must never weaken checks, budgets, or security boundaries.
+A harness PR's own `pull_request` workflows run with a token whose read-only default a `permissions:` key overrides, and trunk is unprotected.
+So a candidate may change only `tools/maintainer/**` and `.github/workflows/honest-annie.yml`, whose top-level `on:` and key set stay deeply equal to the base's; every other `.github` change is refused.
+One shared function enforces that rule at the executor guard (paths), the maintain snapshot, the harness gate, CI import, and delivery before any PAT use.
+A fresh independent reviewer reads the full diff read-only; the fixed harness gate (npm ci, npm test, bash -n, workflow YAML parse, actionlint) replaces the product gates, with at most one in-run repair.
+The harness gate reruns on a fresh credential-free runner; a separate model-free step that never executes candidate code verifies the bundle, pushes it to `annie/harness/<fingerprint>`, and opens a PR against trunk with `ANNIE_GH_TOKEN`.
+Harness candidates never reach trunk, the registry, or management, and every delivery outcome is a receipt plus an incident comment, never a silent drop.
+Annie never admits, reviews for integration, or integrates `annie/harness/*` PRs or any PR touching protected paths, and refuses them before paid admission.
+
 ## Selected-task integration interface
 
 `PUFFER_MAINT_TASK` is strict trusted JSON selected before model execution and delivered unchanged to the release/management job.
@@ -172,6 +188,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 
 Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection from Pi defaults and `enabledModels`, cross-run provider holds, the forwarded provider env list against pi-ai's mapping, and in-lease provider failover.
 Shell and workflow validation pass.
+Offline tests cover incident detection and dedupe, idempotent incident issues against a fake GitHub, harness task schema and caps, guard selection, the harness gate runner, a faux harness run through export, PR delivery success and failures, and self-integration refusals.
 Fake-Podman tests cover reviewer sandbox flags, environment, freezing, output capping, timeout/abort cleanup, and the per-review time budget.
 Fake-Podman tests cover `ui_snapshot` isolation flags, priming decisions, caps, budget sharing, the skipped and unavailable paths, and the result schema; a faux review shows a screenshot to the model with `image()`.
 A real isolated short-runroot container preflight succeeds without changing host configuration.

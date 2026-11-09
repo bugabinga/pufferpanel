@@ -47,7 +47,7 @@ jobs:
       - name: Offline tests, no observations or credentials
         run: |
           npm test
-          bash -n ci.sh gate.sh publish.sh run.sh podman.sh sandbox.sh
+          bash -n ci.sh gate.sh harness-gate.sh publish.sh run.sh podman.sh sandbox.sh
         working-directory: tools/maintainer
 
   observe:
@@ -71,6 +71,8 @@ jobs:
       retry: ${{ steps.observe.outputs.retry }}
       republish: ${{ steps.observe.outputs.republish }}
       holds: ${{ steps.observe.outputs.holds }}
+      incident: ${{ steps.observe.outputs.incident }}
+      incidents: ${{ steps.observe.outputs.incidents }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,10 +127,13 @@ jobs:
       candidate: ${{ steps.candidate.outputs.candidate }}
       management: ${{ steps.candidate.outputs.management }}
       feedback: ${{ steps.candidate.outputs.feedback }}
+      harness: ${{ steps.candidate.outputs.harness }}
     env:
       PUFFER_MAINT_DEFER_PUBLISH: '1'
       PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
       ANNIE_PROVIDER_HOLDS: ${{ needs.observe.outputs.holds }}
+      # Sanitized incident digest for a harness repair task; untrusted data that reaches the model only via the intake file.
+      ANNIE_INCIDENT: ${{ needs.observe.outputs.incident }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -278,7 +283,7 @@ jobs:
         if: always()
         run: bash tools/maintainer/ci.sh export
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && (steps.candidate.outputs.candidate == 'true' || steps.candidate.outputs.management == 'true' || steps.candidate.outputs.feedback == 'true')
+        if: always() && (steps.candidate.outputs.candidate == 'true' || steps.candidate.outputs.management == 'true' || steps.candidate.outputs.feedback == 'true' || steps.candidate.outputs.harness == 'true')
         with:
           name: honest-annie-candidate-${{ github.run_id }}-1
           path: ${{ env.HONEST_ANNIE_ARTIFACT }}
@@ -485,6 +490,129 @@ jobs:
           HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
           ANNIE_RETRY: ${{ needs.observe.outputs.retry }}
         run: node tools/maintainer/controller.mjs retry
+
+  # Model-free incident issues: native token, issues: write only, trusted trunk harness, observe output as sole input.
+  incidents:
+    name: Annie incidents (model-free)
+    needs: observe
+    if: >-
+      github.repository == 'bugabinga/pufferpanel' && github.ref == 'refs/heads/trunk' &&
+      vars.HONEST_ANNIE_ENABLED == 'true' && needs.observe.outputs.incidents != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - name: Create, update, reopen, or close one incident issue per fingerprint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
+          ANNIE_INCIDENTS: ${{ needs.observe.outputs.incidents }}
+        run: node tools/maintainer/controller.mjs incidents
+
+  # Harness self-repair candidates run their own tests here, on a fresh runner with no secrets and a read-only token,
+  # never in the job that holds ANNIE_GH_TOKEN.
+  harness-gate:
+    name: Annie harness gate (model-free)
+    needs: [observe, maintain]
+    if: vars.HONEST_ANNIE_ENABLED == 'true' && needs.maintain.outputs.harness == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
+      HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(needs.observe.outputs.task).base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck effects enablement
+        run: test "$HONEST_ANNIE_ENABLED" = true
+      - run: bash tools/maintainer/ci.sh init
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: honest-annie-candidate-${{ github.run_id }}-1
+          path: ${{ env.HONEST_ANNIE_ARTIFACT }}
+      - name: Verify harness candidate identity, harness-only paths, and gate receipt
+        run: bash tools/maintainer/ci.sh import
+      - name: Independently rerun the harness gate without credentials
+        run: bash tools/maintainer/ci.sh gate
+
+  # Delivery as a PR for Oliver: plumbing-only bundle checks, never trunk, never candidate code, never a merge.
+  # Same display name as release on purpose: the effects retry keys on it, and at most one of the two runs per task.
+  harness-deliver:
+    name: Annie effects (model-free)
+    needs: [observe, maintain, harness-gate]
+    if: >-
+      always() && vars.HONEST_ANNIE_ENABLED == 'true' && needs.maintain.outputs.harness == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: honest-annie-release
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    env:
+      PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
+      HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(needs.observe.outputs.task).base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck effects enablement
+        run: test "$HONEST_ANNIE_ENABLED" = true
+      - run: bash tools/maintainer/ci.sh init
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: honest-annie-candidate-${{ github.run_id }}-1
+          path: ${{ env.HONEST_ANNIE_ARTIFACT }}
+      - name: Push the reviewed fix to annie/harness/FP and open a PR for Oliver, never trunk
+        id: deliver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANNIE_GH_TOKEN: ${{ secrets.ANNIE_GH_TOKEN }}
+          ANNIE_HARNESS_GATE: ${{ needs.harness-gate.result }}
+        run: bash tools/maintainer/ci.sh deliver
+      # A report marks the record terminal, so it exists only once the outcome is visible as a PR or incident comment;
+      # otherwise the record stays pending for the bounded effects retry and then becomes an abandoned-effects incident.
+      - name: Collect sanitized harness delivery report and receipts
+        id: collect
+        if: always() && steps.deliver.outcome == 'success'
+        run: |
+          day=$(node -p 'JSON.parse(process.env.PUFFER_MAINT_TASK).day')
+          node tools/maintainer/report.mjs collect --report "$HONEST_ANNIE_ARTIFACT/result.json" --reportdir "$RUNNER_TEMP/honest-annie-report" --action-receipts "$PUFFER_MAINT_STATE/runs/$day/action-receipts.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.collect.outcome == 'success'
+        with:
+          name: honest-annie-release-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/honest-annie-report/report.json
+          if-no-files-found: error
+          retention-days: 14
 
   republish:
     name: Annie republish (model-free)

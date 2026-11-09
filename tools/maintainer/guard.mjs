@@ -13,6 +13,9 @@ import { PROTECTED_PATHS } from './task.mjs';
 const GIT_METADATA = '.git';
 const under = (rel, prefix) => rel === prefix || rel.startsWith(`${prefix}/`);
 const inside = rel => rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+// Harness repairs: an allow-list instead; anything else under .github could run on the PR with a write token.
+const scopeReason = (allowed, path) => `${path} is outside the harness repair scope: change only ${allowed.map(prefix => prefix.endsWith('.yml') ? prefix : `${prefix}/**`).join(' and ')}; other .github files can run with write tokens on the PR`;
+const outsideScope = (rel, allowed) => allowed && !allowed.some(prefix => under(rel, prefix));
 const protectedReason = (hit, path) => hit === GIT_METADATA ? `${path} is Git metadata; the host manages .git, leave it unchanged` : `${path} is in ${hit}, the host-trusted harness/CI policy; leave it unchanged and report needed changes as blockers`;
 // The path forms the durable write/edit tools accept: '@' prefix, Unicode spaces, '~', and file:// URLs.
 const toolPath = path => {
@@ -22,7 +25,7 @@ const toolPath = path => {
 };
 
 // Canonical absolute write target inside the worktree; throws a corrective reason otherwise.
-export async function confinePath(worktree, path, protectedPaths = PROTECTED_PATHS) {
+export async function confinePath(worktree, path, protectedPaths = PROTECTED_PATHS, allowedPaths = null) {
   if (typeof path !== 'string' || !path) throw Error('a file path is required');
   const root = await realpath(worktree), lexical = resolve(worktree, toolPath(path)), rest = [];
   let existing = lexical;
@@ -38,6 +41,7 @@ export async function confinePath(worktree, path, protectedPaths = PROTECTED_PAT
   if (!inside(rel)) throw Error([relative(root, lexical), relative(resolve(worktree), lexical)].some(inside) ? `${path} resolves through a symlink outside the maintenance worktree; write only real paths inside it` : `${path} is outside the maintenance worktree; write only inside it, with paths relative to it`);
   const hit = [GIT_METADATA, ...protectedPaths].find(prefix => under(rel, prefix));
   if (hit) throw Error(protectedReason(hit, path));
+  if (outsideScope(rel, allowedPaths)) throw Error(scopeReason(allowedPaths, path));
   return canonical;
 }
 
@@ -78,13 +82,13 @@ function gitReason(sub, rest) {
   return null;
 }
 // Corrective reason for a bash command that would bypass host authority, or null.
-export function classifyCommand(command, { worktree = '/', protectedPaths = PROTECTED_PATHS } = {}) {
+export function classifyCommand(command, { worktree = '/', protectedPaths = PROTECTED_PATHS, allowedPaths = null } = {}) {
   let view; try { view = shellView(command); } catch (error) { return error.message; }
   const { commands, texts } = view;
   const protectedTarget = target => {
     const rel = relative(resolve(worktree), resolve(worktree, target.replace(/^\$\{?PWD\}?\//, '')));
     const hit = [GIT_METADATA, ...protectedPaths].find(prefix => under(rel, prefix));
-    return hit ? `shell write to ${protectedReason(hit, target)}` : null;
+    return hit ? `shell write to ${protectedReason(hit, target)}` : inside(rel) && outsideScope(rel, allowedPaths) ? `shell write to ${scopeReason(allowedPaths, target)}` : null;
   };
   for (const start of commands) {
     const git = GIT.exec(start);
@@ -135,10 +139,10 @@ export function spotlightResult(id, result) {
   };
 }
 
-// One extension per variant: a harness-repair task would select another name with `protectedPaths: []`.
-export function createGuard({ worktree, name = 'pufferpanel-guard', protectedPaths = PROTECTED_PATHS, id = randomBytes(16).toString('hex') }) {
+// One extension per variant: harness repair selects another name with `protectedPaths: []` and an `allowedPaths` allow-list.
+export function createGuard({ worktree, name = 'pufferpanel-guard', protectedPaths = PROTECTED_PATHS, allowedPaths = null, id = randomBytes(16).toString('hex') }) {
   if (!worktree) throw Error('guard worktree is required');
-  const paths = Object.freeze([...protectedPaths]);
+  const paths = Object.freeze([...protectedPaths]), allowed = allowedPaths && Object.freeze([...allowedPaths]);
   const untrusted = async call => {
     if (['run', 'ui_snapshot', 'read_github_plans'].includes(call.name)) return true;
     if (call.name === 'bash') return fetchesRemote(String(call.arguments?.command ?? ''));
@@ -149,9 +153,9 @@ export function createGuard({ worktree, name = 'pufferpanel-guard', protectedPat
   return defineExtension({ name, hooks: [hook(ToolTask, {
     // Fires for model-issued and nested (codemode script) calls; a throw blocks with its message.
     beforeTool: async call => {
-      if (['write', 'edit'].includes(call.name)) return { arguments: { ...call.arguments, path: await confinePath(worktree, call.arguments?.path, paths) } };
+      if (['write', 'edit'].includes(call.name)) return { arguments: { ...call.arguments, path: await confinePath(worktree, call.arguments?.path, paths, allowed) } };
       if (call.name !== 'bash') return undefined;
-      const reason = classifyCommand(String(call.arguments?.command ?? ''), { worktree, protectedPaths: paths });
+      const reason = classifyCommand(String(call.arguments?.command ?? ''), { worktree, protectedPaths: paths, allowedPaths: allowed });
       return reason ? { block: reason } : undefined;
     },
     afterTool: async (call, result) => await untrusted(call) ? spotlightResult(id, result) : undefined,

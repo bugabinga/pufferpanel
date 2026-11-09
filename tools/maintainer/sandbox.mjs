@@ -178,7 +178,7 @@ export function createReviewSandbox({ state, env = process.env, script = join(he
       // Unavailable priming leaves `run` rejecting with the reason; the review itself stays read-only capable.
       // Priming may use only what the review window and the fixed gate after it (16 minutes warm locally, slower on hosted runners) leave of the deadline.
       const seconds = Math.floor(Math.min(limits.primeMs, deadline - Date.now() - limits.reviewMs - limits.gateReserveMs) / 1000);
-      if (!sourceChanged) current.unavailable = 'management-only candidate has no source change to run';
+      if (!sourceChanged) current.unavailable = 'candidate has no product source change to run';
       else if (!env.PUFFER_MAINT_RUNROOT) current.unavailable = 'no pinned Podman runroot';
       else if (seconds < 60) current.unavailable = 'insufficient time before the run deadline';
       // The version is recorded even when priming fails, so a failed live run still says which Podman it met.

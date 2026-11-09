@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { controller, digest, retryEffects, verifyUploadedLease, POLICY_PATH } from './controller.mjs';
+import { controller, digest, harnessFingerprint, retryEffects, verifyUploadedLease, POLICY_PATH } from './controller.mjs';
 const OWN = 'bugabinga/pufferpanel', now = Date.parse('2026-04-03T04:17:00Z'), base = 'a'.repeat(40), U = 'b'.repeat(40), tree = { tree: [{ path: '.github', sha: 'c'.repeat(40) }, { path: 'tools', sha: 'd'.repeat(40) }] };
 const response = body => new Response(JSON.stringify(body));
 function zip(value, name) {
@@ -17,7 +17,7 @@ async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'annie-flow-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const env = { ANNIE_MODE: 'maintain', GITHUB_REPOSITORY: OWN, GITHUB_REF: 'refs/heads/trunk', GITHUB_SHA: base, GITHUB_REPOSITORY_ID: '7', GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_NAME: 'schedule', GITHUB_EVENT_PATH: join(dir, 'event.json'), ANNIE_OUTPUT_DIR: dir, ANNIE_BOOTSTRAP: '42', HONEST_ANNIE_ENABLED: 'true', GH_TOKEN: 'readonly-sentinel' };
   await writeFile(env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '17 4 * * *' }));
-  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], jobsByAttempt = new Map();
+  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], jobsByAttempt = new Map();
   let clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
   const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(clock).toISOString(), updated_at: new Date(clock).toISOString() });
   const fetchImpl = async (url, options = {}) => {
@@ -40,6 +40,7 @@ async function fixture(t) {
     if (path.includes('/git/trees/')) return response(path.endsWith(`/${changedPolicy}`) ? { tree: [{ path: '.github', sha: '1'.repeat(40) }, tree.tree[1]] } : tree);
     if (path.includes('/git/ref/heads/')) return response({ object: { sha: U } });
     if (path.endsWith('/pulls')) return response(prs);
+    if (/\/pulls\/\d+\/files$/.test(path)) return response(files);
     if (/\/pulls\/\d+$/.test(path)) return response(prs.find(pr => path.endsWith(`/${pr.number}`)));
     if (path.endsWith('/permission')) return response({ permission: role });
     if (path.endsWith('/status')) return response({ statuses: [], total_count: 0 });
@@ -56,7 +57,7 @@ async function fixture(t) {
   }
   const execute = async changes => controller({ env: { ...env, ...changes }, fetchImpl, now: clock, delays: [] });
   const json = async name => JSON.parse(await readFile(join(dir, name), 'utf8'));
-  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, prs, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
+  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, prs, files, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
 }
 test('faux controller: cheap observe has no lease/registry/retry; maintain wires exact B/U task and creation-deadline lease', async t => {
   const f = await fixture(t);
@@ -99,7 +100,7 @@ test('healthy CP → offline check without artifacts → maintain retains allowa
 });
 test('pre-dispatch failure frees flight/calendar, shared environment cooldown stops another PR', async t => {
   const f = await fixture(t);
-  for (const number of [7, 8]) f.prs.push({ number, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: String(number).repeat(40) }, base: { ref: 'trunk', repo: { full_name: OWN } } });
+  for (const number of [7, 8]) f.prs.push({ number, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: String(number).repeat(40), ref: 'feature' }, base: { ref: 'trunk', repo: { full_name: OWN } } });
   await f.execute(); const cp = await f.json('checkpoint.json');
   assert.deepEqual(cp.handled, []); assert.equal(cp.flights.length, 1);
   f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', cp);
@@ -168,7 +169,7 @@ test('release fallback leaves unknown completion pending; expired day14 receipt 
 });
 test('missing model settlement permits only proven exported candidate effects retry; latest check-only attempt discovers prior effects failure', async t => {
   const f = await fixture(t);
-  f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: 'f'.repeat(40) }, base: { ref: 'trunk', repo: { full_name: OWN } } });
+  f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: 'f'.repeat(40), ref: 'feature' }, base: { ref: 'trunk', repo: { full_name: OWN } } });
   await f.execute(); const lease = await f.json('lease.json');
   f.runs.push({ ...f.run(42), run_attempt: 2 }); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', await f.json('checkpoint.json')); f.artifact(42, 'annie-lease-42-1', 'lease.json', lease);
   f.artifact(42, 'honest-annie-candidate-42-1', 'do-not-download', {});
@@ -222,7 +223,7 @@ test('half-hour native discovery prioritizes exact trusted ready PR B/H/U; forei
   for (const role of ['write', 'read']) {
     const f = await fixture(t); f.setRole(role);
     await writeFile(f.env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '7,37 * * * *' }));
-    f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: 'f'.repeat(40) }, base: { ref: 'trunk', repo: { full_name: OWN } } });
+    f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: 'f'.repeat(40), ref: 'feature' }, base: { ref: 'trunk', repo: { full_name: OWN } } });
     const result = await f.execute(); assert.equal(result.paid, role === 'write');
     if (result.paid) {
       const lease = await f.json('lease.json'); assert.equal(lease.task.kind, 'pr'); assert.equal(lease.task.number, 7); assert.equal(lease.task.head, 'f'.repeat(40)); assert.equal(lease.task.base, base); assert.equal(lease.task.upstreamSha, U);
@@ -306,7 +307,7 @@ test('unpersisted PR compatibility compare: behind/diverged supersede, ahead/ide
   const F = 'f'.repeat(40), C = 'c'.repeat(40), moved = '9'.repeat(40);
   for (const [sinceBase, untilHead, expected] of [['ahead', 'ahead', 'pending'], ['ahead', 'identical', 'pending'], ['behind', 'ahead', 'superseded'], ['ahead', 'behind', 'superseded'], ['ahead', 'diverged', 'superseded'], ['ahead', 'mystery', 'pending'], ['ahead', 500, 'pending']]) {
     const f = await fixture(t), label = `${sinceBase}/${untilHead}`;
-    f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: F }, base: { ref: 'trunk', repo: { full_name: OWN } } });
+    f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: F, ref: 'feature' }, base: { ref: 'trunk', repo: { full_name: OWN } } });
     const lease = await approved(f, { settlement: { taskKind: 'pr', commit: C, releaseCommit: F } });
     assert.equal(lease.task.kind, 'pr');
     f.setHead(moved);
@@ -383,4 +384,43 @@ test('provider holds expire, the next provider still runs, and malformed provide
   f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', { ...cp, paid: false, flights: [] });
   f.setClock(now + 5 * 3600000 + 60000); f.setCurrent(44);
   const expired = await f.execute(); assert.deepEqual(expired.providerHolds, []); assert.equal(expired.holdsExpireAt, null);
+});
+
+test('incidents: failed effects jobs dedupe across observes, then admit one $5 harness repair without a calendar slot, once per incident and policy', async t => {
+  const f = await fixture(t), outputPath = join(f.dir, 'outputs'), outputs = async () => Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+  await f.execute({ ANNIE_MODE: 'observe' }); const first = await f.json('checkpoint.json');
+  // Two earlier runs whose model-free effects failed at the same step; their checkpoints prove no paid work was pending.
+  for (const id of [40, 41]) { f.runs.push({ ...f.run(id), conclusion: 'failure' }); f.artifact(id, `annie-checkpoint-${id}-1`, 'checkpoint.json', { ...first, runId: id }); }
+  f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', first);
+  f.jobs.push({ id: 9, name: 'Annie effects (model-free)', conclusion: 'failure', steps: [{ name: 'Persist source before registry auth', conclusion: 'failure' }] });
+  f.setCurrent(43); const seen = await f.execute({ ANNIE_MODE: 'observe' });
+  assert.deepEqual(seen.incidents.map(({ kind, count, status, ready }) => ({ kind, count, status, ready })), [{ kind: 'job-failed', count: 1, status: 'open', ready: false }]);
+  const second = await f.json('checkpoint.json'); assert.deepEqual(second.incidents[0].runs, [41, 40]);
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', second);
+  f.setCurrent(44); await writeFile(outputPath, '');
+  const admitted = await f.execute({ GITHUB_OUTPUT: outputPath });
+  assert.equal(admitted.state, 'admitted'); assert.equal(admitted.incidents[0].count, 2); assert.equal(admitted.incidents[0].ready, true);
+  const lease = await f.json('lease.json'), third = await f.json('checkpoint.json'), incident = third.incidents[0].fingerprint;
+  assert.equal(lease.task.kind, 'harness'); assert.equal(lease.task.incident, incident); assert.equal(lease.cap, 5); assert.deepEqual(third.slots, []);
+  assert.equal(lease.task.fingerprint, harnessFingerprint(incident, digest(JSON.stringify({ github: 'c'.repeat(40), maintainer: 'e'.repeat(40) }))));
+  assert.deepEqual(admitted.harnessRepair, { incident, kind: 'job-failed' });
+  const written = await outputs(), digestOut = JSON.parse(written.incident);
+  assert.equal(digestOut.incident, incident); assert.equal(digestOut.runs[0].jobs[0].name, 'Annie effects (model-free)'); assert.match(digestOut.runs[0].jobs[0].log, /^log unavailable/);
+  assert.equal(JSON.parse(written.incidents)[0].fingerprint, incident);
+  assert.doesNotMatch(JSON.stringify(third), /readonly-sentinel/);
+  // The settled repair (any terminal outcome) is handled; the next daily round buys ordinary maintenance instead.
+  f.runs.push(f.run(44)); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', third); f.artifact(44, 'annie-lease-44-1', 'lease.json', lease);
+  f.artifact(44, 'honest-annie-model-report-44-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: 'harness', incident, day: lease.task.day, base, managementApproved: false, commit: null, releaseCommit: null, phase: 'rejected', reason: 'review-rejected', usageComplete: true, reportedUsage: { status: 'known', cost: 1 } });
+  f.setCurrent(45); const next = await f.execute();
+  assert.equal(next.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'maintenance'); assert.equal(next.allowance, 14);
+  assert.ok((await f.json('checkpoint.json')).handled.includes(lease.task.fingerprint));
+});
+test('never self-integrate: harness repair branches and protected-path PRs are refused before any paid admission', async t => {
+  const f = await fixture(t);
+  f.prs.push({ number: 7, state: 'open', draft: false, user: { login: 'trusted', type: 'User' }, head: { sha: 'f'.repeat(40), ref: 'annie/harness/abcdef012345' }, base: { ref: 'trunk', repo: { full_name: OWN } } });
+  let result = await f.execute(); assert.equal(result.readyPRs, 0); assert.notEqual((await f.json('lease.json')).task.kind, 'pr');
+  f.prs[0] = { ...f.prs[0], head: { sha: 'f'.repeat(40), ref: 'feature' } }; f.files.push({ filename: 'tools/maintainer/controller.mjs' });
+  f.setCurrent(43); f.env.ANNIE_BOOTSTRAP = '43'; result = await f.execute({ ANNIE_MODE: 'observe' }); assert.equal(result.readyPRs, 0);
+  f.files[0] = { filename: 'docs/x.md', previous_filename: '.github/workflows/honest-annie.yml' }; result = await f.execute({ ANNIE_MODE: 'observe' }); assert.equal(result.readyPRs, 0);
+  f.files[0] = { filename: 'docs/x.md' }; result = await f.execute({ ANNIE_MODE: 'observe' }); assert.equal(result.readyPRs, 1);
 });

@@ -151,6 +151,25 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   assert.equal(job.steps.find(step => step.uses?.startsWith('actions/upload-artifact@')).with.name, 'honest-annie-republish-report-${{ github.run_id }}-${{ github.run_attempt }}');
   assert.equal(job.steps.at(-1).run, 'bash tools/maintainer/ci.sh cleanup'); assert.equal(job.steps.at(-1).if, 'always()');
 });
+test('self-repair jobs: incidents and gate stay secretless, delivery holds the PAT but never runs candidate code or writes contents; wake stays secretless', () => {
+  const workflow = readFileSync(join(moduleDir, '../../.github/workflows/honest-annie.yml'), 'utf8'), jobs = YAML.parse(workflow).jobs;
+  const secrets = job => JSON.stringify(job).match(/secrets\.[A-Z_]+/g) ?? [];
+  assert.deepEqual(jobs.incidents.permissions, { contents: 'read', issues: 'write' }); assert.deepEqual(secrets(jobs.incidents), []); assert.equal(jobs.incidents.environment, undefined);
+  assert.match(jobs.incidents.if, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(jobs.incidents.if, /github\.ref == 'refs\/heads\/trunk'/);
+  assert.deepEqual(jobs['harness-gate'].permissions, { contents: 'read' }); assert.deepEqual(secrets(jobs['harness-gate']), []); assert.equal(jobs['harness-gate'].environment, undefined);
+  assert.deepEqual(jobs['harness-gate'].steps.filter(step => step.run?.includes('ci.sh')).map(step => step.run), ['bash tools/maintainer/ci.sh init', 'bash tools/maintainer/ci.sh import', 'bash tools/maintainer/ci.sh gate']);
+  const deliver = jobs['harness-deliver'];
+  assert.equal(deliver.name, 'Annie effects (model-free)'); assert.equal(deliver.environment, 'honest-annie-release'); assert.deepEqual(deliver.needs, ['observe', 'maintain', 'harness-gate']);
+  assert.deepEqual(deliver.permissions, { contents: 'read', issues: 'write', 'pull-requests': 'read' }); assert.deepEqual(secrets(deliver), ['secrets.ANNIE_GH_TOKEN']);
+  assert.doesNotMatch(JSON.stringify(deliver), /ci\.sh (gate|import|push|publish|registry-login)|npm test|harness-gate\.sh/);
+  const step = deliver.steps.find(item => item.env?.ANNIE_GH_TOKEN); assert.equal(step.run, 'bash tools/maintainer/ci.sh deliver'); assert.equal(step.env.ANNIE_HARNESS_GATE, '${{ needs.harness-gate.result }}');
+  assert.match(deliver.steps.find(item => item.uses?.startsWith('actions/upload-artifact@')).if, /steps\.collect\.outcome == 'success'/);
+  // Harness candidates never reach the trunk release job; the maintain job only forwards the untrusted digest.
+  assert.doesNotMatch(jobs.release.if, /harness/); assert.equal(jobs.maintain.env.ANNIE_INCIDENT, '${{ needs.observe.outputs.incident }}');
+  assert.match(jobs.check.steps.at(-1).run, /harness-gate\.sh/);
+  const wake = YAML.parse(readFileSync(join(moduleDir, '../../.github/workflows/annie-pr-wake.yml'), 'utf8'));
+  assert.deepEqual(wake.permissions, {}); assert.deepEqual(secrets(wake), []); assert.ok(Object.values(wake.jobs).every(job => !job.environment && job.steps.every(item => !item.uses)));
+});
 test('reviewed CI bundle imports exact commit, pushes once, and safely retries', t => {
   const f = fixture(t);
   let result = f.command('export'); assert.equal(result.status, 0, result.stderr);
