@@ -123,6 +123,21 @@ test('ZIP allowlist, size bounds, digest and ID downloads; storage redirect NEVE
   const bad = new GitHub('secret', async () => new Response(null, { status: 302, headers: { location: 'https://evil.invalid/blob' } }));
   await assert.rejects(bad.artifact(meta, 'lease.json'));
 });
+test('GitHub reads retry only network, 5xx, 429 with bounded zero-delay backoff; 4xx and mutations never retry; errors name stage and status', async () => {
+  const sanitized = /^[A-Za-z0-9 :;,.()/_-]{1,180}$/, path = '/repos/bugabinga/pufferpanel';
+  const scripted = statuses => { const calls = []; return { calls, api: new GitHub('t', async (url, opts) => { calls.push({ url, opts }); const status = statuses[Math.min(calls.length - 1, statuses.length - 1)]; if (status === 'network') throw TypeError('fetch failed'); if (status === 302) return new Response(null, { status, headers: { location: 'https://storage.blob.core.windows.net/artifact' } }); return response({ ok: 1 }, {}, status); }, [0, 0]) }; };
+  for (const first of [502, 429, 'network']) { const s = scripted([first, 200]); assert.deepEqual(await s.api.get(path), { ok: 1 }); assert.equal(s.calls.length, 2); }
+  let s = scripted([404]); await assert.rejects(s.api.get(path), /^Error: GitHub controller http-404$/); assert.equal(s.calls.length, 1);
+  await assert.rejects(s.api.get(`${path}/../other`), /invalid API path/); assert.deepEqual(await scripted([200]).api.get(`${path}/compare/${'a'.repeat(40)}...${'b'.repeat(40)}`), { ok: 1 });
+  s = scripted([503]); await assert.rejects(s.api.get(path), /^Error: GitHub controller http-503$/); assert.equal(s.calls.length, 3);
+  s = scripted(['network']); await assert.rejects(s.api.get(path), /^Error: GitHub controller network-error$/); assert.equal(s.calls.length, 3);
+  s = scripted([502]); await assert.rejects(s.api.request(`${path}/actions/jobs/1/rerun`, { method: 'POST' }), /http-502/); assert.equal(s.calls.length, 1);
+  const meta = { id: 99, expired: false, size_in_bytes: 10, digest: `sha256:${'0'.repeat(64)}` };
+  s = scripted([404]); const api404 = await s.api.artifact(meta, 'lease.json').catch(error => error.message); assert.equal(api404, 'artifact download failed http-404 api'); assert.equal(s.calls.length, 1);
+  s = scripted([302, 503]); const blob = await s.api.artifact(meta, 'lease.json').catch(error => error.message); assert.equal(blob, 'artifact download failed http-503 blob'); assert.equal(s.calls.length, 4); assert.equal(s.calls[3].opts.headers, undefined);
+  s = scripted([502, 302, 403]); const denied = await s.api.artifact(meta, 'lease.json').catch(error => error.message); assert.equal(denied, 'artifact download failed http-403 blob'); assert.equal(s.calls.length, 3);
+  for (const message of [api404, blob, denied]) assert.match(message, sanitized);
+});
 test('actual startup fallback report settles no identity and retains full prepaid cap', async t => {
   const dir = await scratch(t), rawPath = join(dir, 'initial.json'), reportDir = join(dir, 'collected');
   await writeFile(rawPath, JSON.stringify(reportFor({ day: task.day, phase: 'starting', spent: null, version: '2026.4.3' }, { interrupted: true })));
@@ -287,6 +302,12 @@ test('workflow isolates secretless PR wake, trusted observation, prepaid attempt
   assert.doesNotMatch(model, /ANNIE_GH_TOKEN|REGISTRY_PASSWORD|contents: write/);
   const release = main.slice(main.indexOf('  release:'), main.indexOf('  retry-effects:'));
   assert.ok(release.indexOf('ci.sh push') < release.indexOf('ci.sh registry-login'));
+  // Best-effort management follows publication and survives a publish failure after source persistence.
+  assert.ok(release.indexOf('ci.sh publish') < release.indexOf('ci.sh management-check'));
+  const jobs = YAML.parse(main).jobs, steps = jobs.release.steps, policy = steps.find(step => step.id === 'management-policy');
+  assert.match(policy.if, /!cancelled\(\)/); assert.match(policy.if, /steps\.push\.outcome == 'success'/);
+  for (const step of steps.filter(step => step.run === 'bash tools/maintainer/ci.sh management')) assert.match(step.if, /steps\.management-policy\.outcome == 'success'/);
+  assert.equal(jobs.observe.outputs.republish, '${{ steps.observe.outputs.republish }}');
   assert.match(release, /PUFFER_MAINT_TASK: \$\{\{ needs.observe.outputs.task \}\}/);
   assert.match(release, /honest-annie-candidate-\$\{\{ github.run_id \}\}-1/);
   assert.equal((main.match(/secrets.ANNIE_GH_TOKEN/g) ?? []).length, 1);

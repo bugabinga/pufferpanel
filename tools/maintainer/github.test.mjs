@@ -11,6 +11,13 @@ test('bounded GitHub intake uses fixed API paths and never serializes token', as
   assert.ok(seen.every(request => request.url.startsWith('https://api.github.com/repos/'))); assert.ok(seen.every(request => !request.url.includes(token)));
   assert.equal(seen.filter(request => request.init.headers.Authorization).length, 4);
 });
+test('own repo has_issues false marks intake issues disabled even when the issue list answers', async () => {
+  for (const [hasIssues, disabled] of [[false, true], [true, false]]) {
+    const fetchImpl = async url => url.includes('/git/ref/') ? response({ object: { sha: 'a'.repeat(40) } }) : /\/repos\/[^/]+\/[^/]+$/.test(url) ? response({ default_branch: 'trunk', has_issues: hasIssues }) : response([{ number: 4, title: 'pr-backed issue', pull_request: {} }]);
+    const intake = await collectGitHubSnapshot({ fetchImpl, token: 'x' });
+    assert.equal(intake.own.issues.disabled === true, disabled);
+  }
+});
 test('author trust uses current permission or push and fails closed', async () => {
   for (const [body, eligible] of [[{ permission: 'write' }, true], [{ permission: 'read', permissions: { push: true } }, true], [{ permission: 'read' }, false], [null, false]]) {
     const value = await authorTrust('maintainer', { token: 'x', fetchImpl: async () => body === null ? response({}, 500) : response(body) }); assert.equal(value.eligible, eligible);

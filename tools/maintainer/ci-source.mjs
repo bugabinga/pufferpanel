@@ -140,7 +140,13 @@ export async function ciSource(command, env = process.env) {
     const receipts = await executePlan(await readJSON(join(artifact, 'management.json')), run);
     await mkdir(runDir, { recursive: true, mode: 0o700 });
     await writeFile(join(runDir, 'action-receipts.json'), JSON.stringify(receipts), { mode: 0o600 });
-    if (receipts.some(r => r.status === 'failed')) throw Error('management actions failed; inspect sanitized receipts');
+    // Best-effort: failed receipts are reported, never block source, image, or queue.
+    const failed = receipts.filter(r => r.status === 'failed');
+    if (failed.length) {
+      const line = `management receipts failed: ${failed.map(r => `${r.kind}${r.number ? ` #${r.number}` : ''} (${r.reason ?? 'unknown'})`).join('; ')}`.replace(/[^A-Za-z0-9 :;,.()#/_-]/g, '_').slice(0, 500);
+      console.error(line);
+      if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `\n${line}\n`, { flag: 'a' });
+    }
     return;
   }
   if (run.phase !== 'publishing') throw Error('management-only task has no source candidate');

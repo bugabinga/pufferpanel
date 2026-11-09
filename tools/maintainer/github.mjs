@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -46,7 +46,7 @@ export async function collectGitHubSnapshot({ fetchImpl = fetch, token = null } 
     ref(OWN, ownBranch, token), queue(fetchImpl, OWN, 'issues', token), queue(fetchImpl, OWN, 'pulls', token),
     ref(UPSTREAM, upstreamBranch, null), queue(fetchImpl, UPSTREAM, 'issues', null, token), queue(fetchImpl, UPSTREAM, 'pulls', null, token),
   ]);
-  const disabled = ownIssues.error === 'http-410';
+  const disabled = own.value?.has_issues === false || ownIssues.error === 'http-410';
   return {
     own: { repo: OWN, metadata: own.error ? { error: own.error } : { defaultBranch: ownBranch ?? null }, head: ownHead.error ? { error: ownHead.error } : { sha: sha(ownHead.value?.object?.sha) }, issues: disabled ? { disabled: true, items: [], truncated: false } : ownIssues, prs: ownPrs },
     upstream: { repo: UPSTREAM, metadata: upstream.error ? { error: upstream.error } : { defaultBranch: upstreamBranch ?? null }, head: upstreamHead.error ? { error: upstreamHead.error } : { sha: sha(upstreamHead.value?.object?.sha) }, issues: upstreamIssues, prs: upstreamPrs },
@@ -100,6 +100,13 @@ export function installGitHubTools(registry, { root, worktree, runDoc }) {
     const run = (await api.snapshot(runDoc, root.id, context))?.run;
     if (!run?.requestId || !run?.day) throw Error('active maintenance run unavailable');
     const plan = { actions: validateActions(actions), at: Date.now(), runId: run.requestId };
+    if (run.githubDiagnostics?.issuesDisabled === true) {
+      // Disabled issues: only listed open PRs (or the selected PR) may receive comments/labels.
+      let prs = [run.prNumber];
+      try { prs.push(...JSON.parse(await readFile(run.intakePath, 'utf8')).own.prs.items.map(item => item.number)); } catch { prs = [run.prNumber]; }
+      const refused = plan.actions.find(action => action.kind === 'create-issue' || ['comment', 'add-label'].includes(action.kind) && !prs.includes(action.number));
+      if (refused) throw Error(`issues are disabled for ${OWN}: ${refused.kind}${refused.number ? ` #${refused.number}` : ''} refused; only open pull requests may receive comments or labels`);
+    }
     plan.hash = createHash('sha256').update(JSON.stringify(plan.actions)).digest('hex');
     await api.commit(async tx => {
       const doc = await tx.doc(GitHubPlansDoc, root.id);

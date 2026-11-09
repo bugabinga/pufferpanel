@@ -69,6 +69,7 @@ jobs:
       task: ${{ steps.observe.outputs.task }}
       lease: ${{ steps.observe.outputs.lease }}
       retry: ${{ steps.observe.outputs.retry }}
+      republish: ${{ steps.observe.outputs.republish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -255,31 +256,12 @@ jobs:
       - name: Independently rerun fixed gates before release credentials
         if: needs.maintain.outputs.candidate == 'true'
         run: bash tools/maintainer/ci.sh gate
-      - name: Persist source before management or registry auth
+      - name: Persist source before registry auth
+        id: push
         if: needs.maintain.outputs.candidate == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/ci.sh push
-      - name: Validate approved management permission class without admin credentials
-        if: needs.maintain.outputs.management == 'true'
-        id: management-policy
-        run: bash tools/maintainer/ci.sh management-check
-      - name: Apply ordinary reviewed management with native token only
-        if: needs.maintain.outputs.management == 'true' && steps.management-policy.outputs.adminAction != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash tools/maintainer/ci.sh management
-      - name: Apply explicitly reviewed enable-issues with isolated admin capability
-        if: needs.maintain.outputs.management == 'true' && steps.management-policy.outputs.adminAction == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ANNIE_GH_TOKEN: ${{ secrets.ANNIE_GH_TOKEN }}
-        run: bash tools/maintainer/ci.sh management
-      - name: Host substantive rejection COMMENT at exact H
-        if: needs.maintain.outputs.feedback == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash tools/maintainer/ci.sh feedback
       - name: Authenticate publisher only after source persistence
         if: needs.maintain.outputs.candidate == 'true'
         env:
@@ -292,6 +274,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/maintainer/ci.sh publish
+      # Best-effort management after publication: runs once source persisted, even when publication failed.
+      - name: Validate approved management permission class without admin credentials
+        id: management-policy
+        if: >-
+          !cancelled() && needs.maintain.outputs.management == 'true' &&
+          (needs.maintain.outputs.candidate == 'true' && steps.push.outcome == 'success' ||
+          needs.maintain.outputs.candidate != 'true' && success())
+        run: bash tools/maintainer/ci.sh management-check
+      - name: Apply ordinary reviewed management with native token only
+        if: >-
+          !cancelled() && steps.management-policy.outcome == 'success' &&
+          steps.management-policy.outputs.adminAction != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/maintainer/ci.sh management
+      - name: Apply explicitly reviewed enable-issues with isolated admin capability
+        if: >-
+          !cancelled() && steps.management-policy.outcome == 'success' &&
+          steps.management-policy.outputs.adminAction == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANNIE_GH_TOKEN: ${{ secrets.ANNIE_GH_TOKEN }}
+        run: bash tools/maintainer/ci.sh management
+      - name: Host substantive rejection COMMENT at exact H
+        if: needs.maintain.outputs.feedback == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/maintainer/ci.sh feedback
       - name: Collect sanitized release report and actual receipts
         if: always()
         run: |
@@ -332,3 +342,76 @@ jobs:
           HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
           ANNIE_RETRY: ${{ needs.observe.outputs.retry }}
         run: node tools/maintainer/controller.mjs retry
+
+  republish:
+    name: Annie republish (model-free)
+    needs: [check, observe]
+    if: >-
+      github.repository == 'bugabinga/pufferpanel' && github.ref == 'refs/heads/trunk' &&
+      vars.HONEST_ANNIE_ENABLED == 'true' && needs.observe.outputs.republish != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: honest-annie-release
+    permissions:
+      contents: read
+    env:
+      ANNIE_REPUBLISH: ${{ needs.observe.outputs.republish }}
+      PUFFER_MAINT_REGISTRY: registry.bugabinga.net/pufferpanel
+      HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
+    steps:
+      # Harness comes from the trusted current checkout; the release commit is only a detached worktree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck effects enablement
+        run: test "$HONEST_ANNIE_ENABLED" = true
+      - run: bash tools/maintainer/ci.sh init
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.10.0'
+      - name: Ensure rootless container tools
+        run: |
+          if ! command -v podman; then
+            sudo apt-get update
+            sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          fi
+          podman info
+      - run: npm ci --ignore-scripts
+        working-directory: tools/maintainer
+      - name: Verify persisted release commit, policy, and detached worktree
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/maintainer/republish.mjs verify
+      - name: Independently rerun fixed gates on the release commit
+        id: gate
+        run: node tools/maintainer/republish.mjs gate
+      - name: Authenticate publisher only after fresh gates
+        id: login
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: bash tools/maintainer/ci.sh registry-login
+      - name: Publish immutable numbered image, verify, promote latest
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/maintainer/republish.mjs publish
+      - name: Collect sanitized republish report
+        if: always()
+        env:
+          ANNIE_REPUBLISH_STAGES: verify=${{ steps.verify.outcome }},gate=${{ steps.gate.outcome }},login=${{ steps.login.outcome }},publish=${{ steps.publish.outcome }}
+        run: node tools/maintainer/republish.mjs report "$RUNNER_TEMP/honest-annie-republish-report"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: honest-annie-republish-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/honest-annie-republish-report/report.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Clean private Podman runroot and registry auth
+        if: always()
+        run: bash tools/maintainer/ci.sh cleanup

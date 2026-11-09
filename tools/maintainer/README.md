@@ -107,6 +107,8 @@ One constant trusted concurrency group serializes admission through effects; off
 
 Trusted preparation performs bounded read-only HTTPS GET intake for `bugabinga/pufferpanel` and public `pufferpanel/pufferpanel` only.
 The native `GH_TOKEN` is used only for that preparation and is removed from model shell environments.
+Intake reports own issues disabled iff repository metadata says `has_issues: false` or the issue list answers HTTP 410.
+While issues are disabled, `propose_github` refuses `create-issue` and any `comment`/`add-label` whose target is not a listed open PR or the selected PR; nothing is stored.
 The ephemeral intake JSON path is supplied as `PUFFER_MAINT_INTAKE`; it is untrusted data, is not uploaded, and reports retain only compact identifiers, titles, reasons, and proposal summaries.
 `node maintain.mjs --help` documents wrapper usage; use `run.sh`, not a bare production invocation.
 The executor has `merge_upstream()` for a pinned, uncommitted merge in its dedicated worktree and `propose_github(actions)` for non-executing bounded plans.
@@ -123,12 +125,13 @@ Hosted maintenance has both a `$15` per-job cap and a `$15` rolling-24h cap acro
 Every workflow rerun is unpaid; only selective retries of the known model-free effects job may perform already-approved effects.
 The model/gate wrapper has a two-hour deadline; the separate no-model release job has its own timeout.
 CI validates private Podman storage after runtime preparation and before exposing `ZAI_API_KEY`, then always removes its explicit short runroot; release cleanup also removes registry auth.
-Each model/release job writes a sanitized Actions summary and uploads only its explicit `report.json` for 14 days, including on failure; raw logs, transcripts, SQLite, environment data, and source diffs are not uploaded.
+Each model/release/republish job writes a sanitized Actions summary and uploads only its explicit `report.json` for 14 days, including on failure; raw logs, transcripts, SQLite, environment data, and source diffs are not uploaded.
 Reviewed bundles/plans remain separate explicitly approved 14-day artifacts, never blanket report/log uploads.
 Rerun only a failed release job to reuse the exact commit/version without more model spend.
 Do not rerun the whole workflow as a publication retry: the runtime and YAML prohibit new model calls on every attempt after 1.
 The numeric daily version allows at most one image revision per UTC date.
 Source may already be on trunk when registry publication fails; that is not evidence of deployment.
+Persisted but unpublished source takes the model-free republish lane described below, not a whole-workflow rerun.
 No desktop timer or klops deployment is activated by this integration.
 
 ## Selected-task CLI contract
@@ -160,12 +163,16 @@ Trusted ordering for source candidates:
 3. Export outputs `candidate`, `sourcecandidate`, and `management` booleans for selected tasks.
 4. Release runner checks out trusted B, or original H for already-integrated PR retries, then runs `ci.sh import` and `ci.sh gate`.
 5. Native `GH_TOKEN` only: `ci.sh push` verifies source persistence before writing private `source.ok`.
-6. If `management=true`, run `ci.sh management` after source persistence, before registry authentication.
-7. Only then expose registry credentials to `ci.sh registry-login`, followed by `ci.sh publish`.
+6. Only then expose registry credentials to `ci.sh registry-login`, followed by `ci.sh publish`.
+7. If `management=true`, run `ci.sh management` after publication; it still runs when source persisted but registry login or publication failed.
 8. Always collect sanitized report/receipts, then cleanup temporary registry auth/runroot.
 
+Management is best-effort: `ci.sh management` records applied/skipped/failed receipts, prints one sanitized failed-receipt line to stderr and the step summary, and exits 0 when only receipts failed.
+Receipt failures never block source persistence, image publication, release determination, or the queue.
+
 `registry-login` refuses any authentication effect without independent exact-tree gates, matching source receipt, and matching current remote trunk.
-The workflow invokes this guard after native source persistence and optional approved management, never direct unguarded Podman login.
+The workflow invokes this guard after native source persistence, never direct unguarded Podman login.
+With `ANNIE_REPUBLISH` set, `registry-login` calls `republish.mjs authorize` instead: fresh exact-tree gates on the detached release worktree and the release commit still reachable from current remote trunk.
 PR import bundles include both approved synthetic C and actual H, then independently verify C parents `[B]`, tree(C)=tree(H)=T, ancestry, linear introduced history, and protected paths including reverted changes.
 Upstream merge import requires full ordered `[B,pinned U]`, `trustedUpstreamPin=U`, and the original trusted task U; ordinary patch mode remains `[B]`.
 The fresh release gate runs on C/T; publisher archives detached actual H/T and stamps OCI revision H, not C.
@@ -187,7 +194,8 @@ Only allowlisted approved artifact files may cross jobs; never snapshots, transc
 The hash detects modification, not a forged approval from a compromised model runner; workflow artifact provenance and independent gates remain mandatory.
 Native `GH_TOKEN` handles labels/comments/create-issue; optional `ANNIE_GH_TOKEN` is supplied only to the trusted management step, used only for reviewed `enable-issues` from a selected `management` task.
 Never inject admin token into model jobs or use it for source pushes.
-Missing auth or unknown permission class fails clearly without credential values.
+Native installation tokens may not expose a usable repository `permissions` field, so ordinary management checks only repository identity and lets the mutation HTTP status decide, e.g. `GitHub mutation http-403`.
+The admin path still requires `permissions.admin`; missing auth or unknown admin permission class fails clearly without credential values.
 Labels read current desired state; posts use stable markers excluding volatile timestamps, with complete bounded lookup coverage; stale targets skip visibly.
 Read/post races cannot be made atomic by GitHub comments API; timestamps are re-fetched immediately before mutation.
 No automatic issue enabling or repository-setting change occurs by default.
@@ -221,8 +229,20 @@ A daily quality round may honestly no-op; identical handled inputs never force s
 The calendar slot is reserved before model execution; verified terminal no-source reports release it, while approved source keeps its immutable slot and blocks replacement work.
 Management-only work never consumes that slot.
 Anonymous registry HEAD must prove the numbered tag absent before new source admission; collision or unknown availability prevents pay.
-Pending approved source/management effects take priority across midnight and suppress fresh model work.
-Missing approved candidate artifacts are blockers, not permission to buy a replacement candidate.
+Pending approved unpersisted source/management effects with a live candidate and fewer than three effects attempts take priority across midnight and suppress fresh model work.
+A source record is released iff a non-expired release report proves publication digest, persisted source, and matching release commit; management receipt statuses are irrelevant.
+A management-only record is terminal once any completed release report exists.
+A completed unpersisted record whose candidate is missing or expired, or whose run reached attempt 3, becomes `abandoned`: non-blocking, reported, never handled, so a later batch may redo the work.
+
+Persisted source (release commit equals trunk head, or compare reports trunk `ahead`/`identical`) is never blocking.
+The observer reads the numbered tag anonymously like `publish.sh`: matching OCI revision means released; a numerically newer `latest` or a different revision on the tag means superseded; otherwise it is a republish candidate.
+The release commit may carry an older `.github`/`tools/maintainer` policy; it is only build input, while every executed harness file comes from the trusted current checkout.
+Unknown registry or compare answers hold only that record, reported and non-blocking, instead of failing observation.
+Only attempt-1 `maintain` with `HONEST_ANNIE_ENABLED=true` emits output `republish` (`runId`, `releaseCommit`, `version`, `day`) and then admits no paid work in that run (`republishing`).
+Checkpoint key `republish` tracks at most 20 `{runId, attempts, nextAt}` entries; attempts have a 30-minute cooldown and a ceiling of three, after which the record becomes `abandoned`.
+The `republish` job uses `honest-annie-release` with only `contents: read`, checks out trusted `github.sha` for the harness, and gates/publishes a detached release-commit worktree under `$PUFFER_MAINT_STATE`.
+`republish.mjs` subcommands: `verify` (unprotected trunk, no rules, trusted checkout policy equal to current trunk policy, release commit reachable from current remote trunk, clean worktree, version), `gate`, `authorize`, `publish`, and `report`.
+Its report `honest-annie-republish-report-RUN_ID-ATTEMPT` contains only run ID, release commit, version, and publication digest or failure reason.
 
 Lease artifact: `annie-lease-RUN_ID-1`, expected file `lease.json`.
 Final model settlement: `honest-annie-model-report-RUN_ID-1`, expected file `report.json`.
@@ -243,7 +263,8 @@ Artifacts and prompts are not an OS sandbox; repository administrators deleting 
 
 `controller.mjs retry` uses only a known `Annie effects (model-free)` job ID, native `actions: write`, matching original/current protected-policy trees, current enablement, and current unprotected branch/rules.
 It dispatches asynchronously without waiting under the trusted concurrency group, never uses generic rerun-all/rerun-failed, waits at least 30 minutes, and stops after attempt 3.
-Legacy policy, exhausted attempts, missing approved evidence, and superseded source are deferred without rollback or a new paid batch.
+Legacy policy and superseded source are deferred without rollback or a new paid batch; exhausted or candidate-less unpersisted work is abandoned rather than blocking.
+Controller GitHub reads and artifact downloads retry at most twice after about 1s/3s, only on network error, 5xx, or 429; 4xx and mutations never retry, and errors name stage and status, e.g. `artifact download failed http-503 blob`.
 Every effect command independently rechecks current enablement/protected policy during hosted reruns.
 `controller.mjs verify-upload` verifies the prepaid artifact before the first provider credential/model step.
 `ci.sh management-check` validates the canonical plan and emits `adminAction` before any admin credential is exposed.
@@ -253,7 +274,7 @@ Filtered windows recursively shard below GitHub's 1000-result cap; each window r
 Lifetime history beyond 10,000 runs does not exhaust admission coverage.
 Healthy observations download recent accounting artifacts and checkpoint-carried outstanding IDs, including older nonterminal executions fetched individually.
 Pending receipts preserve original lease identity, sanitized settlement, candidate metadata, and original artifact timestamps across 14-day artifact expiry.
-Expired/missing candidate packs and exhausted effects retries remain visible blockers; receipt refresh never manufactures approval or completion.
+Expired/missing candidate packs and exhausted effects retries are reported as abandoned, never as completion; receipt refresh never manufactures approval or completion.
 An expired original lease on an old-created recent rerun retains unknown spend without crashing observation; an unsupported expired candidate identity is carried as an explicit blocker rather than silently forgotten.
 Bounds remain 999 counted records/window, 198 current PRs, 200 handled fingerprints/outcomes, 20 outstanding receipts/flights, 32 calendar slots, and 256KiB ZIP/128KiB JSON payloads.
 Admission records an in-flight task, not terminal handling; verified original-attempt job/step evidence that the model-capable step was skipped releases the flight/calendar slot without charging a lease.

@@ -15,7 +15,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { redact, reportFor, writeReport } from './report.mjs';
 import { collectGitHubSnapshot, writeIntake, installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
-import { selectedTask } from './task.mjs';
+import { selectedTask, versionFor } from './task.mjs';
 import { materializePR } from './pr.mjs';
 import { approvedPlan } from './management.mjs';
 
@@ -61,7 +61,7 @@ export function callUsage(doc, requestId) {
 }
 const nativeUsage = async (harness, root, run) => callUsage(await harness.snapshot(CallsDoc, root.id, ctx), run.requestId);
 export const RunDoc = defineDoc({ kind: 'pufferpanel.maintenance.run', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ run: null }) });
-export const versionFor = day => day.split('-').map(Number).join('.');
+export { versionFor };
 export const stateDirectory = (env = process.env) => resolve(env.PUFFER_MAINT_STATE ?? join(env.HOME ?? fail('HOME is required'), '.pi/agent/maintenance/pufferpanel'));
 export const sourceDirectory = (env = process.env) => resolve(env.PUFFER_MAINT_SOURCE ?? join(here, '../..'));
 export const getRun = async (root, harness) => structuredClone((await harness.snapshot(RunDoc, root.id, ctx))?.run ?? null);

@@ -43,7 +43,7 @@ A failed or rejected candidate cannot release.
 ## Observable and traceable
 
 Actions summaries and explicitly selected sanitized artifacts are the reporting surface.
-Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, and verified release.
+Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, republishing, abandoned, and verified release.
 Require a complete reviewer response matching the strict JSON verdict schema.
 Allow reviewer responses up to 32,768 output tokens, clamped to the selected model's limit; executor responses remain capped at 4,000 tokens.
 Reserve the full phase-specific output ceiling before dispatch, inside the unchanged shared budget and original deadline.
@@ -95,10 +95,12 @@ Calendar numbered tags remain immutable, so a second distinct revision on the sa
 
 Management-only approval stops at `managing`, exits successfully, and never runs source gates, creates a source commit, or publishes an image.
 Only current-run bounded independently approved canonical plans cross jobs as a publication-safe sanitized hash-bound operational artifact, separate from public reports.
-Host execution rechecks whole-plan hash/repo/source/approval, exact current target identity/open state/updatedAt, permission class, and bounded idempotence coverage.
+Host execution rechecks whole-plan hash/repo/source/approval, exact current target identity/open state/updatedAt, admin permission class for `enable-issues`, and bounded idempotence coverage; native-token mutations let their HTTP status decide.
 Native token executes ordinary allowlisted operations; admin token is restricted to explicitly reviewed `enable-issues` from a selected management task.
 No arbitrary API endpoints, destructive actions, protection changes, visibility changes, collaborator changes, or automatic issue enabling are permitted.
-Source plus plans executes management after verified source persistence and before registry login.
+Source plus plans executes management after publication, and still after verified source persistence when registry login or publication failed.
+Management is best-effort: failed receipts are reported, the step succeeds, and receipts never gate release, publication, or the queue.
+While intake reports issues disabled (`has_issues: false` or HTTP 410), proposals cannot create issues or target non-PR issues.
 Posts identify Annie as an automated maintainer and use stable hash markers excluding volatile updatedAt; labels reconcile the desired set.
 Retries never duplicate when complete lookup coverage proves an earlier marker, and fail closed when lookup is truncated or unknown.
 Optional PR rejection feedback is host-generated `COMMENT` at exact current H from substantive trusted read-only reviewer findings only; invalid review output is bot failure, not PR blame.
@@ -127,9 +129,15 @@ PR fingerprints bind number/H/B/policy, excluding clock/upstream/reviews/attempt
 Ordinary rejection and deterministic preparation failure remain handled until relevant input changes.
 Missing or expired checkpoint state blocks admission rather than silently resetting deduplication; initial bootstrap must be explicit.
 Management-only tasks cannot change source/history or reserve an image slot.
-Source work reserves one calendar opportunity before pay; terminal verified no-source work releases it, while an approved pending source blocks new source work across UTC midnight.
+Source work reserves one calendar opportunity before pay; terminal verified no-source work releases it, while an approved unpersisted source with a live candidate and fewer than three effects attempts blocks new source work across UTC midnight.
+Source is released iff a release report proves publication digest, persisted source, and matching release commit; a management-only record is terminal once any completed release report exists.
+Unpersisted work with a missing or expired candidate or an exhausted effects ceiling becomes `abandoned`: reported, non-blocking, and not handled, so later batches may redo it.
 All source/report paths use frozen selected-task day.
 Approved effects recovery uses only an existing known model-free release job, rechecks enablement and protected policy, has a three-attempt ceiling and 30-minute cooldown, and never requests rerun-all or rerun-failed.
+Persisted but unpublished source never blocks: anonymous registry evidence marks it released, superseded by a newer `latest` or tag collision, or a model-free republish candidate.
+Republish runs only from attempt-1 paid-capable observation without admitting paid work in that run, uses a trusted current harness on a detached release-commit worktree, reruns every fixed gate, and is bounded to three attempts with a 30-minute cooldown before `abandoned`.
+Republish requires an unprotected rule-free trunk, the trusted checkout's protected policy equal to current trunk's, and the release commit reachable from current remote trunk; the release commit's own harness is build input only and never executed.
+Unknown registry or compare answers hold only that record and are reported; transient GitHub controller reads retry twice on network error, 5xx, or 429, never on 4xx.
 Unpaid observe/sweep cannot dispatch a retry.
 Current branch/rules policy blocks ordinary maintenance pushes as well as PR pushes; no bypass exists.
 

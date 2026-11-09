@@ -58,7 +58,7 @@ case "${1:-}" in
     git -C "$source" remote add upstream https://github.com/pufferpanel/pufferpanel.git
     ;;
   registry-login)
-    node "$module/ci-source.mjs" authorize-publication
+    if [[ -n ${ANNIE_REPUBLISH:-} ]]; then node "$module/republish.mjs" authorize; else node "$module/ci-source.mjs" authorize-publication; fi
     : "${REGISTRY_USERNAME:?}" "${REGISTRY_PASSWORD:?}" "${REGISTRY_AUTH_FILE:?}"
     registry=${PUFFER_MAINT_REGISTRY:-registry.bugabinga.net/pufferpanel}
     [[ $registry =~ ^[A-Za-z0-9.-]+(:[0-9]+)?/[a-z0-9/_.-]+$ ]] || { echo 'invalid registry image name' >&2; exit 64; }

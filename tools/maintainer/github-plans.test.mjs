@@ -111,6 +111,18 @@ test('active plans remain bounded across distinct proposals; invalid and destruc
   assert.ok(stored.flatMap(item => item.actions).every(action => action.kind !== 'delete-repository'));
 });
 
+test('disabled issues: propose_github refuses create-issue and non-PR comment/label targets, stores only PR actions', async t => {
+  const at = '2026-04-03T00:00:00Z';
+  const f = await fixture(t, [plan([issue('Cannot exist')]), plan([{ kind: 'comment', number: 9, body: 'issue', expectedUpdatedAt: at }]), plan([{ kind: 'add-label', number: 9, labels: ['x'], expectedUpdatedAt: at }]), plan([{ kind: 'comment', number: 7, body: 'pull request', expectedUpdatedAt: at }]), end(), fauxAssistantMessage('{"approve":true,"findings":[]}')]);
+  const intakePath = join(f.dir, 'disabled-intake.json');
+  await import('node:fs/promises').then(({ writeFile }) => writeFile(intakePath, JSON.stringify({ own: { issues: { disabled: true, items: [] }, prs: { items: [{ number: 7 }] } } })));
+  const prepare = f.hooks.prepare; f.hooks.prepare = async run => ({ ...await prepare(run), githubDiagnostics: { issuesDisabled: true, truncated: false }, intakePath });
+  await f.root.commit(async tx => { (await tx.doc(RunDoc, f.root.id)).run = { day: '2026-04-03', requestId: 'request-one', startedAt: Date.now(), spent: 0, usageStart: 0, phase: 'admitted', timeline: [] }; }, ctx);
+  await advance(f.root, { harness: f.harness, ...f.hooks, day: '2026-04-03' });
+  const stored = (await f.harness.snapshot(GitHubPlansDoc, f.root.id, ctx))?.plans ?? [];
+  assert.deepEqual(stored.flatMap(item => item.actions).map(action => [action.kind, action.number]), [['comment', 7]]);
+});
+
 test('invalid issue title, labels, number, and updatedAt are rejected by actual proposal tool', async t => {
   const invalid = [
     [{ kind: 'create-issue', title: '  ', body: 'valid' }],

@@ -3,7 +3,7 @@ import { inflateRawSync } from 'node:zlib';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { OWN, REF, isSha, validateTask } from './task.mjs';
+import { OWN, REF, isSha, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
@@ -42,10 +42,19 @@ export function rollingAllowance(entries, now = Date.now()) {
 }
 
 export class GitHub {
-  constructor(token, fetchImpl = fetch) { this.token = token; this.fetch = fetchImpl; }
+  constructor(token, fetchImpl = fetch, delays = [1000, 3000]) { this.token = token; this.fetch = fetchImpl; this.delays = delays; }
+  // Bounded read retry: network error, 5xx, or 429 only; 4xx and mutations are never retried. Null means network failure.
+  async send(url, init, delays = this.delays) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.fetch(url, { ...init, signal: AbortSignal.timeout(15_000) }).catch(() => null);
+      if (res && res.status < 500 && res.status !== 429 || attempt >= delays.length) return res;
+      await new Promise(done => setTimeout(done, delays[attempt]));
+    }
+  }
   async request(path, options = {}) {
-    if (!path.startsWith('/repos/') || path.split('?')[0].includes('..')) fail('invalid API path');
-    const res = await this.fetch(`https://api.github.com${path}`, { ...options, redirect: 'manual', headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'honest-annie-controller', ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}), ...options.headers }, signal: AbortSignal.timeout(15_000) });
+    if (!path.startsWith('/repos/') || path.split('?')[0].split('/').includes('..')) fail('invalid API path'); // Segment check: compare uses A...B.
+    const res = await this.send(`https://api.github.com${path}`, { ...options, redirect: 'manual', headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'honest-annie-controller', ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}), ...options.headers } }, (options.method ?? 'GET') === 'GET' ? this.delays : []);
+    if (!res) fail('GitHub controller network-error');
     if (!res.ok) fail(`GitHub controller http-${res.status}`);
     return res;
   }
@@ -71,14 +80,17 @@ export class GitHub {
   }
   async artifact(meta, filename) {
     if (!integer(meta?.id) || meta.expired || !/^sha256:[a-f0-9]{64}$/.test(meta.digest ?? '') || !Number.isInteger(meta.size_in_bytes) || meta.size_in_bytes < 1 || meta.size_in_bytes > 262144) fail('unavailable ledger artifact');
-    const res = await this.fetch(`https://api.github.com/repos/${OWN}/actions/artifacts/${meta.id}/zip`, { redirect: 'manual', headers: { Authorization: `Bearer ${this.token}`, Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
+    const res = await this.send(`https://api.github.com/repos/${OWN}/actions/artifacts/${meta.id}/zip`, { redirect: 'manual', headers: { Authorization: `Bearer ${this.token}`, Accept: 'application/vnd.github+json' } });
+    if (!res) fail('artifact download failed network-error api');
+    if (res.status !== 302 && !res.ok) fail(`artifact download failed http-${res.status} api`);
     let archive = res;
     if (res.status === 302) {
       const url = new URL(res.headers.get('location'));
       if (url.protocol !== 'https:' || url.username || url.password || !(/(^|\.)blob\.core\.windows\.net$/.test(url.hostname) || /(^|\.)githubusercontent\.com$/.test(url.hostname) || /(^|\.)actions\.github\.com$/.test(url.hostname))) fail('untrusted artifact redirect');
-      archive = await this.fetch(url.href, { redirect: 'error', signal: AbortSignal.timeout(15000) }); // Deliberately NO Authorization.
+      archive = await this.send(url.href, { redirect: 'error' }); // Deliberately NO Authorization.
+      if (!archive) fail('artifact download failed network-error blob');
+      if (!archive.ok) fail(`artifact download failed http-${archive.status} blob`);
     }
-    if (!archive.ok) fail('artifact download failed');
     const bytes = await boundedBody(archive, 262144);
     if (`sha256:${digest(bytes)}` !== meta.digest) fail('artifact digest mismatch');
     return unzipJSON(bytes, filename);
@@ -159,7 +171,7 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
     let decision = null;
     if (cp && !cp.expired) {
       const value = await api.artifact(cp, 'checkpoint.json');
-      const keys = ['schema', 'runId', 'repoId', 'handled', 'slots', 'paid', 'queue', 'pendingRuns', 'lastMaintenance', 'upstream', 'inputBase', 'flights', 'outcomes', 'environment', 'receipts', 'blocked'];
+      const keys = ['schema', 'runId', 'repoId', 'handled', 'slots', 'paid', 'queue', 'pendingRuns', 'lastMaintenance', 'upstream', 'inputBase', 'flights', 'outcomes', 'environment', 'receipts', 'blocked', 'republish'];
       if (!value || Object.keys(value).some(key => !keys.includes(key)) || ['queue', 'lastMaintenance'].some(key => value[key] !== undefined && !/^[a-f0-9]{64}$/.test(value[key])) || ['upstream', 'inputBase'].some(key => value[key] !== undefined && !isSha(value[key])) || value.paid !== undefined && typeof value.paid !== 'boolean') fail('malformed decision checkpoint fields');
       if (value.pendingRuns !== undefined && (!Array.isArray(value.pendingRuns) || value.pendingRuns.length > 20 || value.pendingRuns.some(id => !integer(id)))) fail('malformed pending checkpoint');
       if (value.schema !== 1 || value.runId !== run.id || value.repoId !== repo.id || !Array.isArray(value.handled) || value.handled.length > 200 || value.handled.some(v => !/^[a-f0-9]{64}$/.test(v)) || !Array.isArray(value.slots) || value.slots.length > 32 || value.slots.some(v => !/^\d{4}-\d{2}-\d{2}$/.test(v))) fail('malformed decision checkpoint');
@@ -167,6 +179,7 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
       if (value.outcomes !== undefined && (!Array.isArray(value.outcomes) || value.outcomes.length > 200 || value.outcomes.some(o => !/^[a-f0-9]{64}$/.test(o.fingerprint) || !integer(o.runId) || !integer(o.attempts) || !Number.isFinite(o.nextAt) || !['environment', 'zero-dispatch', 'transient'].includes(o.kind)))) fail('malformed outcomes');
       if (value.environment != null && (!/^[a-f0-9]{64}$/.test(value.environment.signal) || !Number.isFinite(value.environment.nextAt))) fail('malformed environment cooldown');
       if (value.blocked !== undefined && (!Array.isArray(value.blocked) || value.blocked.length > 20 || value.blocked.some(b => !integer(b.runId) || !['expired-candidate-identity', 'admission-unreconciled'].includes(b.reason)))) fail('malformed blocked receipts');
+      if (value.republish !== undefined && (!Array.isArray(value.republish) || value.republish.length > 20 || value.republish.some(r => !r || Object.keys(r).sort().join(',') !== 'attempts,nextAt,runId' || !integer(r.runId) || !integer(r.attempts) || r.attempts > 3 || !Number.isFinite(r.nextAt)) || new Set(value.republish.map(r => r.runId)).size !== value.republish.length)) fail('malformed republish attempts');
       if (value.receipts !== undefined && (!Array.isArray(value.receipts) || value.receipts.length > 20 || value.receipts.some(r => !integer(r.runId) || r.runId !== r.lease?.runId))) fail('malformed pending receipts');
       decision = value;
       if (!checkpoint || time(cp.created_at) > checkpoint.at || time(cp.created_at) === checkpoint.at && value.runId > checkpoint.value.runId) {
@@ -256,19 +269,33 @@ export function chooseTask({ prs, base, upstreamSha, upstreamRef, policy, day, c
   if ((usefulUpstream || queueChanged || daily) && !handled.has(fingerprint)) return validateTask({ ...common, kind, fingerprint });
   return null;
 }
+const REGISTRY = 'https://registry.bugabinga.net/v2/pufferpanel', MANIFEST = 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json';
+// Anonymous publish.sh-equivalent read: manifest, config blob, OCI revision/version labels; null only on HTTP 404.
+export async function registryImage(fetchImpl, tag) {
+  const read = (path, accept) => fetchImpl(`${REGISTRY}/${path}`, { redirect: 'error', headers: accept ? { Accept: accept } : {}, signal: AbortSignal.timeout(10000) });
+  const manifest = await read(`manifests/${tag}`, MANIFEST);
+  if (manifest.status === 404) return null;
+  const config = manifest.ok ? (await manifest.json())?.config?.digest : null;
+  if (!/^sha256:[a-f0-9]{64}$/.test(config ?? '')) fail('registry manifest unknown');
+  const blob = await read(`blobs/${config}`);
+  const labels = blob.ok ? (await blob.json())?.config?.Labels : null;
+  if (!labels || typeof labels !== 'object') fail('registry config unknown');
+  return { revision: labels['org.opencontainers.image.revision'] ?? null, version: labels['org.opencontainers.image.version'] ?? null };
+}
+const newer = (a, b) => { const [x, y] = [a, b].map(v => /^\d+\.\d+\.\d+$/.test(v ?? '') ? v.split('.').map(Number) : null); return Boolean(x && y) && (x[0] - y[0] || x[1] - y[1] || x[2] - y[2]) > 0; };
 export async function publicationAvailable(fetchImpl, day) {
-  const version = day.split('-').map(Number).join('.');
-  const res = await fetchImpl(`https://registry.bugabinga.net/v2/pufferpanel/manifests/${version}`, { method: 'HEAD', redirect: 'error', headers: { Accept: 'application/vnd.oci.image.manifest.v1+json' }, signal: AbortSignal.timeout(10000) });
+  const version = versionFor(day);
+  const res = await fetchImpl(`${REGISTRY}/manifests/${version}`, { method: 'HEAD', redirect: 'error', headers: { Accept: 'application/vnd.oci.image.manifest.v1+json' }, signal: AbortSignal.timeout(10000) });
   if (res.status === 404) return true;
   if (res.ok) return false;
   fail('anonymous publication availability unknown');
 }
-async function output(name, value) { if (process.env.GITHUB_OUTPUT) await writeFile(process.env.GITHUB_OUTPUT, `${name}=${typeof value === 'string' ? value : JSON.stringify(value)}\n`, { flag: 'a' }); }
-export async function controller({ env = process.env, fetchImpl = fetch, now = Date.now() } = {}) {
+const outputs = env => async (name, value) => { if (env.GITHUB_OUTPUT) await writeFile(env.GITHUB_OUTPUT, `${name}=${typeof value === 'string' ? value : JSON.stringify(value)}\n`, { flag: 'a' }); };
+export async function controller({ env = process.env, fetchImpl = fetch, now = Date.now(), delays } = {}) {
   const mode = env.ANNIE_MODE ?? 'check';
   if (mode === 'check') return { state: 'offline-unpaid' }; // No reads, observations, leases, retries, or effects.
   if (!['observe', 'sweep', 'maintain'].includes(mode) || env.GITHUB_REPOSITORY !== OWN || env.GITHUB_REF !== REF) fail('untrusted controller invocation');
-  const api = new GitHub(env.GH_TOKEN, fetchImpl), repo = await api.get(`/repos/${OWN}`);
+  const api = new GitHub(env.GH_TOKEN, fetchImpl, delays), repo = await api.get(`/repos/${OWN}`);
   if (repo.id !== Number(env.GITHUB_REPOSITORY_ID) || repo.default_branch !== 'trunk') fail('repository identity mismatch');
   const event = JSON.parse(await readFile(env.GITHUB_EVENT_PATH, 'utf8'));
   if (env.GITHUB_EVENT_NAME === 'workflow_run') await verifyWake(api, event, repo);
@@ -299,8 +326,8 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   }
   for (const record of ledger.records) record.effectIdentity = record.settlement ?? (!record.zeroDispatch && record.lease.task.kind === 'pr' && singleton(record.artifacts, `honest-annie-candidate-${record.run.id}-1`) ? { commit: record.lease.task.head, releaseCommit: record.lease.task.head, managementApproved: false, phase: 'publishing' } : null);
   const active = ledger.records.filter(r => (r.effectIdentity?.commit || r.effectIdentity?.managementApproved) && !['failed', 'rejected'].includes(r.effectIdentity.phase));
-  const pending = ledger.records.filter(record => !record.zeroDispatch && !record.effectIdentity && singleton(record.artifacts, `honest-annie-candidate-${record.run.id}-1`));
-  const superseded = [];
+  const waiting = ledger.records.filter(record => !record.zeroDispatch && !record.effectIdentity && singleton(record.artifacts, `honest-annie-candidate-${record.run.id}-1`));
+  const superseded = [], republishable = [], held = [], abandoned = [];
   for (const record of active) {
     const reports = record.artifacts.filter(a => a.name.startsWith(`honest-annie-release-report-${record.run.id}-`));
     let released = false;
@@ -309,23 +336,51 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
       const report = await api.artifact(meta, 'report.json');
       if (noCompletionEvidence(report)) continue;
       if (report.fingerprint !== record.lease.task.fingerprint || report.ledgerReservation !== record.lease.hash || ['base', 'day'].some(key => report[key] != null && report[key] !== record.lease.task[key]) || report.releaseCommit != null && report.releaseCommit !== record.effectIdentity.releaseCommit) fail('release report identity mismatch');
-      const managementDone = !record.effectIdentity.managementApproved || report.actionReceipts?.length && report.actionReceipts.every(r => ['applied', 'skipped'].includes(r.status));
-      if (managementDone && (!record.effectIdentity.commit || /^sha256:[a-f0-9]{64}$/.test(report.publicationDigest ?? '') && report.sourcePersisted === true && report.releaseCommit === record.effectIdentity.releaseCommit)) released = true;
+      // Management receipts are best-effort; they never gate release or the queue.
+      if (!record.effectIdentity.commit || /^sha256:[a-f0-9]{64}$/.test(report.publicationDigest ?? '') && report.sourcePersisted === true && report.releaseCommit === record.effectIdentity.releaseCommit) released = true;
     }
-    if (!released) {
-      let compatible = record.effectIdentity.releaseCommit === branch.commit.sha || record.lease.task.base === branch.commit.sha;
-      if (!compatible && record.lease.task.kind === 'pr') {
-        try {
-          const [sinceBase, untilHead] = await Promise.all([api.get(`/repos/${OWN}/compare/${record.lease.task.base}...${branch.commit.sha}`), api.get(`/repos/${OWN}/compare/${branch.commit.sha}...${record.effectIdentity.releaseCommit}`)]);
-          compatible = ['ahead', 'identical'].includes(sinceBase.status) && ['ahead', 'identical'].includes(untilHead.status);
-          if (![sinceBase.status, untilHead.status].every(status => ['ahead', 'behind', 'identical', 'diverged'].includes(status))) compatible = true;
-        } catch { compatible = true; } // Unknown ancestry never authorizes buying replacement work.
-      }
-      if (compatible) pending.push(record);
-      else superseded.push({ runId: record.run.id, source: record.effectIdentity.releaseCommit ?? null });
+    if (released) continue;
+    const source = record.effectIdentity.releaseCommit;
+    let onTrunk = source === branch.commit.sha, unknown = false;
+    if (source && !onTrunk && record.lease.task.base !== branch.commit.sha) {
+      try { const { status } = await api.get(`/repos/${OWN}/compare/${source}...${branch.commit.sha}`); onTrunk = ['ahead', 'identical'].includes(status); unknown = !['ahead', 'behind', 'identical', 'diverged'].includes(status); }
+      catch (error) { unknown = !/http-404$/.test(error.message); } // GitHub does not know never-pushed source.
     }
+    const entry = checkpoint.republish?.find(r => r.runId === record.run.id) ?? null;
+    if (unknown) { held.push({ runId: record.run.id, source, reason: 'compare-unknown', entry }); continue; }
+    if (onTrunk) {
+      // Persisted source never blocks: registry evidence decides released, superseded, or model-free republish.
+      const version = versionFor(record.lease.task.day);
+      try {
+        const image = await registryImage(fetchImpl, version);
+        const latest = await registryImage(fetchImpl, 'latest'), higher = Boolean(latest) && newer(latest.version, version);
+        // Released only once latest was promoted too; a version-only push resumes through publish.sh's idempotent path.
+        if (image?.revision === source && latest && !newer(version, latest.version)) continue;
+        if (image?.revision !== source && (image || higher)) { superseded.push({ runId: record.run.id, source, reason: higher ? 'newer-latest' : 'version-collision' }); continue; }
+      } catch { held.push({ runId: record.run.id, source, reason: 'registry-unknown', entry }); continue; }
+      if (entry?.attempts >= 3) abandoned.push({ runId: record.run.id, source, reason: 'republish-exhausted', entry });
+      else republishable.push({ record, source, version, entry });
+      continue;
+    }
+    let compatible = record.lease.task.base === branch.commit.sha;
+    if (!compatible && record.lease.task.kind === 'pr') {
+      try {
+        const [sinceBase, untilHead] = await Promise.all([api.get(`/repos/${OWN}/compare/${record.lease.task.base}...${branch.commit.sha}`), api.get(`/repos/${OWN}/compare/${branch.commit.sha}...${record.effectIdentity.releaseCommit}`)]);
+        compatible = ['ahead', 'identical'].includes(sinceBase.status) && ['ahead', 'identical'].includes(untilHead.status);
+        if (![sinceBase.status, untilHead.status].every(status => ['ahead', 'behind', 'identical', 'diverged'].includes(status))) compatible = true;
+      } catch { compatible = true; } // Unknown ancestry never authorizes buying replacement work.
+    }
+    if (compatible) waiting.push(record);
+    else superseded.push({ runId: record.run.id, source: source ?? null, reason: 'trunk-advanced' });
   }
-  const fresh = { ...checkpoint, schema: 1, runId: run.id, repoId: repo.id, queue: checkpoint.queue ?? queue, paid: false, pendingRuns: [...new Set([...ledger.outstanding, ...pending.map(record => record.run.id), ...ledger.records.filter(r => !r.zeroDispatch && (r.run.status !== 'completed' || !r.settlement && r.lease.deadline + DAY + MARGIN > now)).map(r => r.run.id)])] };
+  // Unpersisted work cannot block forever; its fingerprint stays unhandled so a later batch may redo it.
+  const pending = waiting.filter(record => {
+    const candidate = singleton(record.artifacts, `honest-annie-candidate-${record.run.id}-1`);
+    const reason = record.run.status !== 'completed' ? null : !candidate ? 'candidate-missing' : candidate.expired ? 'candidate-expired' : record.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null;
+    if (reason) abandoned.push({ runId: record.run.id, source: record.effectIdentity?.releaseCommit ?? null, reason });
+    return !reason;
+  });
+  const fresh = { ...checkpoint, schema: 1, runId: run.id, repoId: repo.id, queue: checkpoint.queue ?? queue, paid: false, pendingRuns: [...new Set([...ledger.outstanding, ...pending.map(record => record.run.id), ...republishable.map(r => r.record.run.id), ...held.map(r => r.runId), ...ledger.records.filter(r => !r.zeroDispatch && (r.run.status !== 'completed' || !r.settlement && r.lease.deadline + DAY + MARGIN > now)).map(r => r.run.id)])] };
   fresh.blocked = ledger.blockers;
   if (fresh.pendingRuns.length > 20) fail('outstanding execution capacity exceeded');
   // Retain only current PR fingerprints plus last maintenance metadata; healthy sweeps refresh retention.
@@ -364,9 +419,15 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   const task = chooseTask({ prs: eligible, base: branch.commit.sha, upstreamSha: pin.object.sha, upstreamRef, policy, day, checkpoint: { ...fresh, handled: [...fresh.handled, ...fresh.flights.map(f => f.task.fingerprint), ...fresh.outcomes.filter(o => (o.kind !== 'environment' || checkpoint.environment?.signal === configSignal) && (o.attempts >= 3 || o.nextAt > now)).map(o => o.fingerprint)], queue }, usefulUpstream: humanSourceChanged || checkpoint.upstream !== undefined && checkpoint.upstream !== pin.object.sha, queueChanged, daily: env.GITHUB_EVENT_NAME === 'schedule' && event.schedule === '17 4 * * *' });
   fresh.upstream ??= pin.object.sha;
   fresh.inputBase = ownAcknowledged || fresh.inputBase === undefined ? branch.commit.sha : fresh.inputBase;
-  let state = pending.length || ledger.blockers.length ? 'effects-pending' : task ? 'useful-input' : 'no-op';
+  // Model-free republish of persisted source: attempt-1 maintain only, 30-minute cooldown, at most three attempts.
+  fresh.republish = [...republishable, ...held, ...abandoned].map(r => r.entry).filter(Boolean);
+  const next = mode === 'maintain' && env.HONEST_ANNIE_ENABLED === 'true' && env.GITHUB_RUN_ATTEMPT === '1' ? republishable.find(r => !(r.entry?.nextAt > now)) : null;
+  const republish = next ? { runId: next.record.run.id, releaseCommit: next.source, version: next.version, day: next.record.lease.task.day } : null;
+  if (next) fresh.republish = [...fresh.republish.filter(r => r.runId !== republish.runId), { runId: republish.runId, attempts: (next.entry?.attempts ?? 0) + 1, nextAt: now + 30 * 60_000 }];
+  fresh.republish = fresh.republish.slice(-20);
+  let state = republish ? 'republishing' : pending.length || ledger.blockers.length ? 'effects-pending' : task ? 'useful-input' : 'no-op';
   let lease = null;
-  if (mode === 'maintain' && task && !pending.length && !ledger.blockers.length && !(fresh.environment?.nextAt > now) && env.HONEST_ANNIE_ENABLED === 'true' && env.GITHUB_RUN_ATTEMPT === '1' && ledger.allowance > 0) {
+  if (mode === 'maintain' && task && !republish && !pending.length && !ledger.blockers.length && !(fresh.environment?.nextAt > now) && env.HONEST_ANNIE_ENABLED === 'true' && env.GITHUB_RUN_ATTEMPT === '1' && ledger.allowance > 0) {
     if (task.kind !== 'management' && (fresh.slots.includes(day) || branch.protected !== false || !await publicationAvailable(fetchImpl, day))) state = 'source-slot-unavailable';
     else {
       const rules = await api.pages(`/repos/${OWN}/rules/branches/trunk`);
@@ -398,11 +459,12 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
       }
     }
   }
-  await output('retry', retry ? JSON.stringify(retry) : '');
+  const output = outputs(env);
+  await output('retry', retry ? JSON.stringify(retry) : ''); await output('republish', republish ? JSON.stringify(republish) : '');
   await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state);
-  const summary = { state, mode, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint };
+  const summary = { state, mode, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint };
   await writeFile(join(dir, 'observer.json'), JSON.stringify(summary));
-  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}.\n`, { flag: 'a' });
+  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}; republish: ${republish ? republish.version : 'none'}; held: ${held.length}; abandoned: ${abandoned.length}.\n${abandoned.map(a => `\n- abandoned run ${a.runId} (${a.source?.slice(0, 12) ?? 'no source'}): ${a.reason}`).join('')}\n`, { flag: 'a' });
   return summary;
 }
 export async function verifyUploadedLease({ env = process.env, fetchImpl = fetch, now = Date.now() } = {}) {

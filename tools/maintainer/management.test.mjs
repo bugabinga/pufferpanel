@@ -12,11 +12,12 @@ const comment = { kind: 'comment', number: 7, expectedUpdatedAt: time, body: 'Us
 const issue = { kind: 'create-issue', title: 'Follow-up', body: 'Specific follow-up.' };
 const label = { kind: 'add-label', number: 7, expectedUpdatedAt: time, labels: ['triage'] };
 function api() {
-  const state = { calls: [], comments: [], issues: [], labels: [], target: { number: 7, state: 'open', updated_at: time }, hasIssues: true, nativePermissions: { push: true }, adminPermissions: { admin: true }, truncated: false };
+  const state = { calls: [], comments: [], issues: [], labels: [], target: { number: 7, state: 'open', updated_at: time }, hasIssues: true, nativePermissions: { push: true }, adminPermissions: { admin: true }, truncated: false, mutationStatus: 200 };
   const fetchImpl = async (url, init = {}) => {
     const path = url.split('/repos/bugabinga/pufferpanel')[1], method = init.method ?? 'GET';
     const auth = init.headers.Authorization; state.calls.push({ path, method, auth, body: init.body ? JSON.parse(init.body) : null });
     let value;
+    if (method !== 'GET' && state.mutationStatus !== 200) return { ok: false, status: state.mutationStatus, headers: new Headers(), json: async () => ({}) };
     if (method !== 'GET') {
       const body = JSON.parse(init.body);
       if (path === '/issues/7/comments') { state.comments.push(body); state.target.updated_at = '2026-04-03T01:00:00Z'; }
@@ -82,7 +83,9 @@ test('native-vs-admin matrix: ordinary ops only native; enable-issues only expli
     result = await executePlan(p, r, { ...f.options, adminToken }); assert.equal(result[0].status, 'failed'); assert.match(result[0].reason, /missing admin auth|permission class/); assert.equal(f.state.calls.some(c => c.method === 'PATCH'), false);
   }
   f = api(); result = await executePlan(approvedPlan(r, [{ actions: [comment] }]), r, { ...f.options, token: null }); assert.equal(result[0].reason, 'missing native auth');
-  f = api(); f.state.nativePermissions = {}; result = await executePlan(approvedPlan(r, [{ actions: [comment] }]), r, f.options); assert.match(result[0].reason, /permission class/);
+  // Native installation tokens may expose no usable permissions field; the mutation status decides.
+  f = api(); f.state.nativePermissions = undefined; result = await executePlan(approvedPlan(r, [{ actions: [comment] }]), r, f.options); assert.equal(result[0].status, 'applied');
+  f = api(); f.state.nativePermissions = undefined; f.state.mutationStatus = 403; result = await executePlan(approvedPlan(r, [{ actions: [issue] }]), r, f.options); assert.equal(result[0].status, 'failed'); assert.equal(result[0].reason, 'GitHub mutation http-403');
   f = api(); f.state.hasIssues = false; result = await executePlan(approvedPlan(r, [{ actions: [comment] }]), r, f.options); assert.equal(result[0].reason, 'issues-disabled-or-unknown');
 });
 
@@ -109,13 +112,19 @@ test('management-only CI export executes reviewed artifact without source bundle
   await mkdir(join(state, 'runs', r.day), { recursive: true }); await writeFile(join(state, 'runs', r.day, 'management.json'), JSON.stringify(approvedPlan(r, [{ actions: [issue] }]))); await writeFile(result, JSON.stringify(reportFor(r)));
   const task = { kind: 'management', day: r.day, repo: 'bugabinga/pufferpanel', ref: 'refs/heads/trunk', base: r.base, upstreamSha: r.upstreamSha, upstreamRef: r.upstreamRef, fingerprint: r.fingerprint };
   const preload = join(dir, 'fetch.mjs'), calls = join(dir, 'calls.json');
-  await writeFile(preload, `import fs from 'node:fs';globalThis.fetch=async(url,init={})=>{const calls=fs.existsSync(${JSON.stringify(calls)})?JSON.parse(fs.readFileSync(${JSON.stringify(calls)})):[];calls.push({url,method:init.method??'GET'});fs.writeFileSync(${JSON.stringify(calls)},JSON.stringify(calls));return{ok:true,status:200,headers:new Headers(),json:async()=>url.endsWith('/pufferpanel')?{full_name:'bugabinga/pufferpanel',has_issues:true,permissions:{push:true}}:[]};};`);
+  await writeFile(preload, `import fs from 'node:fs';globalThis.fetch=async(url,init={})=>{const calls=fs.existsSync(${JSON.stringify(calls)})?JSON.parse(fs.readFileSync(${JSON.stringify(calls)})):[];calls.push({url,method:init.method??'GET'});fs.writeFileSync(${JSON.stringify(calls)},JSON.stringify(calls));const status=init.method&&init.method!=='GET'?Number(process.env.FAKE_MUTATION_STATUS??200):200;return{ok:status<300,status,headers:new Headers(),json:async()=>url.endsWith('/pufferpanel')?{full_name:'bugabinga/pufferpanel',has_issues:true}:[]};};`);
   const env = { ...process.env, GITHUB_ACTIONS: 'false', NODE_OPTIONS: `--import=${preload}`, PUFFER_MAINT_TASK: JSON.stringify(task), PUFFER_MAINT_RESULT: result, PUFFER_MAINT_SOURCE: source, PUFFER_MAINT_STATE: state, HONEST_ANNIE_ARTIFACT: artifact, GITHUB_SHA: r.base, GITHUB_OUTPUT: output, GH_TOKEN: 'native' };
   for (const command of ['export', 'management']) { const res = spawnSync('node', [new URL('./ci-source.mjs', import.meta.url).pathname, command], { env, encoding: 'utf8' }); assert.equal(res.status, 0, res.stderr); }
   assert.match(await readFile(output, 'utf8'), /candidate=false\nsourcecandidate=false\nmanagement=true/);
   await assert.rejects(readFile(join(artifact, 'candidate.bundle')));
   const receipts = JSON.parse(await readFile(join(state, 'runs', r.day, 'action-receipts.json'))); assert.equal(receipts[0].status, 'applied');
   assert.equal(git('-C', source, 'rev-parse', 'HEAD'), base); assert.equal(git('-C', source, 'status', '--porcelain'), '');
+  // Best-effort management: failed receipts are recorded and summarized, never a failing step.
+  const summary = join(dir, 'summary.md');
+  const denied = spawnSync('bash', [new URL('./ci.sh', import.meta.url).pathname, 'management'], { env: { ...env, FAKE_MUTATION_STATUS: '403', GITHUB_STEP_SUMMARY: summary }, encoding: 'utf8' });
+  assert.equal(denied.status, 0, denied.stderr); assert.match(denied.stderr, /management receipts failed: create-issue \(GitHub mutation http-403\)/);
+  assert.match(await readFile(summary, 'utf8'), /management receipts failed: create-issue \(GitHub mutation http-403\)/);
+  assert.equal(JSON.parse(await readFile(join(state, 'runs', r.day, 'action-receipts.json')))[0].status, 'failed');
   await writeFile(join(source, 'app.txt'), 'independent advance'); git('-C', source, 'commit', '-am', 'independent'); git('-C', source, 'push', 'origin', 'trunk');
   const stale = spawnSync('node', [new URL('./ci-source.mjs', import.meta.url).pathname, 'management'], { env, encoding: 'utf8' });
   assert.notEqual(stale.status, 0); assert.match(stale.stderr, /source context is stale/);

@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import YAML from 'yaml';
 import { createRuntime, selectModels, snapshot } from './maintain.mjs';
 
 const moduleDir = new URL('.', import.meta.url).pathname;
@@ -80,7 +81,7 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   const workflow = readFileSync(join(moduleDir, '../../.github/workflows/honest-annie.yml'), 'utf8');
   const check = workflow.slice(workflow.indexOf('  check:'), workflow.indexOf('  maintain:'));
   const maintain = workflow.slice(workflow.indexOf('  maintain:'), workflow.indexOf('  release:'));
-  const release = workflow.slice(workflow.indexOf('  release:'));
+  const release = workflow.slice(workflow.indexOf('  release:'), workflow.indexOf('  retry-effects:'));
   assert.doesNotMatch(check, /secrets\.|contents: write/);
   assert.match(maintain, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(maintain, /github\.ref == 'refs\/heads\/trunk'/);
   assert.match(maintain, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(maintain, /secrets\.ZAI_API_KEY/);
@@ -90,6 +91,15 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
   assert.match(release, /contents: write/); assert.doesNotMatch(release, /ZAI_API_KEY/);
   assert.ok(release.indexOf('ci.sh gate') < release.indexOf('secrets.REGISTRY_PASSWORD'));
   for (const [, ref] of workflow.matchAll(/^\s*- uses: ([^\s]+)/gm)) assert.match(ref, /@[a-f0-9]{40}$/);
+  // Model-free republish: trusted harness checkout, release environment, read-only token, gates before registry secrets.
+  const job = YAML.parse(workflow).jobs.republish, text = workflow.slice(workflow.indexOf('\n  republish:\n'));
+  assert.deepEqual(job.needs, ['check', 'observe']); assert.deepEqual(job.permissions, { contents: 'read' }); assert.equal(job.environment, 'honest-annie-release'); assert.equal(job['timeout-minutes'], 90);
+  assert.match(job.if, /github\.repository == 'bugabinga\/pufferpanel'/); assert.match(job.if, /github\.ref == 'refs\/heads\/trunk'/); assert.match(job.if, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(job.if, /needs\.observe\.outputs\.republish != ''/);
+  assert.deepEqual(job.steps[0].with, { ref: '${{ github.sha }}', 'fetch-depth': 0, 'persist-credentials': false });
+  assert.doesNotMatch(text, /ZAI_API_KEY|ANNIE_GH_TOKEN|: write|needs\.observe\.outputs\.task|download-artifact/);
+  assert.ok(text.indexOf('republish.mjs verify') < text.indexOf('republish.mjs gate') && text.indexOf('republish.mjs gate') < text.indexOf('secrets.REGISTRY_PASSWORD') && text.indexOf('secrets.REGISTRY_PASSWORD') < text.indexOf('republish.mjs publish'));
+  assert.equal(job.steps.find(step => step.uses?.startsWith('actions/upload-artifact@')).with.name, 'honest-annie-republish-report-${{ github.run_id }}-${{ github.run_attempt }}');
+  assert.equal(job.steps.at(-1).run, 'bash tools/maintainer/ci.sh cleanup'); assert.equal(job.steps.at(-1).if, 'always()');
 });
 test('reviewed CI bundle imports exact commit, pushes once, and safely retries', t => {
   const f = fixture(t);

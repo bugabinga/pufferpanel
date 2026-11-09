@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 export const OWN = 'bugabinga/pufferpanel';
 export const REF = 'refs/heads/trunk';
 export const isSha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
+export const versionFor = day => day.split('-').map(Number).join('.');
 export function validateTask(value) {
   const keys = ['kind', 'day', 'repo', 'ref', 'base', 'upstreamSha', 'upstreamRef', 'number', 'head', 'author', 'fingerprint'];
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !keys.includes(key))) throw Error('invalid selected task fields');

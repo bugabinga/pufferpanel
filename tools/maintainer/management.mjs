@@ -37,7 +37,8 @@ export async function executePlan(plan, run, { fetchImpl = fetch, token = proces
       const admin = action.kind === 'enable-issues'; const auth = admin ? adminToken : token;
       if (!auth) throw Error(admin ? 'missing admin auth' : 'missing native auth');
       const repo = await read('', auth);
-      if (repo.full_name !== OWN || (admin ? repo.permissions?.admin !== true : repo.permissions?.push !== true)) throw Error('unknown or insufficient permission class');
+      // Native installation tokens may report no usable repo permissions; their mutation HTTP status is the authority.
+      if (repo.full_name !== OWN || admin && repo.permissions?.admin !== true) throw Error('unknown or insufficient permission class');
       if (admin) {
         if (repo.has_issues === true) { receipt.status = 'skipped'; receipt.reason = 'already-enabled'; }
         else if (repo.has_issues !== false) throw Error('unknown issues setting');
