@@ -3,7 +3,7 @@ import { inflateRawSync } from 'node:zlib';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, isSha, providerId, validateHolds, validateTask, versionFor } from './task.mjs';
+import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
 import { REPAIRABLE, detectIncidents, foldIncidents, makeDigest, ready, syncIncidents, syncable, validateIncidents } from './incident.mjs';
 
@@ -21,6 +21,17 @@ const failureList = value => Array.isArray(value) && value.length <= 64 && value
 export function prFingerprint({ number, head, base, policy }) { return digest({ number, head, base, policy }); }
 // Once per incident and trusted policy: a merged harness change (new policy) earns a recurring incident one more attempt.
 export const harnessFingerprint = (incident, policy) => digest({ kind: 'harness', incident, policy });
+// Rejection memory: each review-rejected maintenance run's changed-file area and first five blocking findings, deduplicated
+// by run, kept 30 days, at most the 20 newest.
+export function foldRejections(previous, records, now) {
+  const remembered = new Map(previous.map(entry => [entry.runId, entry]));
+  for (const { run, lease, settlement } of records) {
+    if (lease?.task.kind !== 'maintenance' || settlement?.phase !== 'rejected' || settlement.reason !== 'review-rejected' || !settlement.changedFiles) continue;
+    const { files, count, digest: area } = settlement.changedFiles;
+    remembered.set(run.id, { runId: run.id, day: lease.task.day, files, count, digest: area, findings: (settlement.blockingFindings ?? []).slice(0, 5) });
+  }
+  return activeRejections([...remembered.values()].sort((a, b) => a.runId - b.runId), now).slice(-20);
+}
 export function makeLease({ run, repoId, workflowId, task, cap, now = Date.now() }) {
   if (run.run_attempt !== 1 || !integer(run.id) || !integer(repoId) || !integer(workflowId) || !isSha(run.head_sha) || !allowedEvents.includes(run.event)) fail('ineligible paid execution');
   const createdAt = time(run.created_at), deadline = createdAt + 2 * HOUR;
@@ -190,7 +201,7 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
     let decision = null;
     if (cp && !cp.expired) {
       const value = await api.artifact(cp, 'checkpoint.json');
-      const keys = ['schema', 'runId', 'repoId', 'handled', 'slots', 'paid', 'queue', 'pendingRuns', 'lastMaintenance', 'upstream', 'inputBase', 'flights', 'outcomes', 'environment', 'receipts', 'blocked', 'republish', 'providers', 'providerHolds', 'incidents'];
+      const keys = ['schema', 'runId', 'repoId', 'handled', 'slots', 'paid', 'queue', 'pendingRuns', 'lastMaintenance', 'upstream', 'inputBase', 'flights', 'outcomes', 'environment', 'receipts', 'blocked', 'republish', 'providers', 'providerHolds', 'incidents', 'rejections'];
       if (!value || Object.keys(value).some(key => !keys.includes(key)) || ['queue', 'lastMaintenance'].some(key => value[key] !== undefined && !/^[a-f0-9]{64}$/.test(value[key])) || ['upstream', 'inputBase'].some(key => value[key] !== undefined && !isSha(value[key])) || value.paid !== undefined && typeof value.paid !== 'boolean') fail('malformed decision checkpoint fields');
       if (value.pendingRuns !== undefined && (!Array.isArray(value.pendingRuns) || value.pendingRuns.length > 20 || value.pendingRuns.some(id => !integer(id)))) fail('malformed pending checkpoint');
       if (value.schema !== 1 || value.runId !== run.id || value.repoId !== repo.id || !Array.isArray(value.handled) || value.handled.length > 200 || value.handled.some(v => !/^[a-f0-9]{64}$/.test(v)) || !Array.isArray(value.slots) || value.slots.length > 32 || value.slots.some(v => !/^\d{4}-\d{2}-\d{2}$/.test(v))) fail('malformed decision checkpoint');
@@ -200,6 +211,7 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
       if (value.providers !== undefined && (!value.providers || Object.keys(value.providers).sort().join() !== 'available,signal' || !/^[a-f0-9]{64}$/.test(value.providers.signal) || !providerList(value.providers.available))) fail('malformed provider scope');
       if (value.providerHolds !== undefined) validateHolds(value.providerHolds);
       if (value.incidents !== undefined) validateIncidents(value.incidents);
+      if (value.rejections !== undefined) validateRejections(value.rejections);
       if (value.blocked !== undefined && (!Array.isArray(value.blocked) || value.blocked.length > 20 || value.blocked.some(b => !integer(b.runId) || !['expired-candidate-identity', 'admission-unreconciled'].includes(b.reason)))) fail('malformed blocked receipts');
       if (value.republish !== undefined && (!Array.isArray(value.republish) || value.republish.length > 20 || value.republish.some(r => !r || Object.keys(r).sort().join(',') !== 'attempts,nextAt,runId' || !integer(r.runId) || !integer(r.attempts) || r.attempts > 3 || !Number.isFinite(r.nextAt)) || new Set(value.republish.map(r => r.runId)).size !== value.republish.length)) fail('malformed republish attempts');
       if (value.receipts !== undefined && (!Array.isArray(value.receipts) || value.receipts.length > 20 || value.receipts.some(r => !integer(r.runId) || r.runId !== r.lease?.runId))) fail('malformed pending receipts');
@@ -264,6 +276,7 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
           if (settlement.taskKind !== lease.task.kind || settlement.day !== lease.task.day || settlement.base !== lease.task.base || typeof settlement.managementApproved !== 'boolean' || !['admitted', 'executing', 'reviewing', 'gating', 'committing', 'publishing', 'published', 'rejected', 'failed', 'managing'].includes(settlement.phase) || settlement.commit !== null && !isSha(settlement.commit) || settlement.releaseCommit !== null && !isSha(settlement.releaseCommit) || Boolean(settlement.commit) !== Boolean(settlement.releaseCommit) || !['known', 'unknown'].includes(settlement.reportedUsage?.status) || settlement.usageComplete !== null && typeof settlement.usageComplete !== 'boolean' || settlement.reportedUsage.status === 'known' && (!Number.isFinite(settlement.reportedUsage.cost) || settlement.reportedUsage.cost < 0)) fail('malformed settlement schema');
           if (settlement.sourceIdentity && ['base', 'commit', 'releaseCommit'].some(key => settlement[key] !== settlement.sourceIdentity[key])) fail('inconsistent settlement source identity');
           if (settlement.providers !== undefined && !providerList(settlement.providers) || settlement.providerFailures !== undefined && !failureList(settlement.providerFailures)) fail('malformed settlement provider evidence');
+          if (settlement.changedFiles != null && !validChanged(settlement.changedFiles) || settlement.blockingFindings !== undefined && !validFindings(settlement.blockingFindings, 10)) fail('malformed settlement rejection evidence');
         }
       }
       if (run.run_attempt > 1) {
@@ -450,6 +463,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     }
   }
   fresh.providerHolds = [...holds.values()].filter(hold => hold.until > now).slice(0, 64);
+  fresh.rejections = foldRejections(checkpoint.rejections ?? [], ledger.records, now);
   const heldProviders = new Set(fresh.providerHolds.map(hold => hold.provider));
   const providersHeld = fresh.providers.available.length > 0 && fresh.providers.available.every(provider => heldProviders.has(provider));
   const holdsExpireAt = providersHeld ? new Date(Math.min(...fresh.providerHolds.filter(hold => fresh.providers.available.includes(hold.provider)).map(hold => hold.until))).toISOString() : null;
@@ -539,7 +553,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   }
   const output = outputs(env);
   await output('retry', retry ? JSON.stringify(retry) : ''); await output('republish', republish ? JSON.stringify(republish) : '');
-  await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state); await output('holds', JSON.stringify(fresh.providerHolds));
+  await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state); await output('holds', JSON.stringify(fresh.providerHolds)); await output('rejections', JSON.stringify(fresh.rejections));
   const issueWork = syncable(fresh.incidents), repairing = lease && task.kind === 'harness' ? fresh.incidents.find(incident => incident.fingerprint === task.incident) : null;
   await output('incidents', issueWork.length ? JSON.stringify(issueWork) : ''); await output('incident', repairing ? JSON.stringify(await harnessDigest(api, repairing, ledger.records)) : '');
   const summary = { state, mode, providerHolds: fresh.providerHolds.map(hold => ({ ...hold, until: new Date(hold.until).toISOString() })), holdsExpireAt, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint, incidents: fresh.incidents.map(i => ({ fingerprint: i.fingerprint, kind: i.kind, detail: i.detail, count: i.count, status: i.status, ready: ready(i) })), harnessRepair: repairing ? { incident: repairing.fingerprint, kind: repairing.kind } : null };

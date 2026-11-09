@@ -386,6 +386,24 @@ test('provider holds expire, the next provider still runs, and malformed provide
   const expired = await f.execute(); assert.deepEqual(expired.providerHolds, []); assert.equal(expired.holdsExpireAt, null);
 });
 
+test('rejection memory: a review-rejected maintenance report reaches the checkpoint and the maintain output; malformed evidence fails closed', async t => {
+  const area = { files: ['web/backup/download.go'], count: 1, digest: 'e'.repeat(64) }, findings = [{ id: 'unbounded-range', impact: 'serves bytes past the end' }];
+  const f = await heldFixture(t, [], { phase: 'rejected', reason: 'review-rejected', modelFailure: null, changedFiles: area, blockingFindings: findings });
+  f.setClock(now + 2 * 3600000); f.setCurrent(43);
+  const observed = await f.execute({ GITHUB_OUTPUT: join(f.dir, 'out-43') });
+  const memory = [{ runId: 42, day: '2026-04-03', ...area, findings }], cp = await f.json('checkpoint.json');
+  assert.deepEqual(cp.rejections, memory); assert.notEqual(observed.state, 'blocked');
+  assert.ok((await readFile(join(f.dir, 'out-43'), 'utf8')).includes(`rejections=${JSON.stringify(memory)}\n`));
+  // The next observation carries it from the checkpoint alone; a forged checkpoint entry blocks observation.
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', { ...cp, paid: false, flights: [] });
+  f.setClock(now + 2 * 3600000 + 60000); f.setCurrent(44); await f.execute();
+  assert.deepEqual((await f.json('checkpoint.json')).rejections, memory);
+  const forged = await fixture(t); forged.runs.push(forged.run(41)); forged.artifact(41, 'annie-checkpoint-41-1', 'checkpoint.json', { ...cp, runId: 41, rejections: [{ ...memory[0], files: ['../x y'] }] });
+  await assert.rejects(forged.execute(), /malformed rejection memory/);
+  const bad = await heldFixture(t, [], { phase: 'rejected', reason: 'review-rejected', changedFiles: { ...area, count: 0 } }); bad.setClock(now + 2 * 3600000); bad.setCurrent(43);
+  await assert.rejects(bad.execute(), /malformed settlement rejection evidence/);
+});
+
 test('incidents: failed effects jobs dedupe across observes, then admit one $5 harness repair without a calendar slot, once per incident and policy', async t => {
   const f = await fixture(t), outputPath = join(f.dir, 'outputs'), outputs = async () => Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
   await f.execute({ ANNIE_MODE: 'observe' }); const first = await f.json('checkpoint.json');

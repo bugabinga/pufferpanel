@@ -43,7 +43,9 @@ Selected tasks key requests by fingerprint; calendar image tags still permit onl
 SQLite checkpoints retain execution, reviewer identity, reviewed tree/hash, commit, version, and publication phase.
 Pi Durable `1.4.0`+ migrates an existing desktop `maintain.sqlite` to storage schema version 2 on first open; that file cannot be opened by `1.3.0` or earlier, so downgrading the harness requires fresh desktop state.
 Hosted runs always start from fresh state and are unaffected.
-An interrupted commit is accepted only when tree, full expected parent list, subject, and cleanliness prove it is the same reviewed commit.
+The exact commit message is checkpointed with the `committing` phase, and the host commits it with `--cleanup=verbatim`.
+An interrupted commit is accepted only when tree, full expected parent list, exact persisted message, and cleanliness prove it is the same reviewed commit; a commit hook that edits the message fails the commit.
+Runs that reached `committing` before messages were persisted keep the legacy subject-only message.
 An ordinary patch has exact parent `[base]`; a resolved upstream merge has exact parents `[base, pinnedUpstreamSha]` and only when `MERGE_HEAD` was that pinned SHA.
 Pending publication is reconciled before a new daily batch, even after its original model deadline.
 Interrupted non-replay-safe shell tools are reported as interrupted, not blindly rerun by the durable runtime.
@@ -81,7 +83,13 @@ pi-ai may still clamp the sent value to the remaining context, so the reservatio
 An offline test drives the real pi-ai anthropic-messages and openai-completions adapters and fails if the sent `max_tokens` differs from the reservation; bedrock is not covered.
 Both conversations are offered only Pi Durable's `codemode` tool (QuickJS sandbox, 256 MiB VM memory limit); the reviewer also gets `submit_verdict`.
 Each executor turn's final stop reason is reported in `executorDiagnostics`; a final answer cut at the output cap, which can silently drop a truncated codemode script, gets one continuation per executor conversation asking for a shorter script.
-Scripts call the other tools as nested calls; `codemode` and `submit_verdict` are model-only, and script `models.*` is disabled because it would bypass this provider boundary.
+Scripts call the other tools as nested calls; `codemode` and `submit_verdict` are model-only.
+Script `models.*` reaches only code mode's internal tools, which call the Harness models, which are this budgeted boundary.
+`models.classify()` reserves its serialized input bytes as tokens plus 4096 tokens of template and answer headroom, capped at the classifier's context window, at its highest catalog price, and commits that intent before dispatch inside the same lease, `$15` cap, deadline, and 256-call limit.
+It dispatches without provider retries; a completed result with reported prompt tokens settles at pi-ai's usage cost, a provider error settles at the reservation, and missing usage, aborts, or interruption keep the reservation held.
+Classifier calls count toward cost and call count but never toward provider failures, holds, failover, or `modelFailure`, because scripts control their input.
+`models.generateImages()` returns an error without dispatch, raw `stream`, `complete`, and deferred calls are refused, and compaction's `completeSimple` uses the budgeted chat path.
+Executor and reviewer instructions say classifiers serve cheap triage, such as whether a log mentions a flaky test, and that their answers are untrusted advice.
 Nested `bash` uses the same prepared credential-free shell environment.
 Code mode replays a script after a restart from its journal; per Pi Durable's replay policy a nested `bash` interrupted mid-run is not replay-safe, so it rejects in the script as interrupted instead of rerunning.
 The budget is based on provider-reported usage and quoted prices, not a guarantee about subscription billing or unreported work interrupted before a usage receipt.
@@ -102,6 +110,25 @@ Observe passes active holds to the maintain job as `ANNIE_PROVIDER_HOLDS`; maint
 When every known candidate provider is held, observe admits no paid work, reports `providers-held`, and names when the earliest hold expires.
 Provider-attributed quota/auth failures replace the shared 24-hour environment cooldown for that run; other environment failures keep it.
 Per-run failover is unchanged.
+
+### Rejection memory
+
+The model report carries `changedFiles` (at most 20 sorted safe paths, the full path count, and a SHA-256 of every changed path) and `blockingFindings` (at most 10 ids with impacts of at most 160 redacted characters).
+The area is Annie's own delta: for a pinned upstream merge, only paths differing from both base and upstream, unless the merge is the whole change.
+Observe folds each review-rejected maintenance report into checkpoint `rejections`: at most 20 strictly validated `{runId, day, files, count, digest, findings}` entries with at most five findings, kept 30 days.
+Observe passes them to the maintain job as `ANNIE_REJECTIONS`; maintain validates them strictly and adds them to the untrusted intake as `rejections`.
+The maintenance prompt then says not to resubmit the same change unless every finding is addressed with evidence.
+Two areas match on equal digests, or on Jaccard similarity of at least 0.6 when both path lists are complete; larger changes match only by digest.
+A maintenance candidate whose area matches at least two rejections within 30 days is refused before review, so no reviewer is paid.
+That run ends `published` without source or plans, with reason and outcome `repeat-rejected`: a normal handled no-op, not an incident.
+A pure upstream merge without changed paths is neither remembered nor refused.
+
+### Commit messages
+
+The subject is `maintenance: DAY: HEADLINE`, cut at 72 characters, where the headline is the first line of the executor's final answer, which the prompt asks to name the main change, or `merge upstream SHA12` without one.
+PR commits use `maintenance: DAY: integrate PR #N`, and harness repairs keep `fix(annie): harness repair for incident FP12`.
+The body holds at most 2 KiB of the remaining summary, the reviewer's `checked` list, and advisory findings, then host facts: pinned upstream merge, PR head, incident, gate repair, and a closing host line.
+Model text is redacted like reports, stripped of control, format, and bidi characters, wrapped at 72 columns behind a host indent or bullet, and never starts a line, so it cannot forge Git trailers.
 
 ## GitHub setup
 
@@ -271,7 +298,7 @@ Bootstrap defaults off, requires no checkpoint/lease evidence in the supported h
 A later invocation cannot reuse that run-bound grant; missing/expired checkpoints require operator recovery, not another empty-ledger bootstrap.
 Lost state requires explicit operator recovery, not automatic fresh paid admission.
 `ANNIE_OUTPUT_DIR` belongs in runner temporary space and contains only sanitized `checkpoint.json`, `observer.json`, and optional original `lease.json`.
-Intake bodies remain ephemeral; checkpoint hashes contain no issue/PR bodies, titles, transcripts, or reviewer findings.
+Intake bodies remain ephemeral; checkpoint hashes contain no issue/PR bodies, titles, or transcripts, and reviewer findings appear only as bounded rejection-memory ids and impacts.
 Issue title/body/state changes can be useful inputs; labels/comments alone never create an own-effect paid loop.
 Exact own source H is acknowledged without swallowing a concurrent human source commit.
 PR fingerprints bind number/H/B/protected-policy identity and exclude clock, upstream, review timestamps, and attempt IDs.
@@ -329,7 +356,7 @@ Healthy observations download recent accounting artifacts and checkpoint-carried
 Pending receipts preserve original lease identity, sanitized settlement, candidate metadata, and original artifact timestamps across 14-day artifact expiry.
 Expired/missing candidate packs and exhausted effects retries are reported as abandoned, never as completion; receipt refresh never manufactures approval or completion.
 An expired original lease on an old-created recent rerun retains unknown spend without crashing observation; an unsupported expired candidate identity is carried as an explicit blocker rather than silently forgotten.
-Bounds remain 999 counted records/window, 198 current PRs, 200 handled fingerprints/outcomes, 20 outstanding receipts/flights, 32 calendar slots, and 256KiB ZIP/128KiB JSON payloads.
+Bounds remain 999 counted records/window, 198 current PRs, 200 handled fingerprints/outcomes, 20 outstanding receipts/flights, 32 calendar slots, 20 rejection-memory entries, and 256KiB ZIP/128KiB JSON payloads.
 Admission records an in-flight task, not terminal handling; verified original-attempt job/step evidence that the model-capable step was skipped releases the flight/calendar slot without charging a lease.
 Manual check mode itself remains fully offline; later native observers establish zero dispatch from job metadata, never from the event name alone.
 Only valid no-op, substantive rejection, or approved work acknowledges maintenance inputs; invalid review output and transient failures remain bot retries, bounded to three attempts per fingerprint with one-hour backoff.

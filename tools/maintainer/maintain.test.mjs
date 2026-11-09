@@ -17,6 +17,10 @@ import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './g
 import { fakeReviewSandbox } from './fake-podman.mjs';
 import { createGuard } from './guard.mjs';
 import { reportFor } from './report.mjs';
+import { changedFiles } from './task.mjs';
+// Rejection memory entries dated relative to now: two for the fixture's value.txt area, two for an unrelated area.
+const daysAgo = days => new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+const memory = (paths, ...runIds) => runIds.map((runId, index) => ({ runId, day: daysAgo(3 + index * 7), ...changedFiles(paths), findings: [{ id: 'unsafe-change', impact: 'breaks fixture' }] }));
 
 const ctx = BACKGROUND_CONTEXT;
 const blocking = { id: 'unsafe-change', severity: 'blocking', file: 'value.txt', line: 1, impact: 'breaks fixture', evidence: 'diff sets after', correction: 'revert it' };
@@ -41,6 +45,18 @@ test('actual SQLite resumes old run without duplicate admission', async t => {
   const second = await open(db); const resumed = hooks();
   const run = await advance(second.root, { ...resumed, day: '2026-04-04' });
   assert.equal(run.day, '2026-04-03'); assert.equal(run.phase, 'published'); assert.equal(resumed.state.admitted, 0);
+  await second.harness.close(ctx);
+});
+test('the exact commit message is checkpointed before the commit and reused when an interrupted commit resumes', async t => {
+  const db = join(await scratch(t), 'run.sqlite'), first = await open(db), seen = [];
+  const h = hooks({ prepare: async () => ({ taskKind: 'maintenance' }), execute: async run => { run.summary = 'Fix restart race\nDetails.'; return { base: 'c0', head: 'c1', tree: 't1', diff: 'x', changed: true, cost: 1 }; }, commit: async run => { seen.push(run.commitMessage); throw Error('interrupted during commit'); } });
+  await assert.rejects(advance(first.root, { ...h, day: '2026-04-03' }), /interrupted during commit/);
+  const persisted = (await getRun(first.root, first.harness)).commitMessage;
+  assert.equal(persisted, seen[0]); assert.match(persisted, /^maintenance: 2026-04-03: Fix restart race\n\nSummary/);
+  await first.harness.close(ctx);
+  const second = await open(db), resumed = hooks({ commit: async run => { seen.push(run.commitMessage); resumed.state.inspection.head = 'c2'; return 'c2'; } });
+  const run = await advance(second.root, { ...resumed, day: '2026-04-03' });
+  assert.equal(run.phase, 'published'); assert.deepEqual(seen, [persisted, persisted]);
   await second.harness.close(ctx);
 });
 test('run reads detach deeply from SDK snapshot ownership', async t => {
@@ -76,11 +92,12 @@ test('approved management-only run defers gates, commit, and publication', async
   await harness.close(ctx);
 });
 test('host derives verdict: exactly one recorded call, approved iff no blocking finding, bounded mapped findings', () => {
-  assert.deepEqual(reviewVerdict(approval), { approve: true, findings: [], checked: ['diff'], reason: 'approved' });
+  assert.deepEqual(reviewVerdict(approval), { approve: true, findings: [], checked: ['diff'], blocking: [], reason: 'approved' });
+  assert.deepEqual(reviewVerdict(recorded({ findings: [advisory, blocking], checked: ['diff'] })).blocking, [{ id: 'unsafe-change', impact: 'breaks fixture' }]);
   assert.deepEqual(reviewVerdict(recorded({ findings: [advisory, blocking], checked: ['diff'] })).findings, ['[blocking] unsafe-change (value.txt:1): breaks fixture — diff sets after — revert it', '[advisory] naming: unclear name — value.txt — rename later']);
   assert.equal(reviewVerdict(recorded({ findings: [advisory], checked: ['diff'] })).approve, true);
   assert.equal(reviewVerdict(recorded({ findings: [{ ...blocking, evidence: 'x'.repeat(600) }], checked: ['diff'] })).findings[0].length, 500);
-  for (const calls of [undefined, {}, recorded({ findings: [], checked: ['diff'] }, { findings: [], checked: ['diff'] }), recorded({ findings: 'none', checked: [] }), recorded({ findings: [{ ...blocking, severity: 'fatal' }], checked: ['diff'] })]) assert.deepEqual(reviewVerdict(calls), { approve: false, findings: [], checked: [], reason: 'invalid-review' });
+  for (const calls of [undefined, {}, recorded({ findings: [], checked: ['diff'] }, { findings: [], checked: ['diff'] }), recorded({ findings: 'none', checked: [] }), recorded({ findings: [{ ...blocking, severity: 'fatal' }], checked: ['diff'] })]) assert.deepEqual(reviewVerdict(calls), { approve: false, findings: [], checked: [], blocking: [], reason: 'invalid-review' });
 });
 test('missing, repeated, malformed, and blocking verdicts never reach gate', async t => {
   for (const verdicts of [{}, recorded({ findings: [], checked: ['diff'] }, { findings: [], checked: ['diff'] }), recorded({ findings: 'none', checked: [] }), recorded({ findings: [blocking], checked: ['diff'] })]) {
@@ -343,6 +360,8 @@ test('real faux codemode executor/reviewer, verdict tool, host commit, and SQLit
     { name: 'container cleanup failure keeps a recorded verdict and is reported', review: [round(sandboxLeak), submit], approved: true, verdictCalls: 1, leaked: true },
     { name: 'container cleanup failure without any verdict fails the review', review: [round(sandboxLeak), fauxAssistantMessage('Looks fine.'), fauxAssistantMessage('Still fine.')], leakedNoVerdict: true },
     { name: 'too little time to prime leaves the review read-only and still reaches the gate', review: [submit], approved: true, verdictCalls: 1, tight: true },
+    { name: 'unrelated rejection memory reaches the executor, review, and publication', review: [submit], approved: true, verdictCalls: 1, rejections: memory(['client/backup.js', 'web/backup.go'], 7, 8) },
+    { name: 'a change whose area was rejected twice is refused before review as a no-op', review: [submit], rejections: memory(['value.txt'], 7, 8), repeat: true },
   ]) await t.test(scenario.name, async t => {
   const dir = await scratch(t); const source = join(dir, 'source'); await mkdir(source);
   const git = repo(source); git('init', '-q', '-b', 'main'); git('config', 'user.name', 'test'); git('config', 'user.email', 'test@example.test');
@@ -370,6 +389,7 @@ for (const attempt of [() => tools.write({ path: '.github/x', content: 'unsafe' 
 if (!/host-trusted harness.CI policy/.test(refused[0]) || !/host commits/.test(refused[1])) throw new Error('guard missing: ' + refused.join(' | '));
 const intake = await tools.bash({ command: 'cat "$PUFFER_MAINT_INTAKE"' });
 if (JSON.parse(intake.output).upstream.repo !== 'pufferpanel/pufferpanel') throw new Error('spotlit intake JSON must stay parseable');
+console.log('rejection-memory', JSON.parse(intake.output).rejections?.length ?? 0);
 const [current, listing] = await Promise.all([tools.read({ path: 'value.txt' }), tools.bash({ command: 'git status --porcelain' })]);
 if (!current.includes('before') || listing.exitCode !== 0) throw new Error('unexpected base');
 await tools.write({ path: 'value.txt', content: 'after' });${scenario.ui ? "\nawait tools.write({ path: 'client/view.txt', content: 'ui' });" : ''}
@@ -405,7 +425,7 @@ console.log(JSON.parse(plans).length, diff.includes('after'));`;
   const root = await harness.root(ctx); Object.assign(policy, { root, harness });
   const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc }); const githubPlanReader = installGitHubPlanReader(registry, root);
   const fixtureFetch = async url => ({ ok: true, status: 200, headers: new Headers(), json: async () => url.includes('/git/ref/') ? { object: { sha: git('rev-parse', 'HEAD') } } : url.includes('/repos/') && !url.includes('/issues') && !url.includes('/pulls') ? { default_branch: 'main' } : [] });
-  const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, reviewSandbox: sandbox, executorExtension, githubPlanReader, guard, policy, instructions: 'Test coding fixture.', snapshotHttp: fixtureFetch, upstreamUrl: source });
+  const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, reviewSandbox: sandbox, executorExtension, githubPlanReader, guard, policy, instructions: 'Test coding fixture.', snapshotHttp: fixtureFetch, upstreamUrl: source, ...(scenario.rejections ? { rejections: scenario.rejections } : {}) });
   t.after(() => host.dispose());
   let gated = 0, published = 0, firstReviewer = null;
   host.gate = async run => {
@@ -432,6 +452,14 @@ console.log(JSON.parse(plans).length, diff.includes('after'));`;
     assert.equal(failed.sandbox.cleanupFailed, true); assert.equal(reportFor(failed).sandbox.cleanupFailed, true); assert.equal(failed.review, undefined); assert.equal(gated, 0);
     await harness.close(ctx); return;
   }
+  if (scenario.repeat) {
+    const refused = await advance(root, { harness, ...host, day: '2026-04-03' }), report = reportFor(refused);
+    assert.deepEqual({ phase: refused.phase, reason: refused.reason, reviewer: refused.reviewer, changed: refused.changed, management: refused.management, gated, published }, { phase: 'published', reason: 'repeat-rejected', reviewer: undefined, changed: false, management: false, gated: 0, published: 0 });
+    assert.deepEqual({ outcome: report.outcome, kind: report.kind, changedFiles: report.changedFiles }, { outcome: 'repeat-rejected', kind: 'noop', changedFiles: changedFiles(['value.txt']) });
+    const items = JSON.stringify((await root.entries({}, 1000, undefined, ctx)).items);
+    assert.ok(items.includes('Previously rejected attempts are in the intake field') && items.includes('rejection-memory 2'));
+    await harness.close(ctx); return;
+  }
   // A one-hour lease leaves less than review plus gate reserve, so priming is skipped.
   const run = await advance(root, { harness, ...host, day: '2026-04-03', ...(scenario.tight ? { absoluteDeadline: Date.now() + 60 * 60_000 } : {}) });
   if (scenario.firstError) {
@@ -449,8 +477,11 @@ console.log(JSON.parse(plans).length, diff.includes('after'));`;
   assert.equal((await root.entries({}, 1000, undefined, ctx)).items.filter(entry => entry.model?.[0]?.role === 'user' && entry.model[0].content === LENGTH_REMINDER).length, scenario.lengthReminded ? 1 : 0);
   assert.deepEqual(reportFor(run).executorDiagnostics.map(entry => entry.lengthCapped), run.executorDiagnostics.map(entry => entry.stopReason === 'length'));
   const reviewer = await harness.conversation(run.reviewer, ctx), executorAgent = await root.agent(ctx), reviewerAgent = await reviewer.agent(ctx);
-  assert.deepEqual(executorAgent.callable.map(tool => tool.name).sort(), ['bash', 'edit', 'merge_upstream', 'propose_github', 'read', 'write']);
-  assert.deepEqual(reviewerAgent.callable.map(tool => tool.name).sort(), ['diff', 'read', 'read_github_plans', 'run', 'ui_snapshot']);
+  // Script models.* reach only code mode's internal tools, which scripts call through globals and the model never sees.
+  const internal = agent => agent.callable.filter(tool => tool.name.startsWith('pi.codemode.')).map(tool => [tool.name, tool.callers]);
+  for (const agent of [executorAgent, reviewerAgent]) assert.deepEqual(internal(agent), [['pi.codemode.models.classify', ['tools']], ['pi.codemode.models.generateImages', ['tools']]]);
+  assert.deepEqual(executorAgent.callable.map(tool => tool.name).filter(name => !name.startsWith('pi.codemode.')).sort(), ['bash', 'edit', 'merge_upstream', 'propose_github', 'read', 'write']);
+  assert.deepEqual(reviewerAgent.callable.map(tool => tool.name).filter(name => !name.startsWith('pi.codemode.')).sort(), ['diff', 'read', 'read_github_plans', 'run', 'ui_snapshot']);
   assert.equal(run.reviewDiagnostics[0].candidateUnchanged, !scenario.escaped);
   const sandboxRuns = (await fake.calls()).filter(call => call.args[6] === 'run' && !['sandbox-probe', 'visual-probe'].includes(call.args.at(-1)) && call.args.at(-2) !== 'visual');
   // The sanitized diagnostic reaches the run record and its public report shape.
@@ -477,7 +508,14 @@ console.log(JSON.parse(plans).length, diff.includes('after'));`;
   assert.equal(await readFile(join(worktree, 'value.txt'), 'utf8'), scenario.repair ? 'after-gate-repair' : 'after');
   await assert.rejects(stat(join(worktree, '.github')), { code: 'ENOENT' }); assert.equal(await readFile(join(source, 'value.txt'), 'utf8'), 'before');
   assert.equal((await harness.snapshot(GitHubPlansDoc, root.id, ctx)).plans.length, 1);
-  if (scenario.approved) assert.equal(await reconcileCommit(worktree, { ...run, head: run.base }), run.commit);
+  // The persisted message is the commit's exact message, and recovery accepts that commit only by it.
+  if (scenario.approved) {
+    assert.equal(execFileSync('git', ['-C', worktree, 'log', '-1', '--format=%B'], { encoding: 'utf8' }).trim(), run.commitMessage);
+    assert.match(run.commitMessage, /^maintenance: 2026-04-03: Fixed val/);
+    assert.equal(await reconcileCommit(worktree, { ...run, head: run.base }), run.commit);
+    await assert.rejects(reconcileCommit(worktree, { ...run, head: run.base, commitMessage: `${run.commitMessage}\nforged` }), /unexpected commit during recovery/);
+  }
+  if (scenario.rejections && !scenario.repeat) assert.ok(JSON.stringify((await root.entries({}, 1000, undefined, ctx)).items).includes('rejection-memory 2'));
   await advance(root, { harness, ...host, day: '2026-04-03' }); assert.equal(published, Number(scenario.approved));
   await harness.close(ctx);
   });

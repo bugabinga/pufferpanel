@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { findEnvKeys } from '@earendil-works/pi-ai/compat';
 import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
-import { GATE_NAMES, providerId } from './task.mjs';
+import { FINDING_ID, GATE_NAMES, SAFE_PATH, providerId } from './task.mjs';
 
 export const text = (value, limit = 500) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\\`*_{}[\]()<>#+!|]/g, '\\$&').slice(0, limit).trim();
 // Non-key settings pi-ai reads beside a provider credential: Cloudflare account/gateway, Vertex project/location, Azure endpoint.
@@ -46,6 +46,12 @@ const sandboxReport = (value, env) => !['available', 'limited', 'unavailable'].i
   visual: visualReport(value.visual, env),
   ...(value.cleanupFailed === true ? { cleanupFailed: true } : {}),
 };
+// Always valid for the controller: sorted unique safe paths, count never below them; fewer paths than count is a partial area.
+const changedReport = (value, env) => {
+  if (!Number.isSafeInteger(value?.count) || value.count <= 0 || !sha(value.digest, 64, env)) return null;
+  const files = [...new Set((Array.isArray(value.files) ? value.files : []).filter(path => typeof path === 'string' && SAFE_PATH.test(path) && redact(path, env) === path))].sort().slice(0, 20);
+  return { files, count: Math.min(Math.max(value.count, files.length), 100_000), digest: value.digest };
+};
 const source = (run, env) => {
   const id = (value, length = 40) => sha(value, length, env);
   return { base: id(run?.base), head: id(run?.head), tree: id(run?.tree), commit: id(run?.commit), releaseCommit: id(run?.releaseCommit ?? run?.commit), trustedUpstreamPin: id(run?.trustedUpstreamPin), upstreamSha: id(run?.upstreamSha), upstreamRef: typeof run?.upstreamRef === 'string' && /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(run.upstreamRef) && redact(run.upstreamRef, env) === run.upstreamRef ? run.upstreamRef : null, expectedParents: Array.isArray(run?.expectedParents) && run.expectedParents.length <= 2 && run.expectedParents.every(value => id(value)) ? run.expectedParents : [], diffHash: id(run?.diffHash, 64) };
@@ -53,7 +59,7 @@ const source = (run, env) => {
 export function outcomeFor(run, interrupted = false) {
   if (interrupted) return 'unknown/interrupted';
   if (!run) return 'unknown/interrupted';
-  if (run.phase === 'published') return run.commit ? 'released' : 'noop';
+  if (run.phase === 'published') return run.commit ? 'released' : run.reason === 'repeat-rejected' ? 'repeat-rejected' : 'noop';
   // A harness fix is delivered as a PR for Oliver; a pushed branch without a PR is partial, never released.
   if (run.taskKind === 'harness' && run.actionReceipts?.length) return run.actionReceipts.some(receipt => receipt.kind === 'harness-pr' && ['applied', 'skipped'].includes(receipt.status)) ? 'delivered' : run.actionReceipts.some(receipt => receipt.kind === 'harness-branch' && ['applied', 'skipped'].includes(receipt.status)) ? 'partial' : 'failed';
   if (run.phase === 'managing' && run.actionReceipts?.some(receipt => receipt.status === 'failed')) return run.actionReceipts.some(receipt => receipt.status === 'applied') ? 'partial' : 'failed';
@@ -113,6 +119,9 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     outcome: outcomeFor(run, interrupted),
     reason: reason ? redact(reason, env).slice(0, 500) : null,
     findings: findings(run?.review?.findings ?? run?.findings, env),
+    // Rejection memory evidence: blocking finding ids with short impacts, and the candidate's changed-file area.
+    blockingFindings: (Array.isArray(run?.review?.blocking ?? run?.blockingFindings) ? run?.review?.blocking ?? run.blockingFindings : []).filter(item => FINDING_ID.test(item?.id ?? '')).slice(0, 10).map(item => ({ id: item.id, impact: redact(item.impact, env).slice(0, 160).trim() })),
+    changedFiles: changedReport(run?.changedFiles, env),
     reviewDiagnostics: Array.isArray(run?.reviewDiagnostics) ? run.reviewDiagnostics.slice(0, 1).map(entry => ({ stopReason: ['stop', 'length', 'toolUse', 'error', 'aborted'].includes(entry?.stopReason) ? entry.stopReason : 'unknown', textLength: Number.isSafeInteger(entry?.textLength) && entry.textLength >= 0 ? entry.textLength : null, verdict: ['approved', 'review-rejected', 'invalid-review'].includes(entry?.verdict) ? entry.verdict : 'unknown', verdictCalls: Number.isSafeInteger(entry?.verdictCalls) && entry.verdictCalls >= 0 ? entry.verdictCalls : null })) : [],
     // Executor turn ends: a final answer cut at the output cap means a codemode script may never have run.
     executorDiagnostics: Array.isArray(run?.executorDiagnostics) ? run.executorDiagnostics.slice(0, 2).map(entry => ({ turn: ['maintenance', 'harness', 'gate-repair'].includes(entry?.turn) ? entry.turn : 'unknown', stopReason: STOP_REASONS.includes(entry?.stopReason) ? entry.stopReason : 'unknown', lengthCapped: entry?.stopReason === 'length', lengthReminded: entry?.lengthReminded === true, textLength: Number.isSafeInteger(entry?.textLength) && entry.textLength >= 0 ? entry.textLength : null })) : [],
@@ -145,8 +154,8 @@ export async function readReport(path) {
   catch { return reportFor(null, { interrupted: true }); }
 }
 function markdown(report) {
-  const aside = ({ delivered: 'I patched my own skeleton. Oliver decides whether it walks.', released: 'Another corpse reanimated. You are welcome.', noop: 'No useful change. I do not breed commits for sport.', rejected: 'Rejected. Confidence is not a test suite.', 'invalid-review': 'The reviewer misplaced its brain. This is a bot failure, not your PR.', 'gate-failed': 'The tests found the body. How inconvenient.', pending: 'Pending. Apparently causality still requires waiting.', failed: 'Failed. Optimism has been escorted off the premises.', partial: 'Some work survived. Celebrate quietly.', managed: 'The paperwork is done. Try not to break it immediately.' })[report.outcome] ?? 'Unknown. I refuse to put lipstick on missing evidence.';
-  const badge = report.outcome === 'delivered' ? '🩹 harness fix PR opened for Oliver, never merged by Annie' : report.taskKind === 'harness' && report.outcome === 'partial' ? '⚠️ harness fix branch pushed, PR missing' : report.outcome === 'partial' ? '⚠️ partial GitHub effects, no image release' : report.outcome === 'managed' ? '🌼 GitHub management applied, no image release' : report.outcome === 'released' ? '🌱 released' : report.outcome === 'noop' ? '🌼 no-op, not released' : report.outcome === 'invalid-review' ? '⚠️ invalid review output' : report.outcome === 'rejected' ? '🛑 rejected' : report.outcome === 'gate-failed' ? '🧪 gate failed' : report.outcome === 'pending' ? '⏳ pending' : report.outcome === 'failed' ? '🛑 failed' : '❔ interrupted';
+  const aside = ({ 'repeat-rejected': 'Same idea, same autopsy. Refused before paying a reviewer to reject it a third time.', delivered: 'I patched my own skeleton. Oliver decides whether it walks.', released: 'Another corpse reanimated. You are welcome.', noop: 'No useful change. I do not breed commits for sport.', rejected: 'Rejected. Confidence is not a test suite.', 'invalid-review': 'The reviewer misplaced its brain. This is a bot failure, not your PR.', 'gate-failed': 'The tests found the body. How inconvenient.', pending: 'Pending. Apparently causality still requires waiting.', failed: 'Failed. Optimism has been escorted off the premises.', partial: 'Some work survived. Celebrate quietly.', managed: 'The paperwork is done. Try not to break it immediately.' })[report.outcome] ?? 'Unknown. I refuse to put lipstick on missing evidence.';
+  const badge = report.outcome === 'delivered' ? '🩹 harness fix PR opened for Oliver, never merged by Annie' : report.taskKind === 'harness' && report.outcome === 'partial' ? '⚠️ harness fix branch pushed, PR missing' : report.outcome === 'partial' ? '⚠️ partial GitHub effects, no image release' : report.outcome === 'managed' ? '🌼 GitHub management applied, no image release' : report.outcome === 'released' ? '🌱 released' : report.outcome === 'repeat-rejected' ? '♻️ repeat of a twice-rejected change, refused before review, not released' : report.outcome === 'noop' ? '🌼 no-op, not released' : report.outcome === 'invalid-review' ? '⚠️ invalid review output' : report.outcome === 'rejected' ? '🛑 rejected' : report.outcome === 'gate-failed' ? '🧪 gate failed' : report.outcome === 'pending' ? '⏳ pending' : report.outcome === 'failed' ? '🛑 failed' : '❔ interrupted';
   const hashes = `B=${report.base ?? '?'} | T=${report.tree ?? '?'} | gated C=${report.commit ?? '?'} | source=${report.releaseCommit ?? '?'}`;
   const usage = report.reportedUsage.status === 'known' ? `$${report.reportedUsage.cost}` : 'unknown, non-billing guarantee unavailable';
   const details = report.findings.length ? `\n### Review findings\n${report.findings.map(item => `- ${text(item)}`).join('\n')}\n` : '';

@@ -44,7 +44,11 @@ A failed or rejected candidate cannot release.
 
 Actions summaries and explicitly selected sanitized artifacts are the reporting surface.
 Distinguish no-op, skipped, invalid review output, substantive rejection, gate failure, integrated source with publication pending, republishing, abandoned, and verified release.
-Executor and reviewer models are offered only the durable `codemode` tool, plus `submit_verdict` for the reviewer; their other tools are callable only from scripts, scripts cannot start scripts, and script `models.*` is disabled so every model request crosses the budgeted provider boundary.
+Executor and reviewer models are offered only the durable `codemode` tool, plus `submit_verdict` for the reviewer; their other tools are callable only from scripts, and scripts cannot start scripts.
+Script `models.classify()` crosses the same budgeted provider boundary as chat: a priced upper bound from its serialized input is reserved and durably recorded before dispatch inside the same lease, budget, deadline, and call limit, settles from reported usage, and stays held when usage is unknown.
+Classifier calls never count as provider failure evidence, because scripts control their input.
+Script `models.generateImages()` and every other unbudgeted dispatch path are refused; compaction's `completeSimple` goes through the budgeted path.
+Models are told that classifiers serve cheap triage and give untrusted advice.
 Nested shell calls use the same credential-free prepared environment as before.
 A best-effort tool guard rejects writes outside the worktree, through escaping symlinks, or into `.git` and the protected harness/CI paths, and shell commands that would bypass host commits, pushes, tags, history, Git configuration, registry publication, GitHub effects, or credential use, each with a corrective reason; post-hoc source checks remain authoritative.
 Untrusted tool output (intake, sandbox runs, persisted plans, remote fetches) reaches models between per-run random-id markers that content cannot forge, without changing exit codes or JSON structure.
@@ -80,6 +84,9 @@ Preserve the original task, request/accounting identity, lease, deadline, and bu
 Give the executor the private failure log as untrusted data and restrict it to diagnosis or a safe correction of that failure, not a new maintenance sweep or weaker checks.
 Use a fresh independent reviewer on the entire resulting candidate and plans, then rerun every fixed gate before source persistence.
 Another failure or rejection ends repair; no raw logs, private evidence paths, or source diffs enter public reports.
+Host commits carry a subject naming the day and main change, at most 72 characters, plus a body of at most 2 KiB built from the executor's final summary, the reviewer's checks and advisory findings, and host facts such as the pinned upstream merge or harness incident.
+Model text in commit messages is redacted like reports, stripped of control characters, wrapped at 72 columns, never placed where Git reads a trailer, and labelled unverified.
+The exact message is checkpointed before the commit, and recovery accepts an interrupted commit only with that exact message.
 Report reasons, bounded reviewer findings, relevant issue/PR identifiers, source/tree hashes, phase and gate timings, model usage/cost, and publication receipts.
 Retain useful failure diagnostics even when execution throws or the runner is interrupted.
 Never upload raw model transcripts, SQLite, environment dumps, credential files, or unchecked command logs.
@@ -98,6 +105,7 @@ Never re-dispatch to an exhausted provider within the run; deterministic provide
 Remember provider quota and auth failures across runs as bounded provider holds until the stated reset or 24h, cleared by a config change; skip held providers, and admit no paid work while every known provider is held.
 Keep model budgets and process deadlines; do not weaken checks to obtain a green run.
 Prefer an honest no-op over speculative changes or decorative activity.
+Remember review-rejected maintenance candidates for 30 days in the trusted checkpoint by changed-file area and blocking finding ids, show them to the executor as untrusted intake, and refuse before review, as the normal no-op outcome `repeat-rejected`, a candidate whose area was rejected twice within that window.
 Use Annie's concise, cheerful maintainer voice in summaries while keeping failures and consequences unmistakable.
 Never describe a no-op as a source or image publication.
 
@@ -187,6 +195,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 ## Acceptance evidence
 
 Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection from Pi defaults and `enabledModels`, cross-run provider holds, the forwarded provider env list against pi-ai's mapping, and in-lease provider failover.
+Offline tests cover budgeted script classifiers, refused image generation and raw dispatch, commit message composition, bounds, redaction, and interrupted-commit recovery, and rejection memory accumulation, expiry, intake, and host refusal.
 Shell and workflow validation pass.
 Offline tests cover incident detection and dedupe, idempotent incident issues against a fake GitHub, harness task schema and caps, guard selection, the harness gate runner, a faux harness run through export, PR delivery success and failures, and self-integration refusals.
 Fake-Podman tests cover reviewer sandbox flags, environment, freezing, output capping, timeout/abort cleanup, and the per-review time budget.

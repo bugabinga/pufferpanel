@@ -71,6 +71,7 @@ jobs:
       retry: ${{ steps.observe.outputs.retry }}
       republish: ${{ steps.observe.outputs.republish }}
       holds: ${{ steps.observe.outputs.holds }}
+      rejections: ${{ steps.observe.outputs.rejections }}
       incident: ${{ steps.observe.outputs.incident }}
       incidents: ${{ steps.observe.outputs.incidents }}
     steps:
@@ -132,6 +133,8 @@ jobs:
       PUFFER_MAINT_DEFER_PUBLISH: '1'
       PUFFER_MAINT_TASK: ${{ needs.observe.outputs.task }}
       ANNIE_PROVIDER_HOLDS: ${{ needs.observe.outputs.holds }}
+      # Trusted rejection memory: review-rejected maintenance areas of the last 30 days, validated strictly by maintain.mjs.
+      ANNIE_REJECTIONS: ${{ needs.observe.outputs.rejections }}
       # Sanitized incident digest for a harness repair task; untrusted data that reaches the model only via the intake file.
       ANNIE_INCIDENT: ${{ needs.observe.outputs.incident }}
     steps:
