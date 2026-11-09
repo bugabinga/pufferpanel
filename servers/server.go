@@ -21,7 +21,6 @@ import (
 	"github.com/pufferpanel/pufferpanel/v3/files"
 	"github.com/pufferpanel/pufferpanel/v3/logging"
 	"github.com/pufferpanel/pufferpanel/v3/utils"
-	"github.com/spf13/cast"
 )
 
 type Server struct {
@@ -530,22 +529,6 @@ func (p *Server) EditData(data map[string]interface{}, asAdmin bool) (err error)
 
 func (p *Server) GetData() map[string]pufferpanel.Variable {
 	return p.Variables
-}
-
-func (p *Server) GetNetwork() string {
-	data := p.GetData()
-	ip := "0.0.0.0"
-	port := "0"
-
-	if ipData, ok := data["ip"]; ok {
-		ip = cast.ToString(ipData.Value)
-	}
-
-	if portData, ok := data["port"]; ok {
-		port = cast.ToString(portData.Value)
-	}
-
-	return ip + ":" + port
 }
 
 func (p *Server) afterExit(exitCode int) {
