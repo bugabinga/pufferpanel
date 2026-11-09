@@ -33,6 +33,13 @@ puffer_podman_init() {
   PUFFER_MAINT_PODMAN=(podman --root "$state/podman/root" --runroot "$runroot" --storage-driver "${PUFFER_MAINT_STORAGE_DRIVER:-overlay}")
 }
 
+# Gate image build flags, shared with the reviewer sandbox so both build identical layers.
+puffer_gate_build_args() {
+  local platform
+  case $(uname -m) in x86_64) platform=linux/amd64;; aarch64) platform=linux/arm64;; *) echo 'unsupported native architecture' >&2; return 1;; esac
+  PUFFER_MAINT_BUILD_ARGS=(--network host --platform "$platform" --build-arg "BUILDPLATFORM=$platform" --build-arg "TARGETPLATFORM=$platform" --build-arg tags=)
+}
+
 puffer_podman_preflight() {
   local tool node=${PUFFER_MAINT_NODE:-node}
   for tool in "$node" git podman bash flock timeout; do command -v "$tool" >/dev/null || { echo "required runtime tool missing: $tool" >&2; return 1; }; done

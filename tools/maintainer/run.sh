@@ -12,6 +12,8 @@ node=${PUFFER_MAINT_NODE:-node}
 export TMPDIR=${TMPDIR:-/tmp}
 puffer_podman_init "$state"
 puffer_podman_preflight
+# Podman's storage database pins the first runroot, so every child of this run reuses it.
+export PUFFER_MAINT_RUNROOT=${PUFFER_MAINT_PODMAN[4]}
 # One process owns SQLite; the process-group deadline includes subprocesses and release checks.
 duration=7200
 if [[ ${GITHUB_ACTIONS:-} == true ]]; then

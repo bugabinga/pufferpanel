@@ -47,7 +47,7 @@ jobs:
       - name: Offline tests, no observations or credentials
         run: |
           npm test
-          bash -n ci.sh gate.sh publish.sh run.sh podman.sh
+          bash -n ci.sh gate.sh publish.sh run.sh podman.sh sandbox.sh
         working-directory: tools/maintainer
 
   observe:

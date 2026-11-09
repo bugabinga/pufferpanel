@@ -29,7 +29,7 @@ function fixture(t, protectedEdit = false) {
   const tree = execFileSync('git', ['-C', worktree, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim();
   const run = join(state, 'runs/2026-04-03'); mkdirSync(run, { recursive: true }); writeFileSync(join(run, 'gate.ok'), tree + '\n');
   const result = join(dir, 'result.json'), output = join(dir, 'output');
-  writeFileSync(result, JSON.stringify({ phase: 'publishing', day: '2026-04-03', version: '2026.4.3', base, tree, commit }));
+  writeFileSync(result, JSON.stringify({ phase: 'publishing', day: '2026-04-03', version: '2026.4.3', base, tree, commit, sandbox: { status: 'limited', reason: 'cgroup limits not delegated', podmanVersion: '4.9.3', runCalls: 1, runSeconds: 3.2, output: 'private' } }));
   const bin = join(dir, 'bin'); mkdirSync(bin);
   writeFileSync(join(bin, 'podman'), '#!/usr/bin/env bash\nexit 0\n'); chmodSync(join(bin, 'podman'), 0o755);
   const env = { ...process.env, GITHUB_ACTIONS: 'false', PATH: `${bin}:${process.env.PATH}`, PUFFER_MAINT_SOURCE: source, PUFFER_MAINT_STATE: state, HONEST_ANNIE_ARTIFACT: artifact, PUFFER_MAINT_RESULT: result, GITHUB_SHA: base, GITHUB_OUTPUT: output };
@@ -154,6 +154,8 @@ test('reviewed CI bundle imports exact commit, pushes once, and safely retries',
   let result = f.command('export'); assert.equal(result.status, 0, result.stderr);
   assert.equal(readFileSync(f.output, 'utf8'), 'candidate=true\n');
   assert.deepEqual(new Set(['candidate.bundle', 'result.json', 'gate.ok']), new Set(readdirSync(f.artifact)));
+  // The allowlisted export carries the sanitized sandbox diagnostic, never extra fields.
+  assert.deepEqual(JSON.parse(readFileSync(join(f.artifact, 'result.json'))).sandbox, { status: 'limited', reason: 'cgroup limits not delegated', podmanVersion: '4.9.3', runCalls: 1, runSeconds: 3.2 });
   result = f.command('import', f.imported); assert.equal(result.status, 0, result.stderr);
   const target = join(f.imported.PUFFER_MAINT_STATE, 'worktree');
   assert.equal(readFileSync(join(target, 'value.txt'), 'utf8'), 'after');

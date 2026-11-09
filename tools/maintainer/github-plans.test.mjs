@@ -12,6 +12,7 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, RunDoc, createHostHooks, ModelCodingTools, ModelCodemode, installReviewer, snapshot } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
+import { fakeReviewSandbox } from './fake-podman.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
 const secretNames = ['GH_TOKEN', 'ANNIE_GH_TOKEN', 'REGISTRY_PASSWORD', 'ZAI_API_KEY'];
@@ -34,7 +35,8 @@ async function fixture(t, responses) {
   models.setProvider(faux.provider);
   const registry = createRegistry();
   registry.install(ModelCodingTools); registry.install(ModelCodemode);
-  const reviewerExtension = installReviewer(registry, worktree);
+  const { sandbox } = await fakeReviewSandbox(t, dir, state);
+  const reviewerExtension = installReviewer(registry, worktree, sandbox);
   const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), {
     models,
     registry,
@@ -46,7 +48,7 @@ async function fixture(t, responses) {
   const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc });
   const githubPlanReader = installGitHubPlanReader(registry, root);
   const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: 'faux', modelId: 'faux-1' } };
-  const hooks = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, instructions: 'Offline test.', snapshotHttp: async () => { throw Error('network forbidden'); } });
+  const hooks = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, reviewSandbox: sandbox, executorExtension, githubPlanReader, instructions: 'Offline test.', snapshotHttp: async () => { throw Error('network forbidden'); } });
   hooks.prepare = async () => ({ base, upstream: 'upstream/main', upstreamRef: 'refs/heads/main', upstreamSha: 'b'.repeat(40), intakePath: join(dir, 'intake.json'), usageStart: 0 });
   hooks.execute = async run => {
     const result = await createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, instructions: 'Offline test.' }).execute(run);

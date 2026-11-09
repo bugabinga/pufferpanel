@@ -22,6 +22,14 @@ const findings = (value, env) => Array.isArray(value) ? value.slice(0, 20).map(i
 const safePhase = (value, env = process.env) => typeof value === 'string' && /^[a-z-]{2,32}$/.test(value) && redact(value, env) === value ? value : 'unknown';
 const safeNumber = value => Number.isFinite(value) && value >= 0 ? value : null;
 const sha = (value, length = 40, env = process.env) => typeof value === 'string' && new RegExp(`^[a-f0-9]{${length}}$`).test(value) && redact(value, env) === value ? value : null;
+// Reviewer sandbox evidence: closed status, bounded redacted reason, Podman version, run count and seconds.
+const sandboxReport = (value, env) => !['available', 'limited', 'unavailable'].includes(value?.status) ? null : {
+  status: value.status,
+  reason: typeof value.reason === 'string' && value.reason ? redact(value.reason, env).slice(0, 200) : null,
+  podmanVersion: typeof value.podmanVersion === 'string' && /^[0-9A-Za-z.+~-]{1,32}$/.test(value.podmanVersion) && redact(value.podmanVersion, env) === value.podmanVersion ? value.podmanVersion : null,
+  runCalls: Number.isSafeInteger(value.runCalls) && value.runCalls >= 0 && value.runCalls <= 10_000 ? value.runCalls : null,
+  runSeconds: Number.isFinite(value.runSeconds) && value.runSeconds >= 0 && value.runSeconds <= 86_400 ? value.runSeconds : null,
+};
 const source = (run, env) => {
   const id = (value, length = 40) => sha(value, length, env);
   return { base: id(run?.base), head: id(run?.head), tree: id(run?.tree), commit: id(run?.commit), releaseCommit: id(run?.releaseCommit ?? run?.commit), trustedUpstreamPin: id(run?.trustedUpstreamPin), upstreamSha: id(run?.upstreamSha), upstreamRef: typeof run?.upstreamRef === 'string' && /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(run.upstreamRef) && redact(run.upstreamRef, env) === run.upstreamRef ? run.upstreamRef : null, expectedParents: Array.isArray(run?.expectedParents) && run.expectedParents.length <= 2 && run.expectedParents.every(value => id(value)) ? run.expectedParents : [], diffHash: id(run?.diffHash, 64) };
@@ -81,6 +89,7 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     reason: reason ? redact(reason, env).slice(0, 500) : null,
     findings: findings(run?.review?.findings ?? run?.findings, env),
     reviewDiagnostics: Array.isArray(run?.reviewDiagnostics) ? run.reviewDiagnostics.slice(0, 1).map(entry => ({ stopReason: ['stop', 'length', 'toolUse', 'error', 'aborted'].includes(entry?.stopReason) ? entry.stopReason : 'unknown', textLength: Number.isSafeInteger(entry?.textLength) && entry.textLength >= 0 ? entry.textLength : null, verdict: ['approved', 'review-rejected', 'invalid-review'].includes(entry?.verdict) ? entry.verdict : 'unknown', verdictCalls: Number.isSafeInteger(entry?.verdictCalls) && entry.verdictCalls >= 0 ? entry.verdictCalls : null })) : [],
+    sandbox: sandboxReport(run?.sandbox, env),
     timeline: Array.isArray(run?.timeline) ? run.timeline.slice(0, 30).map(entry => ({ phase: safePhase(entry?.phase), at: safeNumber(entry?.at) })) : [],
     modelPhaseCost: phaseCosts,
     reportedUsage: modelPending || run?.usageComplete === false || safeNumber(run?.reportedUsage) === null ? { status: 'unknown' } : { status: 'known', cost: safeNumber(run.reportedUsage) },
@@ -118,7 +127,8 @@ function markdown(report) {
   const proposals = report.proposedActionSummary?.length ? `\n### Proposed GitHub actions\n${report.proposedActionSummary.map(action => `- ${text(action.kind)}${action.number ? ` #${action.number}` : ''}${action.title ? `: ${text(action.title)}` : ''}`).join('\n')}\n` : '';
   const receipts = report.actionReceipts?.length ? `\n### GitHub receipts\n${report.actionReceipts.map(action => `- ${text(action.kind)}${action.number ? ` #${action.number}` : ''}: ${text(action.status)}${action.reason ? ` (${text(action.reason)})` : ''}`).join('\n')}\n` : '';
   const blocker = report.blocker ? `\nBlocker: ${text(report.blocker)}\n` : '';
-  return `## ☠️ Annie's incident ledger: ${badge}\n\n${aside}\n\nOutcome: **${text(report.outcome)}**  \nReason: ${text(report.reason ?? 'none recorded')}  \nKind: ${text(report.kind)}  \nGitHub: ${text(report.githubState)}  \nSource changed: ${report.sourceChanged ? 'yes' : 'no'}  \nSource: ${text(hashes, 500)}  \nModel usage: ${text(usage)}  \nImage digest: ${report.publicationDigest ?? 'not verified'}\n${blocker}${details}${gates}${proposals}${receipts}`;
+  const sandbox = report.sandbox ? `Reviewer sandbox: ${text(report.sandbox.status)} (${text(report.sandbox.reason ?? 'no reason recorded')}; podman ${text(report.sandbox.podmanVersion ?? '?')}; ${report.sandbox.runCalls ?? '?'} runs, ${report.sandbox.runSeconds ?? '?'} s)  \n` : '';
+  return `## ☠️ Annie's incident ledger: ${badge}\n\n${aside}\n\nOutcome: **${text(report.outcome)}**  \nReason: ${text(report.reason ?? 'none recorded')}  \nKind: ${text(report.kind)}  \nGitHub: ${text(report.githubState)}  \nSource changed: ${report.sourceChanged ? 'yes' : 'no'}  \nSource: ${text(hashes, 500)}  \nModel usage: ${text(usage)}  \n${sandbox}Image digest: ${report.publicationDigest ?? 'not verified'}\n${blocker}${details}${gates}${proposals}${receipts}`;
 }
 export async function collect({ reportPath, gateEventsPath, publishedPath, sourceReceiptPath, actionReceiptsPath, reportDir, summaryPath }) {
   if (!reportDir) throw Error('explicit --reportdir is required');

@@ -12,7 +12,7 @@ mkdir -p "$run_dir/logs"
 rm -f "$run_dir/gate.ok"
 puffer_podman_init "$state_dir"
 podman=("${PUFFER_MAINT_PODMAN[@]}")
-case $(uname -m) in x86_64) platform=linux/amd64;; aarch64) platform=linux/arm64;; *) echo 'unsupported native architecture' >&2; exit 1;; esac
+puffer_gate_build_args
 run() { local name=$1; shift; puffer_timed "$run_dir" "$name" "$run_dir/logs/$name.log" "$@"; }
 cd "$worktree"
 git rev-parse --is-inside-work-tree >/dev/null
@@ -22,7 +22,7 @@ fi
 before=$(git diff --binary HEAD | sha256sum | cut -d' ' -f1)
 tree=$(git write-tree)
 run whitespace git diff --check HEAD -- . ':(exclude)client/frontend/public/js/ace/**'
-build_args=(--network host --platform "$platform" --build-arg "BUILDPLATFORM=$platform" --build-arg "TARGETPLATFORM=$platform" --build-arg tags=)
+build_args=("${PUFFER_MAINT_BUILD_ARGS[@]}")
 # The node stage itself runs frozen dependency install, JS tests, lint and production build.
 run node "${podman[@]}" build "${build_args[@]}" --target node -t localhost/pufferpanel-maintainer-node -f Dockerfile .
 # Verify upstream Ace bytes, rather than blindly exempting arbitrary vendor edits from formatting.

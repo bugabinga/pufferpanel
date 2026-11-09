@@ -52,6 +52,11 @@ A reviewer run ending without a verdict gets exactly one reminder within the sam
 Allow reviewer responses up to 32,768 output tokens and executor responses up to 16,000, each clamped to the selected model's limit.
 Reserve an upper bound on the maximum output the provider adapter sends before dispatch, phase ceiling plus any thinking budget it may add, inside the unchanged shared budget and original deadline; provider errors settle at that reservation.
 Retain bounded stop-reason, text-length, verdict, and verdict-call-count diagnostics, not raw reviewer answers.
+The reviewer may execute targeted checks only in a disposable offline rootless container over a read-only export of the recorded tree T, never in the maintenance worktree.
+Sandbox containers get no network, credentials, or host environment, a read-only root, bounded time, memory, CPU, and PIDs, and are always removed.
+Preparing the sandbox builds the fixed gate images from T before review, with network but without credentials; this runs candidate build steps earlier than the gate, approves nothing, and its failure only disables `run`.
+A per-review probe may drop only undelegated cgroup resource limits; it never drops network, read-only source, or environment isolation, and reports `available`, `limited`, or `unavailable` with a bounded reason, Podman version, and run count/seconds in the public report.
+After review the host requires the worktree candidate to still equal T; otherwise the verdict is discarded as invalid review output.
 Clear prior usage completeness before model dispatch or resume; active-model and explicitly interrupted reports cannot settle partial subtotals.
 Intermediate review checkpoints remain unknown-cost until final accounting is refreshed.
 Invalid review output remains a bot failure with no gate, source commit, or publication.
@@ -153,6 +158,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 
 Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection, and in-lease provider failover.
 Shell and workflow validation pass.
+Fake-Podman tests cover reviewer sandbox flags, environment, freezing, output capping, timeout/abort cleanup, and the per-review time budget.
 A real isolated short-runroot container preflight succeeds without changing host configuration.
 Check-only CI verifies the uploaded harness without model requests or production effects.
 Live paid maintenance, PR integration, registry publication, and GitHub administration require separately recorded execution evidence; offline fixtures do not prove them.

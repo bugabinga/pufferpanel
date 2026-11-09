@@ -7,7 +7,7 @@ No klops auto-update configuration is changed.
 
 ## Flow
 
-Daily timer → isolated persistent worktree → bounded maintenance agent → independent read-only reviewer → fixed gates → host commit → numbered image → `latest`.
+Daily timer → isolated persistent worktree → bounded maintenance agent → independent reviewer with an offline sandbox over frozen tree T → fixed gates → host commit → numbered image → `latest`.
 No useful changes → no commit or release.
 A failed fixed gate permits one maintenance-only diagnosis/repair using a bounded private log, inside the original budget and deadline.
 Repairs revoke prior approval, get a fresh independent full review, and rerun every gate; PR tasks never acquire a coding turn.
@@ -340,12 +340,44 @@ Cross-host concurrent publishers require registry-side locking/CAS; local flock 
 Registry reads currently require anonymous HTTPS read access; authenticated private reads need a credential-aware transport before use.
 Host Podman uses its own retained storage; publishing uses the operator's existing Podman registry auth.
 
+## Reviewer sandbox
+
+Before review the host exports the recorded candidate tree T through a private Git index into an OS-temp directory, never the worktree, and makes it read-only.
+It then builds the fixed gate's `node` and `tests` images from that export with the gate's flags and private Podman storage, so module cache, generated frontend embeds, and frontend dependencies exist offline.
+That build executes the candidate's Dockerfile, including its `go test ./...` and frontend checks, with network access but without credentials, before independent review instead of only after it.
+The build's Podman client gets only session and storage variables; no provider key, GitHub token, or registry auth reaches it or the build.
+It runs only after the same head, tree, diff, and protected-path check that guards review, and it approves nothing.
+A failed or late build leaves `run` rejecting as unavailable; the review continues read-only, and the fixed gate rebuilds and reports the failure.
+Its build log stays in the private run directory as `review-prime.log`.
+Management-only candidates change no source, so they skip the build and `run` rejects as unavailable.
+`run({ command, timeoutSeconds?, toolchain? })` starts a disposable rootless container by image ID with `--network=none`, `--read-only`, T mounted read-only at `/src`, and a 4 GiB executable tmpfs `/tmp` holding a fresh copy in `/tmp/work`.
+Toolchain `go` (default) overlays the image's generated `client/frontend/dist`; committed `web/swagger` stays as reviewed, while the gate image regenerates it.
+Toolchain `node` copies `client/` and links the image's installed `node_modules`.
+The container environment is only explicit toolchain variables: `PATH`, `HOME`, `TMPDIR`, and Go cache/module settings with `GOFLAGS=-mod=readonly` and `GOPROXY=off`.
+`--unsetenv-all` and `--http-proxy=false` drop image, Podman, and host proxy defaults; the Podman client receives only session and storage variables, never credentials.
+Limits are 8 GiB memory without extra swap, 4 CPUs, 4096 PIDs, all capabilities dropped, and `no-new-privileges`.
+After priming, one trivial probe container per review proves the flag set from inside: only loopback networking, unwritable `/src` and root, and no unexpected environment variable.
+If the probe fails because cgroup controllers are not delegated, or if Podman says it ignores rootless limits, it retries without `--memory`, `--cpus`, and `--pids-limit` and reports `limited`; the runner VM is then the outer limit.
+An unknown `--unsetenv-all` falls back to explicit `--unsetenv` of the image's and Podman's defaults, and an unknown `--read-only-tmpfs` to Podman's default read-only tmpfs mounts; Podman 4.9 supports both flags, so these paths are not expected to fire there.
+Any other probe failure makes the sandbox `unavailable`; network isolation, the read-only source, and environment isolation are never dropped.
+Removal uses `--stop-timeout 0` with `podman rm --force`, so no `rm --time` support is needed.
+The run report carries a sanitized `sandbox` diagnostic: `available`, `limited`, or `unavailable`, a reason of at most 200 redacted characters, the Podman version (recorded even when priming fails), and the count and total seconds of `run` calls.
+Calls run one at a time, default 5 minutes, at most 15, and share 30 minutes of sandbox time per review inside the run deadline.
+`run` resolves `{ exitCode, output, truncated }` for every exit code, keeping the first and last 32 KiB of combined output around an omission marker.
+Timeouts, Podman exit 125, and a missing exit status reject instead.
+Timeout, abort, and review end remove the container with `podman rm --force` and verify it is gone; `podman run --timeout` is a backstop if the host dies.
+The sandbox budget lives in the process; a restarted review starts a fresh one, still bounded by the run deadline, and an interrupted `run` is never replayed.
+Each call starts with a cold Go build cache, so broad builds and `-race` runs are slow; full suites stay with the fixed gates.
+After the reviewer settles, the host compares head, index tree, full diff, and protected paths with the recorded candidate; any change discards the verdict as `invalid-review`.
+`run.sh` exports its pinned `PUFFER_MAINT_RUNROOT`, because Podman's storage database rejects a different runroot for the same root; the sandbox refuses to start without one.
+Fake-Podman tests cover flags, environment, freezing, capping, timeout and abort cleanup, and the budget; an optional real rootless smoke runs only with a local `alpine:3.22.0` and never pulls.
+
 ## Trust and tests
 
 The executor uses an operator-trusted local shell with the operator's OS permissions.
 Prompts and protected-path checks are policy defenses, not an OS sandbox or credential-isolation boundary.
 Use a dedicated restricted account/environment before enabling this against untrusted projects if stronger isolation is needed.
-The reviewer's scripts have only a confined read tool, fixed diff tool, and plan reader, with no arbitrary shell or write tool.
+The reviewer's scripts have a confined read tool, fixed diff tool, plan reader, and sandboxed `run` tool, with no host shell or write tool.
 Host gate/publisher copies come from the original harness directory, not the candidate checkout.
 Offline tests use real SQLite and faux model turns that drive real codemode scripts and nested tools, real temporary Git worktrees/commits, and stubbed external publisher commands.
 No paid maintenance run, live gate build, registry publication, system installation, or deployment is performed by those tests.

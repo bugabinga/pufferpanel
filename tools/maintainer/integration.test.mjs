@@ -16,6 +16,7 @@ import { materializePR, verifyPRHistory, checkPR, git } from './pr.mjs';
 import { pushSource, metadata, verifyCandidate } from './ci-source.mjs';
 import { reportFor, collect } from './report.mjs';
 import { approvedPlan } from './management.mjs';
+import { fakeReviewSandbox } from './fake-podman.mjs';
 const moduleDir = new URL('.', import.meta.url).pathname;
 const response = (body, status = 200, link = '') => ({ ok: status === 200, status, headers: new Headers({ link }), json: async () => body });
 const apiData = task => ({
@@ -65,11 +66,12 @@ test('actual faux PR route executes ZERO coding turns, reviewer reads complete B
   const f = await fixture(t); const faux = fauxProvider();
   faux.setResponses([fauxAssistantMessage(fauxToolCall('codemode', { code: "const diff = await tools.diff({}); if (!diff.includes('PR full change')) throw new Error('incomplete diff'); console.log(diff.length);" }), { stopReason: 'toolUse' }), fauxAssistantMessage(fauxToolCall('submit_verdict', { findings: [], checked: ['complete B→T diff'] }), { stopReason: 'toolUse' })]);
   const models = createModels(); models.setProvider(faux.provider); const registry = createRegistry(); registry.install(ModelCodemode);
-  const reviewerExtension = installReviewer(registry, f.worktree);
+  const { sandbox } = await fakeReviewSandbox(t, f.dir, f.state);
+  const reviewerExtension = installReviewer(registry, f.worktree, sandbox);
   const harness = await Harness.open(await openNodeSqliteStorage(join(f.state, 'test.sqlite')), { models, registry, settings: { retry: { enabled: false } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd }) }, ctx);
   t.after(() => harness.close(ctx)); const root = await harness.root(ctx);
   const choices = { executor: { provider: 'nonexistent', modelId: 'forbidden' }, reviewer: { provider: 'faux', modelId: 'faux-1' } };
-  const hooks = createHostHooks({ root, harness, state: f.state, worktree: f.worktree, models: choices, reviewerExtension, task: f.task, upstreamUrl: f.upstream, snapshotHttp: fakeFetch(f.task), intakeProvider: async () => ({ upstream: {} }) });
+  const hooks = createHostHooks({ root, harness, state: f.state, worktree: f.worktree, models: choices, reviewerExtension, reviewSandbox: sandbox, task: f.task, upstreamUrl: f.upstream, snapshotHttp: fakeFetch(f.task), intakeProvider: async () => ({ upstream: {} }) });
   let gates = 0, reviews = 0; const originalReview = hooks.review;
   hooks.review = async run => { reviews++; assert.match((await snapshot(f.worktree)).diff, /PR full change/); return originalReview(run); };
   hooks.gate = async run => { gates++; assert.equal(run.tree, f.tree); assert.equal(await git(f.worktree, 'rev-parse', 'HEAD'), f.base); };

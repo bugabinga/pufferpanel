@@ -14,6 +14,8 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, RunDoc, selectModels, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
+import { fakeReviewSandbox } from './fake-podman.mjs';
+import { reportFor } from './report.mjs';
 
 const ctx = BACKGROUND_CONTEXT;
 const blocking = { id: 'unsafe-change', severity: 'blocking', file: 'value.txt', line: 1, impact: 'breaks fixture', evidence: 'diff sets after', correction: 'revert it' };
@@ -295,10 +297,15 @@ function repo(path) {
 const codemode = code => fauxToolCall('codemode', { code });
 const verdict = (findings = [], checked = ['diff', 'plans']) => fauxToolCall('submit_verdict', { findings, checked });
 const round = (...calls) => fauxAssistantMessage(calls, { stopReason: 'toolUse' });
+// Prints a computed marker only when the sandboxed run resolved as expected; the script source never contains it.
+const sandboxCheck = codemode("const result = await tools.run({ command: 'go test ./pkg -run Fixture', timeoutSeconds: 60 });\nif (result.exitCode === 0 && result.output === 'ok fixture\\n' && result.truncated === false) console.log('RUN' + '-' + 'OK');");
+const sandboxEscape = codemode("await tools.run({ command: 'escape-fixture' });");
 test('real faux codemode executor/reviewer, verdict tool, host commit, and SQLite idempotency', async t => {
   const submit = round(verdict());
   for (const scenario of [
     { name: 'codemode review then submit_verdict approves', review: [submit], approved: true, verdictCalls: 1 },
+    { name: 'reviewer runs a sandboxed check on frozen T, then submits', review: [round(sandboxCheck), submit], approved: true, verdictCalls: 1, ran: true },
+    { name: 'candidate changed during review is invalid review, never approval', review: [round(sandboxEscape), submit], approved: false, reason: 'invalid-review', verdictCalls: 1, escaped: true },
     { name: 'failed gate gets one repair and a genuinely fresh reviewer', review: [submit], approved: true, verdictCalls: 1, repair: true },
     { name: 'advisory-only finding approves and keeps the finding', review: [round(verdict([advisory]))], approved: true, verdictCalls: 1, findings: ['[advisory] naming: unclear name — value.txt — rename later'] },
     { name: 'verdict beside codemode in one round counts once', review: [round(codemode('console.log("last look")'), verdict()), fauxAssistantMessage('Reviewed.')], approved: true, verdictCalls: 1 },
@@ -354,14 +361,16 @@ console.log(JSON.parse(plans).length, diff.includes('after'));`;
       submit,
     ] : []),
   ]));
-  const registry = createRegistry(); registry.install(ModelCodingTools); registry.install(ModelCodemode); const reviewerExtension = installReviewer(registry, worktree);
+  // The fake escape stands in for any path that changes the maintenance worktree while the reviewer runs.
+  const { fake, sandbox } = await fakeReviewSandbox(t, dir, state, { run: { 'go test ./pkg -run Fixture': { output: 'ok fixture\n' }, 'escape-fixture': { mutate: worktree } } });
+  const registry = createRegistry(); registry.install(ModelCodingTools); registry.install(ModelCodemode); const reviewerExtension = installReviewer(registry, worktree, sandbox);
   const choices = { executor: { provider: 'faux', modelId: 'faux-1' }, reviewer: { provider: failover ? 'faux-backup' : 'faux', modelId: 'faux-1' } };
   const policy = { models: [choices.executor, { provider: 'faux-backup', modelId: 'faux-1' }] };
   const harness = await Harness.open(await openNodeSqliteStorage(join(state, 'run.sqlite')), { models: budgetModels(pricedFaux(models), policy), registry, settings: { extensions: [ModelCodingTools], retry: { ...RETRY, baseDelayMs: 1 } }, env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? worktree }) }, ctx);
   const root = await harness.root(ctx); Object.assign(policy, { root, harness });
   const executorExtension = installGitHubTools(registry, { root, worktree, runDoc: RunDoc }); const githubPlanReader = installGitHubPlanReader(registry, root);
   const fixtureFetch = async url => ({ ok: true, status: 200, headers: new Headers(), json: async () => url.includes('/git/ref/') ? { object: { sha: git('rev-parse', 'HEAD') } } : url.includes('/repos/') && !url.includes('/issues') && !url.includes('/pulls') ? { default_branch: 'main' } : [] });
-  const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, executorExtension, githubPlanReader, policy, instructions: 'Test coding fixture.', snapshotHttp: fixtureFetch, upstreamUrl: source });
+  const host = createHostHooks({ root, harness, worktree, state, models: choices, reviewerExtension, reviewSandbox: sandbox, executorExtension, githubPlanReader, policy, instructions: 'Test coding fixture.', snapshotHttp: fixtureFetch, upstreamUrl: source });
   let gated = 0, published = 0, firstReviewer = null;
   host.gate = async run => {
     gated++;
@@ -394,7 +403,15 @@ console.log(JSON.parse(plans).length, diff.includes('after'));`;
   assert.equal(offered.filter(names => names === 'codemode').length, (scenario.repair ? 4 : 2) + (scenario.retryable ? 1 : 0));
   const reviewer = await harness.conversation(run.reviewer, ctx), executorAgent = await root.agent(ctx), reviewerAgent = await reviewer.agent(ctx);
   assert.deepEqual(executorAgent.callable.map(tool => tool.name).sort(), ['bash', 'edit', 'merge_upstream', 'propose_github', 'read', 'write']);
-  assert.deepEqual(reviewerAgent.callable.map(tool => tool.name).sort(), ['diff', 'read', 'read_github_plans']);
+  assert.deepEqual(reviewerAgent.callable.map(tool => tool.name).sort(), ['diff', 'read', 'read_github_plans', 'run']);
+  assert.equal(run.reviewDiagnostics[0].candidateUnchanged, !scenario.escaped);
+  const sandboxRuns = (await fake.calls()).filter(call => call.args[6] === 'run' && call.args.at(-1) !== 'sandbox-probe');
+  // The sanitized diagnostic reaches the run record and its public report shape.
+  assert.deepEqual({ ...run.sandbox, runSeconds: typeof run.sandbox.runSeconds }, { status: 'available', reason: null, podmanVersion: '4.9.3', runCalls: scenario.ran || scenario.escaped ? 1 : 0, runSeconds: 'number' });
+  assert.deepEqual(reportFor(run).sandbox, run.sandbox);
+  assert.equal(sandboxRuns.length, scenario.ran || scenario.escaped ? 1 : 0);
+  for (const call of sandboxRuns) assert.ok(call.args.includes('--network=none') && call.args.includes('--read-only') && !call.args.some(arg => arg.startsWith(worktree)));
+  if (scenario.ran) assert.ok(JSON.stringify((await reviewer.entries({}, 1000, undefined, ctx)).items).includes('RUN-OK'));
   const reminders = (await reviewer.entries({}, 1000, undefined, ctx)).items.filter(entry => entry.model?.[0]?.role === 'user' && entry.model[0].content === VERDICT_REMINDER);
   assert.equal(reminders.length, scenario.reminded ? 1 : 0);
   assert.equal(run.usageComplete, true); assert.equal(run.modelCalls, 3 + scenario.review.length + (scenario.repair ? 4 : 0) + (scenario.firstError ? 1 : 0));
