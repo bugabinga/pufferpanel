@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"fmt"
 	"net/netip"
 	"path/filepath"
 	"regexp"
@@ -53,6 +54,11 @@ func ConvertToDockerBind(source string) string {
 
 func ParsePortMap(str string) (network.PortMap, error) {
 	parts := dockerPortBindingRegex.FindStringSubmatch(str)
+	if parts == nil {
+		//a non-mapping string used to panic on the nil submatch slice below,
+		//killing the panel when a template or a port variable held garbage
+		return nil, fmt.Errorf("invalid port mapping: %s", str)
+	}
 
 	res := make(network.PortMap)
 

@@ -87,6 +87,24 @@ func TestParsePortMap(t *testing.T) {
 			wantProtocol:      "udp",
 			wantErr:           false,
 		},
+		//regression: these values come from templates and user-editable port
+		//variables, and used to panic (index out of range) instead of erroring
+		{
+			str:     "",
+			wantErr: true,
+		},
+		{
+			str:     "garbage",
+			wantErr: true,
+		},
+		{
+			str:     "a:b:c",
+			wantErr: true,
+		},
+		{
+			str:     "25565:",
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.str, func(t *testing.T) {
