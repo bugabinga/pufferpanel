@@ -12,7 +12,7 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, createHostHooks, ensureWorktree, guardFor, installReviewer, ModelCodemode, ModelCodingTools, snapshot } from './maintain.mjs';
 import { HARNESS_CAP, validateTask } from './task.mjs';
-import { deliverHarness, detectIncidents, foldIncidents, incidentBody, makeDigest, parseDigest, ready, syncIncidents, validateIncidents } from './incident.mjs';
+import { MAX_REPAIRS, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, syncIncidents, validateIncidents } from './incident.mjs';
 import { GitHub, digest as sha256, makeLease, verifyLease, POLICY_PATH } from './controller.mjs';
 import { checkPR } from './pr.mjs';
 import { HARNESS_PATHS, harnessScope, harnessScopeViolation } from './scope.mjs';
@@ -188,10 +188,10 @@ function fakeGitHub({ prStatus = 201, issues = [] } = {}) {
     if (path === '/issues' && method === 'POST') { const issue = { number: state.issues.length + 1, state: 'open', closed_at: null, user: { login: 'github-actions[bot]' }, ...body }; state.issues.push(issue); return json(issue, 201); }
     const one = path.match(/^\/issues\/(\d+)(\/comments)?$/);
     if (one && !one[2] && method === 'PATCH') { const issue = state.issues.find(item => item.number === Number(one[1])); Object.assign(issue, body, body.state === 'closed' ? { closed_at: new Date(NOW + 7200e3).toISOString() } : body.state === 'open' ? { closed_at: null } : {}); return json(issue); }
-    if (one?.[2]) { const list = state.comments.get(Number(one[1])) ?? []; if (method === 'POST') { list.push(body); state.comments.set(Number(one[1]), list); return json(body, 201); } return json(list); }
+    if (one?.[2]) { const list = state.comments.get(Number(one[1])) ?? []; if (method === 'POST') { list.push({ ...body, user: { login: 'github-actions[bot]' } }); state.comments.set(Number(one[1]), list); return json(body, 201); } return json(list); }
     if (path === '/labels/annie-incident') return state.labels.has('annie-incident') ? json({}) : json({}, 404);
     if (path === '/labels') { state.labels.add(body.name); return json(body, 201); }
-    if (path === '/pulls' && method === 'GET') return json(state.prs.filter(pr => `bugabinga:${pr.head.ref}` === searchParams.get('head')));
+    if (path === '/pulls' && method === 'GET') return json(state.prs.filter(pr => (!searchParams.get('head') || `bugabinga:${pr.head.ref}` === searchParams.get('head')) && (searchParams.get('state') === 'all' || pr.state === 'open')));
     if (path === '/pulls' && method === 'POST') { if (prStatus !== 201) return json({ message: 'Resource not accessible by personal access token' }, prStatus); const pr = { ...body, number: 100 + state.prs.length, state: 'open', head: { ref: body.head } }; state.prs.push(pr); return json(pr, 201); }
     throw Error('unexpected fake GitHub request ' + method + ' ' + path);
   };
@@ -347,6 +347,72 @@ for (const [label, files, refused] of SCOPE_CASES) test(`harness scope at mainta
   if (!refused) { assert.equal(result.delivered, true); assert.equal(branchAt(), commit); return; }
   assert.equal(result.delivered, false); assert.throws(branchAt);
   assert.equal(result.receipts[0].kind, 'harness-branch'); assert.match(result.receipts[0].reason, refused);
+});
+
+test('repair decisions: never while running or awaiting a PR; retry only after closed-unmerged, merged with later evidence, or no PR after policy change or 24h; at most three attempts', () => {
+  const DAY = 86_400e3, P = 'a'.repeat(64), Q = 'b'.repeat(64), T = n => String(n).repeat(64);
+  const entry = (repair, extra = {}) => ({ fingerprint: INCIDENT, kind: 'job-failed', status: 'open', since: NOW, ...(repair ? { repair } : {}), ...extra });
+  const one = { tasks: [T(1)], last: T(1), runId: 44, at: NOW, policy: P };
+  const decide = (e, last, extra = {}) => repairDecision({ entry: e, last, policy: P, now: NOW + 1000, ...extra });
+  assert.deepEqual(decide(entry(null), null), { admit: true, attempt: 1, reason: 'first' });
+  assert.equal(decide(entry(null), null, { running: true }).reason, 'in-flight');
+  // The live bug: an open PR blocks, whatever the policy says.
+  assert.deepEqual(decide(entry(one, { pr: 2 }), null, { policy: Q }), { admit: false, reason: 'awaiting-review', pr: 2 });
+  assert.deepEqual(decide(entry(one), { state: 'open', number: 2 }, { policy: Q }), { admit: false, reason: 'awaiting-review', pr: 2 });
+  assert.deepEqual(decide(entry(one), { state: 'closed', number: 2 }), { admit: true, attempt: 2, reason: 'closed-unmerged' });
+  assert.equal(decide(entry(one), { state: 'merged', number: 2, at: NOW + 500 }, { evidenceAt: NOW }).reason, 'merged-awaiting-evidence');
+  assert.equal(decide(entry(one), { state: 'merged', number: 2, at: NOW + 500 }, { policy: Q }).reason, 'merged-awaiting-evidence');
+  assert.equal(decide(entry(one), { state: 'merged', number: 2, at: NOW + 500 }, { evidenceAt: NOW + 900 }).reason, 'persists-after-merge');
+  assert.equal(decide(entry(one, { since: NOW + 800 }), { state: 'merged', number: 2, at: NOW + 500 }).reason, 'persists-after-merge');
+  assert.equal(decide(entry(one), { state: 'none' }).reason, 'no-pr-backoff');
+  assert.equal(decide(entry(one), { state: 'none' }, { policy: Q }).reason, 'retry-without-pr');
+  assert.equal(decide(entry(one), { state: 'none' }, { now: NOW + DAY }).reason, 'retry-without-pr');
+  assert.equal(decide(entry({ ...one, policy: null }), { state: 'none' }, { policy: Q }).reason, 'no-pr-backoff'); // Unknown admission policy waits 24h.
+  const full = { tasks: [T(1), T(2), T(3)], last: T(3), runId: 50, at: NOW, policy: P };
+  assert.equal(MAX_REPAIRS, 3); assert.equal(decide(entry(full), { state: 'closed', number: 7 }).reason, 'attempts-exhausted');
+});
+
+test('repair memory folds ledger attempts and open harness PRs are attributed by marker or known branch, never from forks', () => {
+  const T = n => String(n).repeat(64), mine = { tasks: [T(1)], last: T(1), runId: 44, at: NOW, policy: 'a'.repeat(64) };
+  assert.deepEqual(foldRepair(null, [{ task: T(1), runId: 44, at: NOW }, { task: T(2), runId: 46, at: NOW + 5 }]), { tasks: [T(1), T(2)], last: T(2), runId: 46, at: NOW + 5, policy: null });
+  assert.deepEqual(foldRepair(mine, [{ task: T(1), runId: 44, at: NOW }]), mine);
+  assert.equal(foldRepair(mine, [{ task: T(2), runId: 46, at: NOW + 5 }]).last, T(2));
+  const pr = (number, ref, body = '', repo = 'bugabinga/pufferpanel') => ({ number, head: { ref, repo: { full_name: repo } }, body });
+  const known = new Map([['annie/harness/111111111111', INCIDENT]]);
+  const { open, unknown } = openRepairs([pr(2, 'annie/harness/111111111111'), pr(3, 'annie/harness/222222222222', harnessIncidentMarker('e'.repeat(64))), pr(4, 'feature'), pr(5, 'annie/harness/333333333333', '', 'mallory/pufferpanel'), pr(6, 'annie/harness/444444444444')], known);
+  assert.deepEqual([...open], [[INCIDENT, 2], ['e'.repeat(64), 3]]); assert.deepEqual(unknown, [6]);
+  const valid = { fingerprint: INCIDENT, kind: 'job-failed', detail: 'x', runs: [1], firstSeen: 1, since: 1, lastSeen: 1, count: 2, status: 'open' };
+  validateIncidents([{ ...valid, pr: 2, repair: mine }]);
+  for (const bad of [{ pr: 0 }, { repair: { ...mine, last: T(9) } }, { repair: { ...mine, tasks: [] } }, { repair: { ...mine, policy: 'x' } }, { other: 1 }]) assert.throws(() => validateIncidents([{ ...valid, ...bad }]), /malformed incidents/);
+});
+
+test('incident issue says awaiting review/merge of #N exactly once per PR', async () => {
+  const gh = fakeGitHub(), found = detectIncidents({ now: NOW, abandoned: [{ runId: 11, reason: 'candidate-expired' }] });
+  const state = foldIncidents(foldIncidents([], found, NOW), found, NOW + 1800e3).map(entry => ({ ...entry, pr: 2 }));
+  let receipts = await syncIncidents(gh.api, state);
+  assert.deepEqual(receipts.map(r => [r.kind, r.status, r.reason]), [['incident-issue', 'applied', 'created'], ['incident-awaiting', 'applied', 'awaiting #2']]);
+  receipts = await syncIncidents(gh.api, state); assert.deepEqual(receipts.at(-1).reason, 'already-applied');
+  assert.equal(gh.state.comments.get(1).length, 1); assert.match(gh.state.comments.get(1)[0].body, /Awaiting review\/merge of #2/);
+  await syncIncidents(gh.api, state.map(entry => ({ ...entry, pr: 5 }))); assert.equal(gh.state.comments.get(1).length, 2);
+  await syncIncidents(gh.api, state.map(({ pr, ...entry }) => entry)); assert.equal(gh.state.comments.get(1).length, 2);
+});
+
+test('a second delivery for an incident with an open harness PR comments instead of pushing or opening another', async t => {
+  for (const legacy of [false, true]) {
+    const { gh, deliver, branchAt } = await deliveryFixture(t);
+    // Attempt 1's PR #50 is open: by its body marker, or for an older PR by Annie's delivery comment naming it.
+    gh.state.prs.push({ number: 50, state: 'open', head: { ref: 'annie/harness/10fe087581c4' }, body: legacy ? 'older body' : `x\n${harnessIncidentMarker(INCIDENT)}` });
+    if (legacy) gh.state.comments.set(1, [{ body: 'Harness fix ready for review: #50 from `annie/harness/10fe087581c4`.\n<!-- annie-delivery:abc -->', user: { login: 'github-actions[bot]' } }]);
+    const result = await deliver();
+    assert.equal(result.delivered, false); assert.equal(result.communicated, true); assert.throws(branchAt);
+    assert.equal(gh.state.prs.length, 1);
+    assert.deepEqual(result.receipts.map(r => [r.kind, r.status, r.reason]), [['harness-pr', 'skipped', 'awaiting-earlier-pr'], ['incident-comment', 'applied', null]]);
+    assert.match(gh.state.comments.get(1).at(-1).body, /not delivered: #50 for this incident still awaits review\/merge/);
+    assert.equal((await deliver()).receipts.at(-1).reason, 'already-applied');
+    // Annie's own not-delivered comments never become attribution evidence, and a PR marked for another incident never blocks.
+    gh.state.prs[0].body = harnessIncidentMarker('e'.repeat(64));
+    assert.equal((await deliver()).delivered, true);
+  }
 });
 
 test('PR files screen fails closed on a full page or a continuation instead of screening only page one', async () => {

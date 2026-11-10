@@ -17,7 +17,7 @@ async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'annie-flow-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const env = { ANNIE_MODE: 'maintain', GITHUB_REPOSITORY: OWN, GITHUB_REF: 'refs/heads/trunk', GITHUB_SHA: base, GITHUB_REPOSITORY_ID: '7', GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_NAME: 'schedule', GITHUB_EVENT_PATH: join(dir, 'event.json'), ANNIE_OUTPUT_DIR: dir, ANNIE_BOOTSTRAP: '42', HONEST_ANNIE_ENABLED: 'true', GH_TOKEN: 'readonly-sentinel' };
   await writeFile(env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '17 4 * * *' }));
-  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], jobsByAttempt = new Map();
+  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], closedPRs = [], jobsByAttempt = new Map(), pullsAll = { fail: false };
   let clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
   const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(clock).toISOString(), updated_at: new Date(clock).toISOString() });
   const fetchImpl = async (url, options = {}) => {
@@ -39,6 +39,8 @@ async function fixture(t) {
     if (path.endsWith(`/git/trees/${'d'.repeat(40)}`)) return response({ tree: [{ path: 'maintainer', sha: 'e'.repeat(40) }] });
     if (path.includes('/git/trees/')) return response(path.endsWith(`/${changedPolicy}`) ? { tree: [{ path: '.github', sha: '1'.repeat(40) }, tree.tree[1]] } : tree);
     if (path.includes('/git/ref/heads/')) return response({ object: { sha: U } });
+    // Open PRs by default; state=all with head=owner:branch also sees closed ones, filtered like GitHub.
+    if (path.endsWith('/pulls') && u.searchParams.get('state') === 'all') return pullsAll.fail ? new Response('{}', { status: 403 }) : response([...prs, ...closedPRs].filter(pr => !u.searchParams.get('head') || `bugabinga:${pr.head?.ref}` === u.searchParams.get('head')));
     if (path.endsWith('/pulls')) return response(prs);
     if (/\/pulls\/\d+\/files$/.test(path)) return response(files);
     if (/\/pulls\/\d+$/.test(path)) return response(prs.find(pr => path.endsWith(`/${pr.number}`)));
@@ -57,7 +59,7 @@ async function fixture(t) {
   }
   const execute = async changes => controller({ env: { ...env, ...changes }, fetchImpl, now: clock, delays: [] });
   const json = async name => JSON.parse(await readFile(join(dir, name), 'utf8'));
-  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, prs, files, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
+  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
 }
 test('faux controller: cheap observe has no lease/registry/retry; maintain wires exact B/U task and creation-deadline lease', async t => {
   const f = await fixture(t);
@@ -421,7 +423,7 @@ test('incidents: failed effects jobs dedupe across observes, then admit one $5 h
   const lease = await f.json('lease.json'), third = await f.json('checkpoint.json'), incident = third.incidents[0].fingerprint;
   assert.equal(lease.task.kind, 'harness'); assert.equal(lease.task.incident, incident); assert.equal(lease.cap, 5); assert.deepEqual(third.slots, []);
   assert.equal(lease.task.fingerprint, harnessFingerprint(incident, digest(JSON.stringify({ github: 'c'.repeat(40), maintainer: 'e'.repeat(40) }))));
-  assert.deepEqual(admitted.harnessRepair, { incident, kind: 'job-failed' });
+  assert.deepEqual(admitted.harnessRepair, { incident, kind: 'job-failed', attempt: 1 });
   const written = await outputs(), digestOut = JSON.parse(written.incident);
   assert.equal(digestOut.incident, incident); assert.equal(digestOut.runs[0].jobs[0].name, 'Annie effects (model-free)'); assert.match(digestOut.runs[0].jobs[0].log, /^log unavailable/);
   assert.equal(JSON.parse(written.incidents)[0].fingerprint, incident);
@@ -432,6 +434,62 @@ test('incidents: failed effects jobs dedupe across observes, then admit one $5 h
   f.setCurrent(45); const next = await f.execute();
   assert.equal(next.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'maintenance'); assert.equal(next.allowance, 14);
   assert.ok((await f.json('checkpoint.json')).handled.includes(lease.task.fingerprint));
+});
+// Shared path to a ready job-failed incident (two failing effects runs) whose first harness repair run 44 was just admitted.
+async function admittedRepair(t, { beforeAdmission = () => {} } = {}) {
+  const f = await fixture(t);
+  await f.execute({ ANNIE_MODE: 'observe' }); const first = await f.json('checkpoint.json');
+  for (const id of [40, 41]) { f.runs.push({ ...f.run(id), conclusion: 'failure' }); f.artifact(id, `annie-checkpoint-${id}-1`, 'checkpoint.json', { ...first, runId: id }); }
+  f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', first);
+  f.jobs.push({ id: 9, name: 'Annie effects (model-free)', conclusion: 'failure', steps: [{ name: 'Persist source before registry auth', conclusion: 'failure' }] });
+  f.setCurrent(43); await f.execute({ ANNIE_MODE: 'observe' });
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', await f.json('checkpoint.json'));
+  f.setCurrent(44); beforeAdmission(f); const admitted = await f.execute();
+  return { f, admitted, lease: admitted.paid ? await f.json('lease.json') : null, checkpoint: await f.json('checkpoint.json') };
+}
+// Run 44 delivered its fix as PR #2; the PR body predates the incident marker, like the live PR #2.
+function deliveredAsPR(f, lease, checkpoint) {
+  const C = '9'.repeat(40);
+  f.runs.push(f.run(44)); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', checkpoint); f.artifact(44, 'annie-lease-44-1', 'lease.json', lease);
+  const identity = { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: 'harness', incident: lease.task.incident, day: lease.task.day, base };
+  f.artifact(44, 'honest-annie-model-report-44-1', 'report.json', { ...identity, managementApproved: false, commit: C, releaseCommit: C, phase: 'publishing', usageComplete: true, reportedUsage: { status: 'known', cost: 1 } });
+  f.artifact(44, 'honest-annie-release-report-44-1', 'report.json', { ...identity, releaseCommit: C, phase: 'publishing', actionReceipts: [{ kind: 'harness-pr', number: 2, status: 'applied', reason: null }] });
+  const pr = { number: 2, state: 'open', draft: false, user: { login: 'bugabinga', type: 'User' }, head: { sha: C, ref: `annie/harness/${lease.task.fingerprint.slice(0, 12)}`, repo: { full_name: OWN } }, base: { ref: 'trunk', repo: { full_name: OWN } }, body: 'legacy harness PR body without an incident marker' };
+  f.prs.push(pr); return pr;
+}
+const changedPolicy = digest(JSON.stringify({ github: '1'.repeat(40), maintainer: 'e'.repeat(40) }));
+test('live regression: an open harness PR blocks a second paid repair for its incident even after a policy change; closing it unmerged allows attempt 2', async t => {
+  const { f, lease, checkpoint } = await admittedRepair(t), incident = lease.task.incident;
+  assert.equal(lease.task.kind, 'harness'); assert.deepEqual(checkpoint.incidents[0].repair, { tasks: [lease.task.fingerprint], last: lease.task.fingerprint, runId: 44, at: now, policy: digest(JSON.stringify({ github: 'c'.repeat(40), maintainer: 'e'.repeat(40) })) });
+  deliveredAsPR(f, lease, checkpoint);
+  // An unrelated harness change lands: the trusted policy digest moves. Registry collision keeps maintenance out of the way.
+  f.setChangedPolicy(base); f.setRegistry(200); f.setCurrent(45);
+  const waiting = await f.execute();
+  assert.equal(waiting.paid, false); assert.equal(waiting.harnessRepair, null);
+  assert.deepEqual(waiting.harnessWaits, [{ incident, reason: 'awaiting-review', pr: 2 }]);
+  const held = await f.json('checkpoint.json'); assert.equal(held.incidents[0].pr, 2); assert.deepEqual(held.incidents[0].repair.tasks, [lease.task.fingerprint]);
+  // Oliver closes #2 unmerged while the incident persists: one more attempt, a new task and branch.
+  f.runs.push(f.run(45)); f.artifact(45, 'annie-checkpoint-45-1', 'checkpoint.json', held);
+  f.closedPRs.push({ ...f.prs.pop(), state: 'closed', merged_at: null });
+  f.setCurrent(46); const retried = await f.execute();
+  assert.equal(retried.state, 'admitted'); assert.deepEqual(retried.harnessRepair, { incident, kind: 'job-failed', attempt: 2 });
+  const second = await f.json('lease.json'); assert.equal(second.task.fingerprint, harnessFingerprint(incident, changedPolicy, 2)); assert.notEqual(second.task.fingerprint.slice(0, 12), lease.task.fingerprint.slice(0, 12));
+  const after = await f.json('checkpoint.json'); assert.equal(after.incidents[0].pr, undefined); assert.equal(after.incidents[0].repair.tasks.length, 2); assert.equal(after.incidents[0].repair.policy, changedPolicy);
+  // An unknown PR lookup admits nothing.
+  f.runs.push(f.run(46)); f.artifact(46, 'annie-checkpoint-46-1', 'checkpoint.json', { ...held, runId: 46 }); f.pullsAll.fail = true; f.setCurrent(47);
+  const unknown = await f.execute(); assert.equal(unknown.harnessRepair, null); assert.deepEqual(unknown.harnessWaits, [{ incident, reason: 'harness-pr-lookup-unknown' }]);
+});
+test('harness repair waits while its run is in flight and fails closed on an unattributable open harness PR', async t => {
+  const { f, lease, checkpoint } = await admittedRepair(t), incident = lease.task.incident;
+  f.runs.push({ ...f.run(44), status: 'in_progress', conclusion: null }); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', checkpoint); f.artifact(44, 'annie-lease-44-1', 'lease.json', lease);
+  f.setChangedPolicy(base); f.setCurrent(45);
+  const flying = await f.execute(); assert.equal(flying.harnessRepair, null); assert.deepEqual(flying.harnessWaits, [{ incident, reason: 'in-flight' }]);
+  const stray = await admittedRepair(t, { beforeAdmission: g => g.prs.push({ number: 9, state: 'open', draft: false, user: { login: 'bugabinga', type: 'User' }, head: { sha: 'f'.repeat(40), ref: 'annie/harness/abcdefabcdef' }, base: { ref: 'trunk', repo: { full_name: OWN } }, body: 'no marker' }) });
+  assert.equal(stray.lease?.task.kind === 'harness', false); assert.equal(stray.admitted.harnessRepair, null);
+  assert.deepEqual(stray.admitted.harnessWaits.at(-1), { incident: null, reason: 'unattributed open harness PR #9' });
+  // A marked PR from a fork or an unrelated branch prefix never counts.
+  const fork = await admittedRepair(t, { beforeAdmission: g => g.prs.push({ number: 10, state: 'open', draft: false, user: { login: 'someone', type: 'User' }, head: { sha: 'f'.repeat(40), ref: 'annie/harness/abcdefabcdef', repo: { full_name: 'someone/pufferpanel' } }, base: { ref: 'trunk', repo: { full_name: OWN } }, body: 'fork' }) });
+  assert.equal(fork.lease.task.kind, 'harness');
 });
 test('never self-integrate: harness repair branches and protected-path PRs are refused before any paid admission', async t => {
   const f = await fixture(t);

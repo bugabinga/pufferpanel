@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { redact, text } from './report.mjs';
 import { git } from './pr.mjs';
-import { OWN, harnessBranch } from './task.mjs';
+import { HARNESS_BRANCH_PREFIX, OWN, harnessBranch } from './task.mjs';
 import { harnessScope } from './scope.mjs';
 
 export const INCIDENT_LABEL = 'annie-incident';
@@ -63,18 +63,57 @@ export function detectIncidents({ now, abandoned = [], held = [], blockers = [],
 export function foldIncidents(previous, found, now) {
   const next = found.map(entry => {
     const prior = previous.find(old => old.fingerprint === entry.fingerprint), ongoing = prior?.status === 'open';
-    return { ...entry, runs: entry.runs.slice(0, 5), firstSeen: prior?.firstSeen ?? now, since: ongoing ? prior.since : now, lastSeen: now, count: ongoing ? Math.min(prior.count + 1, 1_000_000) : 1, status: 'open' };
+    // Repair memory survives clearing and recurrence; the open-PR number is recomputed by every observation.
+    return { ...entry, runs: entry.runs.slice(0, 5), firstSeen: prior?.firstSeen ?? now, since: ongoing ? prior.since : now, lastSeen: now, count: ongoing ? Math.min(prior.count + 1, 1_000_000) : 1, status: 'open', ...(prior?.repair ? { repair: prior.repair } : {}) };
   });
-  for (const prior of previous) if (!next.some(entry => entry.fingerprint === prior.fingerprint) && (prior.status === 'open' || now - prior.lastSeen < 7 * DAY)) next.push({ ...prior, status: 'cleared' });
+  for (const prior of previous) if (!next.some(entry => entry.fingerprint === prior.fingerprint) && (prior.status === 'open' || now - prior.lastSeen < 7 * DAY)) { const { pr, ...rest } = prior; next.push({ ...rest, status: 'cleared' }); }
   return next.sort((a, b) => (a.status === 'open' ? 0 : 1) - (b.status === 'open' ? 0 : 1) || b.lastSeen - a.lastSeen).slice(0, 20);
 }
 // An incident earns an issue (and maybe a repair) after two observations; a failed job needs two failing runs within 24h.
 export const ready = entry => entry.status === 'open' && entry.count >= 2 && (entry.kind !== 'job-failed' || entry.runs.length >= 2);
 export const syncable = entries => entries.filter(entry => ready(entry) || entry.status === 'cleared' && entry.count >= 2);
 export function validateIncidents(value) {
-  const keys = 'count,detail,fingerprint,firstSeen,kind,lastSeen,runs,since,status';
-  if (!Array.isArray(value) || value.length > 20 || new Set(value.map(entry => entry?.fingerprint)).size !== value.length || value.some(entry => !entry || typeof entry !== 'object' || Object.keys(entry).sort().join() !== keys || !/^[a-f0-9]{64}$/.test(entry.fingerprint) || !KINDS.includes(entry.kind) || typeof entry.detail !== 'string' || !/^[\x20-\x7e]{0,200}$/.test(entry.detail) || !Array.isArray(entry.runs) || entry.runs.length > 5 || entry.runs.some(id => !Number.isSafeInteger(id) || id < 1) || ['firstSeen', 'since', 'lastSeen'].some(key => !Number.isSafeInteger(entry[key]) || entry[key] <= 0) || entry.firstSeen > entry.since || entry.since > entry.lastSeen || !Number.isSafeInteger(entry.count) || entry.count < 1 || entry.count > 1_000_000 || !['open', 'cleared'].includes(entry.status))) throw Error('malformed incidents');
+  const keys = 'count,detail,fingerprint,firstSeen,kind,lastSeen,runs,since,status', hex = /^[a-f0-9]{64}$/;
+  const repairOk = r => r === undefined || r && typeof r === 'object' && Object.keys(r).sort().join() === 'at,last,policy,runId,tasks' && Array.isArray(r.tasks) && r.tasks.length >= 1 && r.tasks.length <= 5 && r.tasks.every(task => hex.test(task)) && new Set(r.tasks).size === r.tasks.length && r.tasks.includes(r.last) && Number.isSafeInteger(r.runId) && r.runId > 0 && Number.isSafeInteger(r.at) && r.at > 0 && (r.policy === null || hex.test(r.policy));
+  if (!Array.isArray(value) || value.length > 20 || new Set(value.map(entry => entry?.fingerprint)).size !== value.length || value.some(entry => !entry || typeof entry !== 'object' || Object.keys(entry).filter(key => !['pr', 'repair'].includes(key)).sort().join() !== keys || !repairOk(entry.repair) || entry.pr !== undefined && (!Number.isSafeInteger(entry.pr) || entry.pr < 1) || !/^[a-f0-9]{64}$/.test(entry.fingerprint) || !KINDS.includes(entry.kind) || typeof entry.detail !== 'string' || !/^[\x20-\x7e]{0,200}$/.test(entry.detail) || !Array.isArray(entry.runs) || entry.runs.length > 5 || entry.runs.some(id => !Number.isSafeInteger(id) || id < 1) || ['firstSeen', 'since', 'lastSeen'].some(key => !Number.isSafeInteger(entry[key]) || entry[key] <= 0) || entry.firstSeen > entry.since || entry.since > entry.lastSeen || !Number.isSafeInteger(entry.count) || entry.count < 1 || entry.count > 1_000_000 || !['open', 'cleared'].includes(entry.status))) throw Error('malformed incidents');
   return value;
+}
+
+// Repair admission, at most one open proposal per incident and three attempts: never while an attempt runs or a PR awaits
+// Oliver; afterwards only once the PR was (a) closed unmerged, (b) merged with evidence after the merge, or for (c) an attempt
+// without a PR, once trusted policy changed or 24h passed. A policy change alone never retries over an open PR.
+export const MAX_REPAIRS = 3;
+export const harnessIncidentMarker = incident => `<!-- annie-harness-incident:${incident} -->`;
+export function repairDecision({ entry, running = false, last = null, policy, now, evidenceAt = 0 }) {
+  const repair = entry.repair, attempt = (repair?.tasks.length ?? 0) + 1;
+  if (running) return { admit: false, reason: 'in-flight' };
+  if (entry.pr) return { admit: false, reason: 'awaiting-review', pr: entry.pr };
+  if (!repair) return { admit: true, attempt, reason: 'first' };
+  if (repair.tasks.length >= MAX_REPAIRS) return { admit: false, reason: 'attempts-exhausted' };
+  if (last?.state === 'open') return { admit: false, reason: 'awaiting-review', pr: last.number };
+  if (last?.state === 'closed') return { admit: true, attempt, reason: 'closed-unmerged' };
+  if (last?.state === 'merged') return entry.since > last.at || evidenceAt > last.at ? { admit: true, attempt, reason: 'persists-after-merge' } : { admit: false, reason: 'merged-awaiting-evidence', pr: last.number };
+  if (last?.state === 'none') return repair.policy !== null && repair.policy !== policy || now - repair.at >= DAY ? { admit: true, attempt, reason: 'retry-without-pr' } : { admit: false, reason: 'no-pr-backoff' };
+  return { admit: false, reason: 'unknown-last-attempt' };
+}
+// Merge harness attempts seen in the ledger or flights into the checkpoint memory; observed attempts carry no admission policy.
+export function foldRepair(repair, attempts) {
+  const ordered = [...attempts].sort((a, b) => a.runId - b.runId), newest = ordered.at(-1);
+  if (!newest) return repair ?? null;
+  const tasks = [...new Set([...(repair?.tasks ?? []), ...ordered.map(a => a.task)])].slice(-5);
+  if (repair && newest.runId <= repair.runId) return { ...repair, tasks: tasks.includes(repair.last) ? tasks : [...tasks.slice(-4), repair.last] };
+  return { tasks, last: newest.task, runId: newest.runId, at: newest.at, policy: null };
+}
+// Open harness PRs per incident, by body marker or a known attempt branch; an unattributable one blocks every repair.
+export function openRepairs(prs, known) {
+  const open = new Map(); let unknown = [];
+  for (const pr of prs) {
+    const ref = String(pr?.head?.ref ?? '');
+    if (!ref.startsWith(HARNESS_BRANCH_PREFIX) || pr.head?.repo?.full_name && pr.head.repo.full_name !== OWN) continue;
+    const incident = /<!-- annie-harness-incident:([a-f0-9]{64}) -->/.exec(typeof pr.body === 'string' ? pr.body : '')?.[1] ?? known.get(ref);
+    if (!incident) unknown.push(pr.number); else if (!open.has(incident) || open.get(incident) > pr.number) open.set(incident, pr.number);
+  }
+  return { open, unknown };
 }
 
 // Bounded untrusted digest for a harness repair: incident facts, failing jobs/steps, redacted log tails, sanitized report fields.
@@ -142,8 +181,18 @@ export async function syncIncidents(api, entries) {
       else Object.assign(receipt, { status: 'skipped', reason: 'unchanged' });
     } catch (error) { receipt.reason = safe(error.message); }
     receipts.push(receipt);
+    if (entry.status === 'open' && entry.pr && receipt.number && receipt.status !== 'failed' && receipt.reason !== 'closed-by-maintainer') receipts.push(await awaiting(api, entry, receipt.number));
   }
   return receipts;
+}
+// While a harness PR awaits Oliver, say so once per incident and PR, found again by marker on complete comment pages.
+async function awaiting(api, entry, number) {
+  const receipt = { kind: 'incident-awaiting', fingerprint: entry.fingerprint.slice(0, 16), number, status: 'failed', reason: null }, key = `<!-- annie-awaiting:${entry.fingerprint}:${entry.pr} -->`;
+  try {
+    if ((await api.pages(`/repos/${OWN}/issues/${number}/comments`)).some(item => typeof item?.body === 'string' && item.body.includes(key))) Object.assign(receipt, { status: 'skipped', reason: 'already-applied' });
+    else { await comment(api, number, `\u2620\ufe0f Awaiting review/merge of #${entry.pr}; Annie starts no other harness repair for this incident meanwhile.\n${key}`); Object.assign(receipt, { status: 'applied', reason: `awaiting #${entry.pr}` }); }
+  } catch (error) { receipt.reason = safe(error.message); }
+  return receipt;
 }
 
 export function harnessPullBody({ run, task, issue, branch, changed }) {
@@ -153,13 +202,24 @@ export function harnessPullBody({ run, task, issue, branch, changed }) {
     '### Independent review findings', ...(run.findings?.length ? run.findings.slice(0, 20).map(finding => `- ${md(finding)}`) : ['- none blocking or advisory']), '',
     '### Changed files', ...changed.slice(0, 50).map(name => `- ${md(name)}`), '',
     '### Gates', 'Maintain-side and fresh credential-free release-side harness gates passed: npm ci, npm test, bash -n, workflow YAML parse, actionlint.',
-    `Base ${run.base}, tree ${run.tree}, candidate ${run.commit}, task ${task.fingerprint.slice(0, 16)}.`, `<!-- annie-harness:${task.fingerprint} -->`].join('\n');
+    `Base ${run.base}, tree ${run.tree}, candidate ${run.commit}, task ${task.fingerprint.slice(0, 16)}.`, `<!-- annie-harness:${task.fingerprint} -->`, harnessIncidentMarker(task.incident)].join('\n');
+}
+// An open PR from another harness branch for this incident: by body marker or, for PRs older than that marker, by an earlier
+// delivery comment on the incident issue naming it. Lookup failures throw, so delivery fails closed before any push.
+async function openTwin(native, incident, branch, issue) {
+  const open = (await native.pages(`/repos/${OWN}/pulls?state=open`)).filter(pr => String(pr?.head?.ref ?? '').startsWith(HARNESS_BRANCH_PREFIX) && pr.head.ref !== branch && !(pr.head?.repo?.full_name && pr.head.repo.full_name !== OWN));
+  if (!open.length) return null;
+  const named = new Set();
+  // Only Annie's own creation announcements name a PR; a body marking any incident decides alone.
+  if (issue) for (const item of await native.pages(`/repos/${OWN}/issues/${issue}/comments`)) if (item?.user?.login === 'github-actions[bot]' && typeof item.body === 'string' && item.body.includes('<!-- annie-delivery:')) for (const [, number] of item.body.matchAll(/Harness fix ready for review: #(\d+) /g)) named.add(Number(number));
+  const marked = pr => /<!-- annie-harness-incident:([a-f0-9]{64}) -->/.exec(typeof pr.body === 'string' ? pr.body : '')?.[1];
+  return open.filter(pr => marked(pr) ? marked(pr) === incident : named.has(pr.number)).sort((a, b) => a.number - b.number)[0]?.number ?? null;
 }
 // Model-free delivery after the fresh credential-free harness gate: verify the bundle by plumbing (candidate code never runs
 // here), push C to its own branch with the PAT, open a PR against trunk, and tell the incident issue either way.
 export async function deliverHarness({ source, bundle, run, task, gate, native, pat, hasPat }) {
   const branch = harnessBranch(task.fingerprint), receipts = [], note = (kind, status, extra = {}) => receipts.push({ kind, status, number: null, reason: null, ...extra });
-  let pushed = false, pr = null, problem = null, issue = null;
+  let pushed = false, pr = null, problem = null, issue = null, twin = null;
   try { issue = (await incidentIssues(native)).get(task.incident)?.number ?? null; } catch (error) { note('incident-lookup', 'failed', { reason: safe(error.message) }); }
   try {
     if (gate !== 'success') throw Error(`fresh harness gate ${/^[a-z_]{1,20}$/.test(gate ?? '') ? gate : 'missing'}`);
@@ -172,6 +232,9 @@ export async function deliverHarness({ source, bundle, run, task, gate, native, 
     // The shared scope rule again, before any PAT use: a PR's own workflows would run with write tokens on open.
     const scope = await harnessScope(source, run.base, commit);
     if (scope) throw Error(scope);
+    // One open proposal per incident: an earlier open PR stays untouched, so nothing new is pushed or opened.
+    twin = await openTwin(native, task.incident, branch, issue);
+    if (twin) { note('harness-pr', 'skipped', { number: twin, reason: 'awaiting-earlier-pr' }); throw Error(`#${twin} for this incident still awaits review/merge`); }
     if (!hasPat) throw Error('ANNIE_GH_TOKEN missing in honest-annie-release');
     const auth = ['-c', 'credential.helper=', '-c', 'credential.helper=!f() { printf "username=x-access-token\\npassword=%s\\n" "$ANNIE_GH_TOKEN"; }; f'];
     const ref = `refs/heads/${branch}`, remote = async () => (await git(source, ...auth, 'ls-remote', 'origin', ref)).split(/\s/)[0];
@@ -189,8 +252,8 @@ export async function deliverHarness({ source, bundle, run, task, gate, native, 
       if (!Number.isSafeInteger(created.number)) throw Error('PR creation returned no number');
       pr = created; note('harness-pr', 'applied', { number: created.number });
     }
-  } catch (error) { problem = safe(error.message); note(pushed ? 'harness-pr' : 'harness-branch', 'failed', { reason: problem }); }
-  const message = pr?.state === 'closed' ? (pr.merged_at ? `Harness fix from \`${branch}\` was already merged as #${pr.number}.` : `Harness fix from \`${branch}\` was proposed as #${pr.number}, which was closed unmerged; Annie will not reopen it.`) : pr ? `Harness fix ready for review: #${pr.number} from \`${branch}\`. Only Oliver merges it.` : pushed ? `Harness fix ready on branch \`${branch}\` but PR creation failed: ${md(problem)}` : `Harness fix could not be delivered: ${md(problem)}`;
+  } catch (error) { problem = safe(error.message); if (!twin) note(pushed ? 'harness-pr' : 'harness-branch', 'failed', { reason: problem }); }
+  const message = twin ? `Harness fix from \`${branch}\` not delivered: #${twin} for this incident still awaits review/merge, and Annie leaves it unchanged.` : pr?.state === 'closed' ? (pr.merged_at ? `Harness fix from \`${branch}\` was already merged as #${pr.number}.` : `Harness fix from \`${branch}\` was proposed as #${pr.number}, which was closed unmerged; Annie will not reopen it.`) : pr ? `Harness fix ready for review: #${pr.number} from \`${branch}\`. Only Oliver merges it.` : pushed ? `Harness fix ready on branch \`${branch}\` but PR creation failed: ${md(problem)}` : `Harness fix could not be delivered: ${md(problem)}`;
   const key = `<!-- annie-delivery:${digest({ task: task.fingerprint, message })} -->`;
   let told = false;
   if (!issue) note('incident-comment', 'failed', { reason: 'incident issue not found' });

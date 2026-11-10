@@ -3,9 +3,9 @@ import { inflateRawSync } from 'node:zlib';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
+import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, harnessBranch, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
-import { REPAIRABLE, detectIncidents, foldIncidents, makeDigest, ready, syncIncidents, syncable, validateIncidents } from './incident.mjs';
+import { MAX_REPAIRS, REPAIRABLE, detectIncidents, foldIncidents, foldRepair, makeDigest, openRepairs, ready, repairDecision, syncIncidents, syncable, validateIncidents } from './incident.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
 export const WAKE_PATH = '.github/workflows/annie-pr-wake.yml';
@@ -20,7 +20,7 @@ const providerList = value => Array.isArray(value) && value.length <= 64 && valu
 const failureList = value => Array.isArray(value) && value.length <= 64 && value.every(item => item && Object.keys(item).every(key => ['provider', 'kind', 'observedAt', 'resetAt'].includes(key)) && providerId(item.provider) && ['quota', 'auth', 'transient'].includes(item.kind) && iso(item.observedAt) && (item.resetAt === undefined || iso(item.resetAt) && Date.parse(item.resetAt) > Date.parse(item.observedAt) && Date.parse(item.resetAt) <= Date.parse(item.observedAt) + 31 * DAY));
 export function prFingerprint({ number, head, base, policy }) { return digest({ number, head, base, policy }); }
 // Once per incident and trusted policy: a merged harness change (new policy) earns a recurring incident one more attempt.
-export const harnessFingerprint = (incident, policy) => digest({ kind: 'harness', incident, policy });
+export const harnessFingerprint = (incident, policy, attempt = 1) => digest({ kind: 'harness', incident, policy, attempt });
 // Rejection memory: each review-rejected maintenance run's changed-file area and first five blocking findings, deduplicated
 // by run, kept 30 days, at most the 20 newest.
 export function foldRejections(previous, records, now) {
@@ -294,12 +294,12 @@ export async function observeLedger(api, repo, workflow, now, currentId) {
   }
   return { allowance: rollingAllowance(entries, now), checkpoint, records, runs, outstanding, blockers, hadCheckpoint, hadPaidArtifacts };
 }
-export function chooseTask({ prs, base, upstreamSha, upstreamRef, policy, day, checkpoint, usefulUpstream = false, queueChanged = false, daily = false, incidents = [] }) {
+export function chooseTask({ prs, base, upstreamSha, upstreamRef, policy, day, checkpoint, usefulUpstream = false, queueChanged = false, daily = false, repairs = [] }) {
   const handled = new Set(checkpoint.handled), common = { day, repo: OWN, ref: REF, base, upstreamSha, upstreamRef };
-  // Broken machinery wastes every other batch: a ready repairable incident goes first, once per incident and policy.
-  for (const incident of incidents.filter(entry => ready(entry) && REPAIRABLE.has(entry.kind))) {
-    const fingerprint = harnessFingerprint(incident.fingerprint, policy);
-    if (!handled.has(fingerprint)) return validateTask({ ...common, kind: 'harness', incident: incident.fingerprint, fingerprint });
+  // Broken machinery wastes every other batch: an admissible harness repair (repairDecision) goes first.
+  for (const { incident, attempt } of repairs) {
+    const fingerprint = harnessFingerprint(incident, policy, attempt);
+    if (!handled.has(fingerprint)) return validateTask({ ...common, kind: 'harness', incident, fingerprint });
   }
   for (const pr of prs) {
     const fingerprint = prFingerprint({ number: pr.number, head: pr.head.sha, base, policy });
@@ -444,8 +444,8 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   if (fresh.pendingRuns.length > 20) fail('outstanding execution capacity exceeded');
   // Retain only current PR fingerprints plus last maintenance metadata; healthy sweeps refresh retention.
   const current = new Set(prs.map(pr => prFingerprint({ number: pr.number, head: pr.head?.sha, base: branch.commit.sha, policy })));
-  const repairs = new Set((checkpoint.incidents ?? []).map(incident => harnessFingerprint(incident.fingerprint, policy)));
-  fresh.handled = checkpoint.handled.filter(value => current.has(value) || value === checkpoint.lastMaintenance || repairs.has(value)).slice(-199);
+  const repairTasks = new Set((checkpoint.incidents ?? []).flatMap(incident => incident.repair?.tasks ?? []));
+  fresh.handled = checkpoint.handled.filter(value => current.has(value) || value === checkpoint.lastMaintenance || repairTasks.has(value)).slice(-199);
   fresh.flights = (checkpoint.flights ?? []).filter(f => !ledger.records.some(r => r.run.id === f.runId && (r.zeroDispatch || r.run.status === 'completed')));
   fresh.outcomes = [...checkpoint.outcomes ?? []];
   const configSignal = digest({ policy, enabled: env.HONEST_ANNIE_ENABLED, repair: env.ANNIE_CONFIG_REVISION ?? '' });
@@ -506,8 +506,34 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     providersHeld: providersHeld ? { providers: fresh.providers.available, until: heldUntil } : null,
     reports: ledger.records.filter(r => r.settlement && r.lease).map(r => ({ runId: r.run.id, taskKind: r.lease.task.kind, report: r.settlement })),
   }), now);
+  // Harness repair admission: one open proposal per incident and bounded retries (repairDecision); unknown PR state admits none.
+  const createdAt = id => { const found = ledger.runs.find(r => r.id === id); return found ? time(found.created_at) : now; };
+  const attempts = [...ledger.records.filter(r => !r.zeroDispatch && r.lease?.task.kind === 'harness').map(r => ({ incident: r.lease.task.incident, task: r.lease.task.fingerprint, runId: r.run.id, at: time(r.run.created_at), running: r.run.status !== 'completed' || pending.includes(r) })),
+    ...fresh.flights.filter(f => f.task.kind === 'harness').map(f => ({ incident: f.task.incident, task: f.task.fingerprint, runId: f.runId, at: createdAt(f.runId), running: true }))];
+  for (const incident of fresh.incidents) { const repair = foldRepair(incident.repair, attempts.filter(a => a.incident === incident.fingerprint)); if (repair) incident.repair = repair; }
+  const known = new Map([...fresh.incidents.flatMap(incident => (incident.repair?.tasks ?? []).map(fp => [harnessBranch(fp), incident.fingerprint])), ...attempts.map(a => [harnessBranch(a.task), a.incident])]);
+  const { open: openPRs, unknown: unattributed } = openRepairs(prs, known);
+  for (const incident of fresh.incidents) { delete incident.pr; if (incident.status === 'open' && openPRs.has(incident.fingerprint)) incident.pr = openPRs.get(incident.fingerprint); }
+  let repairs = [], lookupFailed = false; const waits = [];
+  for (const incident of fresh.incidents.filter(entry => ready(entry) && REPAIRABLE.has(entry.kind))) {
+    const running = attempts.some(a => a.incident === incident.fingerprint && a.running), repair = incident.repair;
+    let last = null;
+    if (repair && !running && !incident.pr && repair.tasks.length < MAX_REPAIRS) {
+      const branchName = harnessBranch(repair.last);
+      try {
+        const found = (await api.pages(`/repos/${OWN}/pulls?state=all&head=${encodeURIComponent(`${OWN.split('/')[0]}:${branchName}`)}`)).find(pr => pr?.head?.ref === branchName);
+        last = !found ? { state: 'none' } : found.state === 'open' ? { state: 'open', number: found.number } : found.merged_at ? { state: 'merged', number: found.number, at: time(found.merged_at) } : { state: 'closed', number: found.number };
+      } catch { lookupFailed = true; waits.push({ incident: incident.fingerprint, reason: 'harness-pr-lookup-unknown' }); continue; }
+    }
+    const evidenceAt = Math.max(0, ...incident.runs.map(id => ledger.runs.find(r => r.id === id)).filter(Boolean).map(r => time(r.created_at)));
+    const decision = repairDecision({ entry: incident, running, last, policy, now, evidenceAt });
+    if (decision.admit) repairs.push({ incident: incident.fingerprint, attempt: decision.attempt });
+    else waits.push({ incident: incident.fingerprint, reason: decision.reason, ...(decision.pr ? { pr: decision.pr } : {}) });
+  }
+  // Fail closed: an open harness PR nobody can attribute, or an unknown PR lookup, admits no harness repair at all.
+  if (unattributed.length || lookupFailed) { if (unattributed.length) waits.push({ incident: null, reason: `unattributed open harness PR #${unattributed.join(', #')}` }); repairs = []; }
   const humanSourceChanged = checkpoint.inputBase !== undefined && checkpoint.inputBase !== branch.commit.sha && !ownAcknowledged;
-  const task = chooseTask({ prs: eligible, base: branch.commit.sha, upstreamSha: pin.object.sha, upstreamRef, policy, day, checkpoint: { ...fresh, handled: [...fresh.handled, ...fresh.flights.map(f => f.task.fingerprint), ...fresh.outcomes.filter(o => (o.kind !== 'environment' || checkpoint.environment?.signal === configSignal) && (o.attempts >= 3 || o.nextAt > now)).map(o => o.fingerprint)], queue }, usefulUpstream: humanSourceChanged || checkpoint.upstream !== undefined && checkpoint.upstream !== pin.object.sha, queueChanged, daily: env.GITHUB_EVENT_NAME === 'schedule' && event.schedule === '17 4 * * *', incidents: fresh.incidents });
+  const task = chooseTask({ prs: eligible, base: branch.commit.sha, upstreamSha: pin.object.sha, upstreamRef, policy, day, checkpoint: { ...fresh, handled: [...fresh.handled, ...fresh.flights.map(f => f.task.fingerprint), ...fresh.outcomes.filter(o => (o.kind !== 'environment' || checkpoint.environment?.signal === configSignal) && (o.attempts >= 3 || o.nextAt > now)).map(o => o.fingerprint)], queue }, usefulUpstream: humanSourceChanged || checkpoint.upstream !== undefined && checkpoint.upstream !== pin.object.sha, queueChanged, daily: env.GITHUB_EVENT_NAME === 'schedule' && event.schedule === '17 4 * * *', repairs });
   fresh.upstream ??= pin.object.sha;
   fresh.inputBase = ownAcknowledged || fresh.inputBase === undefined ? branch.commit.sha : fresh.inputBase;
   // Model-free republish of persisted source: attempt-1 maintain only, 30-minute cooldown, at most three attempts.
@@ -529,6 +555,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
         fresh.paid = true;
         fresh.flights.push({ runId: run.id, task, queue });
         if (['maintenance', 'pr'].includes(task.kind)) fresh.slots.push(day);
+        if (task.kind === 'harness') { const incident = fresh.incidents.find(entry => entry.fingerprint === task.incident); incident.repair = { tasks: [...(incident.repair?.tasks ?? []), task.fingerprint].slice(-5), last: task.fingerprint, runId: run.id, at: now, policy }; }
         state = 'admitted';
       }
     }
@@ -556,9 +583,9 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   await output('paid', Boolean(lease)); await output('task', lease ? JSON.stringify(task) : ''); await output('lease', lease ? JSON.stringify(lease) : ''); await output('state', state); await output('holds', JSON.stringify(fresh.providerHolds)); await output('rejections', JSON.stringify(fresh.rejections));
   const issueWork = syncable(fresh.incidents), repairing = lease && task.kind === 'harness' ? fresh.incidents.find(incident => incident.fingerprint === task.incident) : null;
   await output('incidents', issueWork.length ? JSON.stringify(issueWork) : ''); await output('incident', repairing ? JSON.stringify(await harnessDigest(api, repairing, ledger.records)) : '');
-  const summary = { state, mode, providerHolds: fresh.providerHolds.map(hold => ({ ...hold, until: new Date(hold.until).toISOString() })), holdsExpireAt, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint, incidents: fresh.incidents.map(i => ({ fingerprint: i.fingerprint, kind: i.kind, detail: i.detail, count: i.count, status: i.status, ready: ready(i) })), harnessRepair: repairing ? { incident: repairing.fingerprint, kind: repairing.kind } : null };
+  const summary = { state, mode, providerHolds: fresh.providerHolds.map(hold => ({ ...hold, until: new Date(hold.until).toISOString() })), holdsExpireAt, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint, incidents: fresh.incidents.map(i => ({ fingerprint: i.fingerprint, kind: i.kind, detail: i.detail, count: i.count, status: i.status, ready: ready(i) })), harnessRepair: repairing ? { incident: repairing.fingerprint, kind: repairing.kind, attempt: repairing.repair.tasks.length } : null, harnessWaits: waits };
   await writeFile(join(dir, 'observer.json'), JSON.stringify(summary));
-  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}; republish: ${republish ? republish.version : 'none'}; held: ${held.length}; abandoned: ${abandoned.length}; provider holds: ${fresh.providerHolds.map(hold => `${hold.provider} ${hold.reason}`).join(', ') || 'none'}${holdsExpireAt ? `, all providers held until ${holdsExpireAt}` : ''}.\n${abandoned.map(a => `\n- abandoned run ${a.runId} (${a.source?.slice(0, 12) ?? 'no source'}): ${a.reason}`).join('')}\nIncidents: ${fresh.incidents.filter(i => i.status === 'open').length} open, ${fresh.incidents.filter(ready).length} reported${issueWork.length ? ', issue sync requested' : ''}${repairing ? `; harness self-repair admitted for ${repairing.kind} ${repairing.fingerprint.slice(0, 12)}, delivered only as a PR for Oliver` : ''}.\n${fresh.incidents.filter(ready).map(i => `\n- incident ${i.kind}: ${i.detail.replace(/[^A-Za-z0-9 :;,.()#/_+-]/g, '_')} (${i.count} observations)`).join('')}\n`, { flag: 'a' });
+  if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}; republish: ${republish ? republish.version : 'none'}; held: ${held.length}; abandoned: ${abandoned.length}; provider holds: ${fresh.providerHolds.map(hold => `${hold.provider} ${hold.reason}`).join(', ') || 'none'}${holdsExpireAt ? `, all providers held until ${holdsExpireAt}` : ''}.\n${abandoned.map(a => `\n- abandoned run ${a.runId} (${a.source?.slice(0, 12) ?? 'no source'}): ${a.reason}`).join('')}\nIncidents: ${fresh.incidents.filter(i => i.status === 'open').length} open, ${fresh.incidents.filter(ready).length} reported${issueWork.length ? ', issue sync requested' : ''}${repairing ? `; harness self-repair attempt ${repairing.repair.tasks.length} admitted for ${repairing.kind} ${repairing.fingerprint.slice(0, 12)}, delivered only as a PR for Oliver` : ''}${waits.length ? `; harness repairs waiting: ${waits.map(w => `${w.incident?.slice(0, 12) ?? 'all'} ${w.reason}${w.pr ? ` #${w.pr}` : ''}`).join(', ')}` : ''}.\n${fresh.incidents.filter(ready).map(i => `\n- incident ${i.kind}: ${i.detail.replace(/[^A-Za-z0-9 :;,.()#/_+-]/g, '_')} (${i.count} observations)`).join('')}\n`, { flag: 'a' });
   return summary;
 }
 export async function verifyUploadedLease({ env = process.env, fetchImpl = fetch, now = Date.now() } = {}) {

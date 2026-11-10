@@ -472,7 +472,16 @@ A maintainer closing an ongoing incident is respected until it clears and recurs
 Bodies hold kind, detail, counts, times, and run links, never raw logs; failed receipts fail the job visibly.
 
 Repairable kinds (`job-failed`, `gate-harness`, sandbox, visual, cleanup, `effects-abandoned`) admit a `harness` task before PRs and maintenance.
-Its fingerprint hashes the incident and the trusted harness policy, so it is admitted once per incident, and merging any harness change permits one more attempt for a recurring incident.
+Its fingerprint hashes the incident, the trusted harness policy, and the attempt number, so every attempt gets its own branch.
+Each checkpoint incident keeps `repair` memory `{tasks, last, runId, at, policy}`, refreshed from harness attempts in the ledger and flights, and `pr` while a harness PR for it is open.
+Open PRs come from the complete open-PR list; an `annie/harness/` PR is attributed by its `annie-harness-incident` body marker or by a known attempt branch, and fork heads are ignored.
+An open harness PR that cannot be attributed, or an unknown lookup of the last attempt's PR, admits no harness repair at all.
+This covers the live PR #2, whose body predates the marker, only while its run is in the ledger or `repair` memory; otherwise every repair waits until Oliver closes or merges it.
+No repair starts while an attempt for the incident is in flight or awaits review in an open PR; a trusted policy change alone never retries.
+Another attempt needs (a) the last PR closed unmerged with the incident still present, (b) the last PR merged and either evidence from a run created after the merge or a recurrence after clearing, or (c) no PR from the last attempt and either a different admission policy or 24h, with an unknown admission policy waiting 24h.
+Kinds whose evidence never moves, such as an abandoned run, therefore never retry after a merge.
+At most three attempts are made per incident.
+While a PR awaits review, the incident issue says `Awaiting review/merge of #N` once per PR, found again by a hidden marker.
 It needs allowance, unheld providers, no pending effects, and no environment cooldown, has a $5 lease cap, and never holds a calendar image slot.
 Any settled harness outcome except an environment failure is handled.
 Observe then fetches the incident runs' failing jobs and steps plus two job log tails with the read-only token.
@@ -495,6 +504,9 @@ Job `Annie harness gate (model-free)` imports the bundle and reruns the harness 
 Job `harness-deliver` holds `ANNIE_GH_TOKEN` and runs no candidate code; it is named `Annie effects (model-free)` so the bounded effects retry covers it.
 It checks the bundle by Git plumbing (commit C, parents `[B]`, tree T) and the scope rule before any PAT use, pushes C without force to `annie/harness/` plus the first 12 hex of the task fingerprint, and opens a PR against trunk.
 The same branch only recurs on an effects retry of the same task, which reuses an existing branch or PR and distinguishes open, merged, and closed-unmerged.
+Before any PAT use, delivery looks for another open harness PR for the same incident, by body marker or, for older PRs, by Annie's own "ready for review: #N" announcement on the incident issue.
+If one exists, delivery pushes and opens nothing and comments that the earlier PR still awaits review/merge.
+It never updates the earlier PR's branch: that would change code under Oliver's review, leave its description and review findings stale, and need a force push.
 The PR body links the incident with Refs, not Closes, quotes the model's diagnosis as unverified, and lists review findings, changed files, and gates.
 Every outcome is commented on the incident issue: ready for review, ready on the branch but PR creation failed, or could not be delivered with the reason.
 Receipts `harness-branch`, `harness-pr`, and `incident-comment` reach the release report and Actions summary.
