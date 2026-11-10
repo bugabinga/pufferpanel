@@ -271,6 +271,10 @@ test('ui_snapshot rejects driver errors, malformed or oversized output, and time
   const slow = await fixture(t, { visual: { sleepMs: 30_000 } }, { ...RUN_LIMITS, reviewMs: 2000, killMs: 5000 }, { visual: true });
   await assert.rejects(slow.snap({ routes: ['/'] }), /ui_snapshot timed out after 2s; container annie-review-[a-f0-9]{16} was removed/);
   await assert.rejects(slow.run({ command: 'go vet ./pkg' }), /reviewer run budget exhausted/);
+  // Regression: runSeconds is rounded to 0.1 s, so a fast fake podman may legitimately report 0 (schema test above),
+  // but time a container really spent — here the 2 s snapshot the budget killed — must still be reported.
+  await slow.sandbox.release();
+  assert.ok(slow.sandbox.diagnostic().runSeconds >= 2);
 });
 
 // Optional: real rootless Podman, only with a locally present tiny image; never pulls.
