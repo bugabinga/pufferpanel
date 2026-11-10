@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 
@@ -43,8 +43,12 @@ if(name==='curl'){
   const publish = () => command('bash', [join(moduleDir, 'publish.sh'), repo, '2026.4.3', run], { env });
   return { root, repo, run, env, git, load, update, publish };
 }
+// podman.sh fails closed on explicit runroots over 50 bytes (unix-socket path budget). The harness gate runs this suite
+// under env -i with a deep isolated TMPDIR ("$context/tmp"), under which nothing below tmpdir() fits the budget, so an
+// explicit runroot picks its base exactly like podman.sh's own auto-allocation: tmpdir() while a sibling fits, else /tmp.
+const runrootUnder = base => mkdtempSync(join(`${realpathSync(base)}/pufferpanel-runroot.XXXXXX`.length <= 50 ? realpathSync(base) : '/tmp', 'pufferpanel-runroot.'));
 test('preflight, gate, publisher use identical private Podman arguments and emit gate events', t => {
-  const f = fixture(t); const runroot = join(f.root, 'rr'); mkdirSync(runroot, { mode: 0o700 }); chmodSync(runroot, 0o700);
+  const f = fixture(t); const runroot = runrootUnder(tmpdir()); t.after(() => rmSync(runroot, { recursive: true, force: true }));
   const common = { ...f.env, PUFFER_MAINT_STATE: join(f.root, 'state'), PUFFER_MAINT_RUNROOT: runroot, PUFFER_MAINT_SOURCE: f.repo, HONEST_ANNIE_ARTIFACT: join(f.root, 'artifact'), GITHUB_SHA: f.git('rev-parse', 'HEAD') };
   const preflight = command('bash', [join(moduleDir, 'ci.sh'), 'preflight'], { env: common }); assert.equal(preflight.status, 0, preflight.stderr);
   const gate = command('bash', [join(moduleDir, 'gate.sh'), f.repo, f.run], { env: common }); assert.equal(gate.status, 0, gate.stderr);
@@ -56,6 +60,19 @@ test('preflight, gate, publisher use identical private Podman arguments and emit
   assert.ok(events.some(event => event.name === 'whitespace'));
   assert.ok(events.some(event => event.name === 'publish-podman'));
   assert.ok(events.every(event => Number.isInteger(event.durationMs) && Number.isInteger(event.exitCode)));
+});
+test('explicit runroot fits the 50-byte Podman budget under the gate deep TMPDIR, which stays enforced', t => {
+  const f = fixture(t);
+  // The gate's own shape: TMPDIR="$context/tmp" off a multi-component runner temp context.
+  const deep = mkdtempSync(join(f.root, 'tmp.E29D5VPz8z-tmp'));
+  assert.ok(`${deep}/pufferpanel-runroot.XXXXXX`.length > 50, 'fixture must leave no room under the deep base');
+  const runroot = runrootUnder(deep); t.after(() => rmSync(runroot, { recursive: true, force: true }));
+  assert.ok(isAbsolute(runroot) && runroot.length <= 50, runroot);
+  assert.notEqual(dirname(runroot), realpathSync(deep)); // forced to the short base, never silently under the deep one
+  const preflight = dir => command('bash', [join(moduleDir, 'ci.sh'), 'preflight'], { env: { ...f.env, PUFFER_MAINT_STATE: join(f.root, 'state'), PUFFER_MAINT_RUNROOT: dir, PUFFER_MAINT_SOURCE: f.repo, HONEST_ANNIE_ARTIFACT: join(f.root, 'artifact'), GITHUB_SHA: f.git('rev-parse', 'HEAD') } });
+  assert.equal(preflight(runroot).status, 0);
+  const underDeep = mkdtempSync(join(deep, 'pufferpanel-runroot.')); t.after(() => rmSync(underDeep, { recursive: true, force: true }));
+  assert.equal(preflight(underDeep).status, 64); // the runroot budget itself is untouched
 });
 test('gate fails closed and removes stale success marker', t => {
   const f = fixture(t); f.update({ failGate: true });

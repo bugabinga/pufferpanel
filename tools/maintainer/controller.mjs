@@ -5,7 +5,7 @@ import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
-import { REPAIRABLE, detectIncidents, foldIncidents, makeDigest, ready, syncIncidents, syncable, validateIncidents } from './incident.mjs';
+import { REPAIRABLE, HARNESS_GATE_JOB, detectIncidents, failed, foldIncidents, makeDigest, ready, syncIncidents, syncable, validateIncidents } from './incident.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
 export const WAKE_PATH = '.github/workflows/annie-pr-wake.yml';
@@ -496,8 +496,28 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   fresh.slots = checkpoint.slots.filter(value => value >= new Date(now - 31 * DAY).toISOString().slice(0, 10) && ((!noSourceDays.has(value) && !zeroDays.has(value)) || reservedSourceDays.has(value)));
   const ownAcknowledged = ledger.records.some(record => record.settlement?.releaseCommit === branch.commit.sha && record.lease?.task.kind !== 'harness');
   // Incidents: trusted model-free evidence this observation already holds, plus failed jobs of trusted runs within 24h.
-  const jobs = [];
-  for (const failedRun of ledger.runs.filter(r => r.id !== run.id && trustedRun(r, repo, workflow) && r.status === 'completed' && ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion) && time(r.updated_at) > now - DAY).slice(0, 30)) jobs.push({ runId: failedRun.id, conclusion: failedRun.conclusion, jobs: await api.pages(`/repos/${OWN}/actions/runs/${failedRun.id}/jobs`, 'jobs') });
+  // Stale evidence is not a current incident: a broken job that a later completed trusted run already ran green at the same
+  // job is fixed history, so it is dropped instead of keeping the issue open for a day and buying a harness repair per
+  // policy change for code that already passes. Only the newest green runs are consulted, a green run that skipped the job
+  // never supersedes anything, and any doubt keeps the failure.
+  const failedRuns = ledger.runs.filter(r => r.id !== run.id && trustedRun(r, repo, workflow) && r.status === 'completed' && ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion) && time(r.updated_at) > now - DAY).slice(0, 30);
+  const greenRuns = ledger.runs.filter(r => r.id !== run.id && trustedRun(r, repo, workflow) && r.status === 'completed' && r.conclusion === 'success').slice(0, 5);
+  const greenJobs = new Map(), jobs = [];
+  for (const failedRun of failedRuns) {
+    const list = await api.pages(`/repos/${OWN}/actions/runs/${failedRun.id}/jobs`, 'jobs');
+    if (!list.length) { jobs.push({ runId: failedRun.id, conclusion: failedRun.conclusion, jobs: list }); continue; } // A jobless run keeps its synthetic workflow-job incident.
+    const current = [];
+    for (const job of list.filter(job => failed(job.conclusion) && job.name !== HARNESS_GATE_JOB)) {
+      let superseded = false;
+      for (const green of greenRuns) {
+        if ((time(green.created_at) - time(failedRun.created_at) || green.id - failedRun.id) <= 0) continue;
+        if (!greenJobs.has(green.id)) greenJobs.set(green.id, await api.pages(`/repos/${OWN}/actions/runs/${green.id}/jobs`, 'jobs'));
+        if (greenJobs.get(green.id).some(entry => entry.name === job.name && entry.conclusion === 'success')) { superseded = true; break; }
+      }
+      if (!superseded) current.push(job);
+    }
+    if (current.length) jobs.push({ runId: failedRun.id, conclusion: failedRun.conclusion, jobs: current });
+  }
   const heldUntil = providersHeld ? holdsExpireAt : null;
   fresh.incidents = foldIncidents(checkpoint.incidents ?? [], detectIncidents({
     now, abandoned, held, blockers: ledger.blockers, jobs,

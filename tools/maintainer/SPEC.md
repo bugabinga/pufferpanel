@@ -112,7 +112,7 @@ Never describe a no-op as a source or image publication.
 ## Harness self-repair
 
 When Annie's own machinery fails, she reports it and, where she can, proposes a reviewed fix that only Oliver merges.
-Observe derives incidents model-free from trusted evidence it already holds and failed jobs of trusted runs within 24h; review rejections, product gate failures, model failures, honest no-ops, and a quota hold while another provider works are not incidents.
+Observe derives incidents model-free from trusted evidence it already holds and failed jobs of trusted runs within 24h, except failures a later green trusted run supersedes by running the same job successfully; review rejections, product gate failures, model failures, honest no-ops, and a quota hold while another provider works are not incidents.
 Incident fingerprints cover kind and identity, never timestamps; the checkpoint deduplicates at most 20 strictly validated entries.
 After two observations, a model-free job with the native token and `issues: write` keeps one `annie-incident` issue per fingerprint by hidden marker and complete bounded lookup, with sanitized facts only, and closes it once the incident clears.
 A repairable incident admits a `harness` task at most once per incident and trusted policy, within allowance and providers, under a $5 cap and without a calendar slot.

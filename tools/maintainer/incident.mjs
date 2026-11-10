@@ -20,7 +20,7 @@ const stable = value => safe(value).replace(/\d+/g, '#'); // Identity text never
 const iso = ms => new Date(ms).toISOString();
 const md = (value, limit) => text(value, limit).replace(/@/g, '@\u200b');
 const item = (kind, identity, detail, runs = []) => ({ fingerprint: digest({ kind, identity }), kind, detail: safe(detail), runs: [...new Set(runs)].filter(id => Number.isSafeInteger(id) && id > 0).sort((a, b) => b - a) });
-const failed = conclusion => ['failure', 'timed_out', 'startup_failure'].includes(conclusion);
+export const failed = conclusion => ['failure', 'timed_out', 'startup_failure'].includes(conclusion);
 
 // Current incidents from evidence observe already holds. Normal outcomes are not incidents: review rejections, product gate
 // failures, and model failures all end in the model step; honest no-ops fail nothing; a quota hold with another provider left

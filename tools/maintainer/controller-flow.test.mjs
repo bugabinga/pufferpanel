@@ -17,7 +17,7 @@ async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'annie-flow-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const env = { ANNIE_MODE: 'maintain', GITHUB_REPOSITORY: OWN, GITHUB_REF: 'refs/heads/trunk', GITHUB_SHA: base, GITHUB_REPOSITORY_ID: '7', GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_NAME: 'schedule', GITHUB_EVENT_PATH: join(dir, 'event.json'), ANNIE_OUTPUT_DIR: dir, ANNIE_BOOTSTRAP: '42', HONEST_ANNIE_ENABLED: 'true', GH_TOKEN: 'readonly-sentinel' };
   await writeFile(env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '17 4 * * *' }));
-  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], jobsByAttempt = new Map();
+  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], jobsByAttempt = new Map(), jobsByRun = new Map();
   let clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
   const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(clock).toISOString(), updated_at: new Date(clock).toISOString() });
   const fetchImpl = async (url, options = {}) => {
@@ -28,7 +28,7 @@ async function fixture(t) {
     const artifactRun = path.match(/\/actions\/runs\/(\d+)\/artifacts$/);
     if (artifactRun) { const items = artifacts.get(Number(artifactRun[1])) ?? []; return response({ total_count: items.length, artifacts: items }); }
     if (path.includes('/jobs') && options.method === 'POST') return new Response(null, { status: 201 });
-    if (path.endsWith('/jobs')) { const selected = jobsByAttempt.get(Number(path.match(/attempts\/(\d+)/)?.[1])) ?? jobs; return response({ total_count: selected.length, jobs: selected }); }
+    if (path.endsWith('/jobs')) { const selected = jobsByRun.get(Number(path.match(/\/actions\/runs\/(\d+)\/jobs$/)?.[1])) ?? jobsByAttempt.get(Number(path.match(/attempts\/(\d+)/)?.[1])) ?? jobs; return response({ total_count: selected.length, jobs: selected }); }
     if (path.endsWith('/actions/workflows/8/runs')) return response({ total_count: runs.length + 1, workflow_runs: [run(currentId), ...runs] });
     if (path.endsWith('/actions/workflows/honest-annie.yml')) return response({ id: 8, path: POLICY_PATH });
     const byId = path.match(/\/actions\/runs\/(\d+)$/);
@@ -57,7 +57,7 @@ async function fixture(t) {
   }
   const execute = async changes => controller({ env: { ...env, ...changes }, fetchImpl, now: clock, delays: [] });
   const json = async name => JSON.parse(await readFile(join(dir, name), 'utf8'));
-  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, prs, files, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
+  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, jobsByRun, prs, files, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
 }
 test('faux controller: cheap observe has no lease/registry/retry; maintain wires exact B/U task and creation-deadline lease', async t => {
   const f = await fixture(t);
@@ -432,6 +432,31 @@ test('incidents: failed effects jobs dedupe across observes, then admit one $5 h
   f.setCurrent(45); const next = await f.execute();
   assert.equal(next.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'maintenance'); assert.equal(next.allowance, 14);
   assert.ok((await f.json('checkpoint.json')).handled.includes(lease.task.fingerprint));
+});
+test('incidents: a newer green run at the same job supersedes stale failures, which stop buying repairs; current failures still report', async t => {
+  const f = await fixture(t);
+  await f.execute({ ANNIE_MODE: 'observe' }); const first = await f.json('checkpoint.json');
+  const broken = id => [{ id, name: 'check', conclusion: 'failure', steps: [{ name: 'Offline tests, no observations or credentials', conclusion: 'failure' }] }];
+  // Two earlier trunk runs failed the offline check at the same step; a later run completed green but skipped that job.
+  for (const id of [40, 41]) { f.runs.push({ ...f.run(id), conclusion: 'failure' }); f.artifact(id, `annie-checkpoint-${id}-1`, 'checkpoint.json', { ...first, runId: id }); f.jobsByRun.set(id, broken(id)); }
+  f.runs.push({ ...f.run(42), conclusion: 'success' }); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', { ...first, runId: 42 });
+  f.jobsByRun.set(42, [{ id: 420, name: 'check', conclusion: 'skipped' }]);
+  f.setCurrent(43); const skipped = await f.execute({ ANNIE_MODE: 'observe' });
+  assert.deepEqual(skipped.incidents.map(({ kind, status }) => ({ kind, status })), [{ kind: 'job-failed', status: 'open' }]);
+  assert.deepEqual((await f.json('checkpoint.json')).incidents[0].runs, [41, 40]);
+  // Once that newer run actually ran the job green, the stale failures clear and buy no harness repair.
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', await f.json('checkpoint.json'));
+  f.jobsByRun.set(42, [{ id: 420, name: 'check', conclusion: 'success' }]);
+  f.setCurrent(44); const cleared = await f.execute({ ANNIE_MODE: 'observe' });
+  assert.deepEqual(cleared.incidents.map(({ kind, status }) => ({ kind, status })), [{ kind: 'job-failed', status: 'cleared' }]);
+  assert.equal(cleared.incidents[0].ready, false); assert.equal(cleared.paid, false); assert.equal(cleared.harnessRepair, null);
+  // A failure newer than every green run is still a current incident: nothing was weakened.
+  f.runs.push(f.run(44)); const after = await f.json('checkpoint.json'); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', after);
+  f.runs.push({ ...f.run(45), conclusion: 'failure' }); f.artifact(45, 'annie-checkpoint-45-1', 'checkpoint.json', { ...after, runId: 45 }); f.jobsByRun.set(45, broken(450));
+  f.setCurrent(46); const fresh = await f.execute({ ANNIE_MODE: 'observe' });
+  const reopened = fresh.incidents.find(incident => incident.kind === 'job-failed' && incident.status === 'open');
+  assert.equal(Boolean(reopened), true); assert.equal(reopened.ready, false);
+  assert.deepEqual((await f.json('checkpoint.json')).incidents[0].runs, [45]);
 });
 test('never self-integrate: harness repair branches and protected-path PRs are refused before any paid admission', async t => {
   const f = await fixture(t);
