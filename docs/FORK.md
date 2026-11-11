@@ -7,7 +7,7 @@ This document records fork-specific technical behavior rather than an upstream c
 
 ## Build and regeneration
 
-The Go module requires Go 1.27.3 in [`go.mod`](../go.mod).
+The Go module requires Go 1.27.4 in [`go.mod`](../go.mod).
 Swagger generation uses the pinned module tool through `go tool swag` in [`Dockerfile`](../Dockerfile).
 Frontend workspaces use Yarn Classic 1.22.22 as declared in [`client/package.json`](../client/package.json).
 The frontend build stage in [`Dockerfile`](../Dockerfile) pins Node 26.13.0-alpine; the template-tester image keeps Node 26.10.0 from its verified compatibility build.
@@ -42,7 +42,7 @@ The rename and stale-reference logic lives in [`client/frontend/src/components/t
 Console-cache timestamps are strictly monotonic and every polling epoch returned by `/api/servers/{id}/console` is newer than all previously stored messages, so a log line written in the same microsecond as a poll is delivered by the next poll instead of being dropped (the `time` parameter is Unix microseconds, not milliseconds).
 Server restarts retry `Start` while the after-exit handler still holds the server running lock during post-execution steps, instead of polling only the environment process state and failing with `server running` when the two disagree; the regression is `TestDoRestartWaitsForPostExecution` in [`web/daemon/restart_test.go`](../web/daemon/restart_test.go).
 The template-tester image retains Ubuntu 22.04 because the official Mono packages failed dependency resolution on Ubuntu 26.04.
-Go 1.27.3, Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.
+Its tester binary builds with Go 1.27.4 (`GOVERSION` build argument); Node 26.10.0, Java, Mono, and the 32-bit runtime libraries were verified in that compatibility image.
 
 ## Archive behavior
 
