@@ -12,7 +12,7 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, createHostHooks, ensureWorktree, guardFor, installReviewer, ModelCodemode, ModelCodingTools, snapshot } from './maintain.mjs';
 import { HARNESS_CAP, validateTask } from './task.mjs';
-import { MAX_REPAIRS, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, syncIncidents, validateIncidents } from './incident.mjs';
+import { MAX_REPAIRS, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, requestFingerprint, noticeBody, syncIncidents, syncNotices, syncable, validateIncidents, validateNotices } from './incident.mjs';
 import { GitHub, digest as sha256, makeLease, verifyLease, POLICY_PATH } from './controller.mjs';
 import { checkPR } from './pr.mjs';
 import { HARNESS_PATHS, harnessScope, harnessScopeViolation } from './scope.mjs';
@@ -278,6 +278,39 @@ test('delivery pushes the reviewed fix to annie/harness/<fp>, opens a PR for Oli
   assert.equal(gh.state.prs.length, 1); assert.equal(gh.state.comments.get(1).length, 1);
   Object.assign(gh.state.prs[0], { state: 'closed', merged_at: null });
   assert.match((await deliver()).message, /closed unmerged/);
+});
+test('operator request: ready at once, never an incident issue, Markdown digest, delivery reports on the request issue', async t => {
+  const request = { number: 4, title: 'latest models', body: '**Pin** it.\r\n\n- ghp_' + 'a'.repeat(30) };
+  const found = detectIncidents({ now: NOW, requests: [request] }), [entry] = foldIncidents([], found, NOW);
+  assert.equal(entry.fingerprint, requestFingerprint(4)); assert.equal(entry.detail, 'issue #4: latest models');
+  assert.equal(ready(entry), true); assert.deepEqual(syncable([entry]), []); assert.deepEqual(syncable(foldIncidents([entry], [], NOW + 1)), []);
+  assert.equal(makeDigest(entry, [], null, request).request.body, '**Pin** it.\n\n- [redacted token]');
+  // 10 000 body plus 5 x 1 000 comment characters of at most three UTF-8 bytes each keep the digest inside parseDigest's byte bound.
+  const long = { author: 'bugabinga', at: '2026-04-03T00:00:00Z', body: '☠'.repeat(2_000) };
+  const wide = makeDigest(entry, [], null, { ...request, title: '☠'.repeat(400), body: '☠'.repeat(20_000), comments: Array(7).fill(long) });
+  assert.equal(wide.request.body.length, 10_000); assert.deepEqual(wide.request.comments.map(item => item.body.length), [1_000, 1_000, 1_000, 1_000, 1_000]); assert.ok(Buffer.byteLength(JSON.stringify(wide)) <= 49_152);
+  assert.equal(parseDigest(JSON.stringify(wide), { incident: entry.fingerprint }).request.number, 4);
+  const { f, gh, deliver } = await deliveryFixture(t);
+  gh.state.issues.push({ number: 4, state: 'open', labels: ['annie-harness'], user: { login: 'bugabinga' }, body: request.body });
+  const result = await deliver({ task: { ...f.task, incident: requestFingerprint(4) } });
+  assert.equal(result.delivered, true); assert.match(gh.state.prs[0].body, /\nCloses #4\n/);
+  // Request repairs retry only on feedback after the last attempt or a reopened request, never on their own.
+  const tried = { ...entry, repair: { tasks: ['a'.repeat(64)], last: 'a'.repeat(64), runId: 9, at: NOW + 10, policy: null } };
+  for (const last of [{ state: 'none' }, { state: 'closed', number: 3 }, { state: 'merged', number: 3, at: NOW + 20 }]) {
+    assert.equal(repairDecision({ entry: tried, last, policy: 'p', now: NOW + 5 * 86_400_000, evidenceAt: NOW + 5 }).reason, 'awaiting-feedback');
+    assert.deepEqual(repairDecision({ entry: tried, last, policy: 'p', now: NOW + 100, evidenceAt: NOW + 11 }), { admit: true, attempt: 2, reason: 'operator-feedback' });
+    assert.equal(repairDecision({ entry: { ...tried, since: NOW + 11 }, last, policy: 'p', now: NOW + 100 }).admit, true);
+  }
+  assert.equal(repairDecision({ entry: { ...tried, repair: { ...tried.repair, tasks: ['a', 'b', 'c'].map(c => c.repeat(64)) } }, last: { state: 'none' }, policy: 'p', now: NOW + 100, evidenceAt: NOW + 11 }).reason, 'attempts-exhausted');
+  // A PR-less attempt answers the request issue once, in GitHub Markdown.
+  const notice = { issue: 4, runId: 42, task: 'a'.repeat(64), phase: 'published', reason: 'no-op', diagnosis: 'defaults already track @someone', attempt: 1 };
+  assert.deepEqual((await syncNotices(gh.api, [notice])).map(r => r.status), ['applied']);
+  assert.deepEqual((await syncNotices(gh.api, [notice])).map(r => r.reason), ['already-applied']);
+  const posted = gh.state.comments.get(4).at(-1).body;
+  assert.match(posted, /^\*\*No action\*\*: .*\n\n- Run: https:\/\/github\.com\/bugabinga\/pufferpanel\/actions\/runs\/42\n/); assert.match(posted, /@\u200bsomeone/); assert.match(posted, /Reply here/);
+  assert.match(noticeBody({ ...notice, phase: 'rejected', attempt: 3 }), /^\*\*Blocked\*\*[\s\S]*attempt 3 of 3; Annie stops/);
+  assert.throws(() => validateNotices([{ ...notice, phase: 'Bad Phase' }]), /malformed/);
+  assert.match(gh.state.comments.get(4)[0].body, /ready for review: #100/); assert.equal(gh.state.comments.get(1), undefined);
 });
 test('delivery without ANNIE_GH_TOKEN pushes nothing and says so on the incident', async t => {
   const { gh, deliver, branchAt } = await deliveryFixture(t);

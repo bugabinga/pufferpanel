@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { approvedPlan, validatePlan, executePlan, planHash } from './management.mjs';
 import { reportFor } from './report.mjs';
+import { validateActions } from './github.mjs';
 const time = '2026-04-03T00:00:00Z';
 const run = () => ({ day: '2026-04-03', taskKind: 'management', base: 'a'.repeat(40), tree: 'b'.repeat(40), review: { approve: true }, phase: 'managing', version: '2026.4.3', fingerprint: 'c'.repeat(64), upstreamSha: 'd'.repeat(40), upstreamRef: 'refs/heads/trunk' });
 const comment = { kind: 'comment', number: 7, expectedUpdatedAt: time, body: 'Useful finding.' };
@@ -46,6 +47,21 @@ test('management export requires explicit approval; hashes/source/repo/whole-pla
   assert.throws(() => validatePlan({ ...payload, repo: 'other/repo', hash: planHash({ ...payload, repo: 'other/repo' }) }, r));
   assert.throws(() => approvedPlan({ ...r, taskKind: 'maintenance' }, [{ actions: [{ kind: 'enable-issues' }] }]), /selected management/);
   assert.throws(() => approvedPlan(r, [{ actions: Array(11).fill(issue) }]));
+});
+
+test('posted bodies keep GitHub Markdown structure and length while secrets stay redacted', async () => {
+  const body = ['**Fixed** in #9.', '', '- first', '- second', '', '```js', 'x()', '```', 'ghp_' + 'a'.repeat(30), 'tail '.repeat(500).trim()].join('\r\n');
+  const r = run(), f = api();
+  await executePlan(approvedPlan(r, [{ actions: [{ ...comment, body }] }]), r, f.options);
+  const posted = f.state.calls.find(c => c.method === 'POST').body.body;
+  assert.ok(posted.startsWith('**Fixed** in #9.\n\n- first\n- second\n\n```js\nx()\n```\n[redacted token]\n'));
+  assert.ok(posted.includes('tail '.repeat(499) + 'tail\n'));
+  assert.throws(() => approvedPlan(r, [{ actions: [{ ...comment, body: 'x'.repeat(4001) }] }]), /got 4001; shorten it/);
+  // The executor checkpoint hashes proposal output; the host re-sanitizes it and must reproduce the same bytes.
+  const proposed = validateActions([{ ...comment, body: body + '\nBearer\n' + 'b'.repeat(20) + '   ' }]);
+  const checked = { ...r, managementPlanHash: planHash(proposed) };
+  assert.deepEqual(validatePlan(approvedPlan(checked, [{ actions: proposed }]), checked), proposed);
+  assert.match(proposed[0].body, /Bearer \[redacted\]$/);
 });
 
 test('host labels/comments/issues are idempotent across retries even after own updatedAt change; friendly static automated footer', async () => {

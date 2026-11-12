@@ -8,7 +8,7 @@ on:
     workflows: [Annie PR wake]
     types: [completed]
   issues:
-    types: [opened, edited, reopened, closed]
+    types: [opened, edited, reopened, closed, labeled]
   workflow_dispatch:
     inputs:
       mode:
@@ -74,6 +74,7 @@ jobs:
       rejections: ${{ steps.observe.outputs.rejections }}
       incident: ${{ steps.observe.outputs.incident }}
       incidents: ${{ steps.observe.outputs.incidents }}
+      notices: ${{ steps.observe.outputs.notices }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -500,7 +501,7 @@ jobs:
     needs: observe
     if: >-
       github.repository == 'bugabinga/pufferpanel' && github.ref == 'refs/heads/trunk' &&
-      vars.HONEST_ANNIE_ENABLED == 'true' && needs.observe.outputs.incidents != ''
+      vars.HONEST_ANNIE_ENABLED == 'true' && (needs.observe.outputs.incidents != '' || needs.observe.outputs.notices != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -521,6 +522,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HONEST_ANNIE_ENABLED: ${{ vars.HONEST_ANNIE_ENABLED }}
           ANNIE_INCIDENTS: ${{ needs.observe.outputs.incidents }}
+          ANNIE_NOTICES: ${{ needs.observe.outputs.notices }}
         run: node tools/maintainer/controller.mjs incidents
 
   # Harness self-repair candidates run their own tests here, on a fresh runner with no secrets and a read-only token,

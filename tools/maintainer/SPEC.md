@@ -118,6 +118,8 @@ After two observations, a model-free job with the native token and `issues: writ
 A repairable incident admits a `harness` task within allowance and providers, under a $5 cap and without a calendar slot, and never while an attempt for it is in flight or a harness PR for it is open.
 Another attempt needs the last PR closed unmerged, the last PR merged with evidence or recurrence after the merge, or no PR from the last attempt plus a policy change or 24h; at most three attempts per incident, and a policy change alone never retries.
 An unattributable open harness PR or an unknown PR lookup admits no harness repair; a duplicate delivery for an incident with an open PR comments on the incident instead of pushing or opening another.
+A harness change request is an open issue labelled `annie-harness`, by Oliver or by an ordinary run's reviewed `add-label` proposal; with a current write-permission author it becomes an `operator-request` incident, ready at once, reported on that issue instead of an incident issue, and never part of the management queue.
+An attempt ending without a PR answers the request issue once; a request PR closes its issue on merge; another attempt needs feedback from the author or owner after the last attempt, or a reopen, never time or policy alone.
 Its executor sees a bounded redacted incident digest as untrusted spotlit data and must never weaken checks, budgets, or security boundaries.
 A harness PR's own `pull_request` workflows run with a token whose read-only default a `permissions:` key overrides, and trunk is unprotected.
 So a candidate may change only `tools/maintainer/**` and `.github/workflows/honest-annie.yml`, whose top-level `on:` and key set stay deeply equal to the base's; every other `.github` change is refused.
@@ -153,6 +155,7 @@ No arbitrary API endpoints, destructive actions, protection changes, visibility 
 Source plus plans executes management after publication, and still after verified source persistence when registry login or publication failed.
 Management is best-effort: failed receipts are reported, the step succeeds, and receipts never gate release, publication, or the queue.
 While intake reports issues disabled (`has_issues: false` or HTTP 410), proposals cannot create issues or target non-PR issues.
+Comment and issue bodies keep their GitHub Markdown line structure through redaction; bodies over 4000 characters are refused, never truncated.
 Posts identify Annie as an automated maintainer and use stable hash markers excluding volatile updatedAt; labels reconcile the desired set.
 Retries never duplicate when complete lookup coverage proves an earlier marker, and fail closed when lookup is truncated or unknown.
 Optional PR rejection feedback is host-generated `COMMENT` at exact current H from substantive trusted read-only reviewer findings only; invalid review output is bot failure, not PR blame.

@@ -194,6 +194,9 @@ Plans carry a hash, are independently read by the reviewer, and never contain an
 A GitHub-only approved candidate stops at `managing`, with `commit: null`, no source gate, no commit, and no publication.
 Only explicit trusted `ci.sh management` executes its approved artifact; model tools never mutate GitHub.
 The host revalidates permissions, target identity/open state/timestamp, plan integrity, and bounded idempotence coverage before mutations.
+Comment and issue bodies are GitHub Markdown: line breaks survive redaction, which runs per line after whole-text private-key and Bearer masking.
+A body over 4000 characters is refused with its length, never cut, so the executor must shorten it.
+`maintenance.md` sets the writing rules: bold outcome first, at most five evidence bullets with permalinks, one next step, under 1500 characters.
 
 
 Hosted runners retain SQLite and local drafts only within a job.
@@ -520,6 +523,23 @@ That file screen reads one page; a full page of 100 files or a continuation fail
 The native token cannot push workflow changes or create PRs under current repository settings.
 Missing or insufficient permissions show as failed receipts and an incident comment, never a silent drop.
 PAT pushes and PRs do trigger workflows: `annie-pr-wake.yml` stays secretless, the main workflow observes the wake and never admits the PR, and the other PR workflows target `v3`.
+
+### Harness requests
+
+An open issue asking to change Annie herself gets the `annie-harness` label from an ordinary maintenance or management run, which proposes `add-label` under `maintenance.md`; Oliver may also label it, and `labeled` issue events wake the workflow at once.
+A bot-applied label triggers no workflow, so such a request starts at the next half-hourly run.
+Observe turns each such issue whose author has current write, maintain, or admin permission into an `operator-request` incident, fingerprinted by issue number, at most five per observation.
+A request is ready on its first observation and is already its own issue, so no `annie-incident` issue is created; removing the label or closing the issue clears it.
+Labelled issues are excluded from the management queue digest, and `maintenance.md` tells ordinary runs never to comment on them.
+Feedback means comments by the request author or the repository owner; bots, including Annie, never count.
+The digest carries a `request` field with the issue URL, title, Markdown body of at most 10 000 redacted characters, and the last five feedback comments of at most 1 000 characters each, which keeps the digest under 48 KiB; the executor treats it as the goal, newest feedback first, but not as permission to widen any limit.
+Everything else follows the incident rules above: $5 cap, independent review, harness gate, delivery as an `annie/harness/` PR that only Oliver merges, and the delivery comment lands on the request issue.
+A request PR body says `Closes #N`, so merging it closes and clears the request; reopening the issue starts a new streak and admits another attempt.
+An attempt that ends without a PR (no change, review rejection, or failure) is answered on the request issue by the model-free incidents job: outcome, run link, bounded reason and diagnosis, and how many of the three attempts are used, found again by a hidden `annie-request` marker.
+Observe emits such a notice only for model reports created since the previous observation started, so a notice is posted once rather than on every half-hourly run.
+A request never retries on its own: after a no-op, a closed PR, or a merge into a still-open issue, the next attempt waits for feedback newer than the last attempt's admission, or a reopen.
+Feedback posted while an attempt is still running is newer than its admission and therefore buys one more attempt after it settles.
+Editing the issue body is not feedback, because GitHub reports no separate edit time; comment instead.
 
 ### Harness PR threat
 

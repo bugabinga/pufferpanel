@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { requestFingerprint } from './incident.mjs';
 import { controller, digest, harnessFingerprint, retryEffects, verifyUploadedLease, POLICY_PATH } from './controller.mjs';
 const OWN = 'bugabinga/pufferpanel', now = Date.parse('2026-04-03T04:17:00Z'), base = 'a'.repeat(40), U = 'b'.repeat(40), tree = { tree: [{ path: '.github', sha: 'c'.repeat(40) }, { path: 'tools', sha: 'd'.repeat(40) }] };
 const response = body => new Response(JSON.stringify(body));
@@ -17,7 +18,7 @@ async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'annie-flow-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const env = { ANNIE_MODE: 'maintain', GITHUB_REPOSITORY: OWN, GITHUB_REF: 'refs/heads/trunk', GITHUB_SHA: base, GITHUB_REPOSITORY_ID: '7', GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_NAME: 'schedule', GITHUB_EVENT_PATH: join(dir, 'event.json'), ANNIE_OUTPUT_DIR: dir, ANNIE_BOOTSTRAP: '42', HONEST_ANNIE_ENABLED: 'true', GH_TOKEN: 'readonly-sentinel' };
   await writeFile(env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '17 4 * * *' }));
-  const runs = [], artifacts = new Map(), bodies = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], closedPRs = [], jobsByAttempt = new Map(), pullsAll = { fail: false };
+  const runs = [], artifacts = new Map(), bodies = new Map(), comments = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], closedPRs = [], jobsByAttempt = new Map(), pullsAll = { fail: false };
   let clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
   const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(clock).toISOString(), updated_at: new Date(clock).toISOString() });
   const fetchImpl = async (url, options = {}) => {
@@ -48,6 +49,8 @@ async function fixture(t) {
     if (path.endsWith('/status')) return response({ statuses: [], total_count: 0 });
     if (path.endsWith('/check-runs')) return response({ check_runs: [{ status: 'completed', conclusion: 'success' }], total_count: 1 });
     if (path.endsWith('/issues')) return response(issues);
+    const thread = path.match(/\/issues\/(\d+)\/comments$/);
+    if (thread) return response(comments.get(Number(thread[1])) ?? []);
     if (path === `/repos/${OWN}`) return response({ id: 7, default_branch: 'trunk', has_issues: true });
     if (path === '/repos/pufferpanel/pufferpanel') return response({ default_branch: 'main' });
     throw Error('unexpected offline request ' + path);
@@ -59,7 +62,7 @@ async function fixture(t) {
   }
   const execute = async changes => controller({ env: { ...env, ...changes }, fetchImpl, now: clock, delays: [] });
   const json = async name => JSON.parse(await readFile(join(dir, name), 'utf8'));
-  return { env, dir, runs, artifacts, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
+  return { env, dir, runs, artifacts, comments, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
 }
 test('faux controller: cheap observe has no lease/registry/retry; maintain wires exact B/U task and creation-deadline lease', async t => {
   const f = await fixture(t);
@@ -434,6 +437,41 @@ test('incidents: failed effects jobs dedupe across observes, then admit one $5 h
   f.setCurrent(45); const next = await f.execute();
   assert.equal(next.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'maintenance'); assert.equal(next.allowance, 14);
   assert.ok((await f.json('checkpoint.json')).handled.includes(lease.task.fingerprint));
+});
+test('operator request: a labelled issue from a write author admits a $5 harness repair at once with its Markdown body; others never pay', async t => {
+  const request = { number: 4, title: 'latest models', body: '**Pin** an image model.\n\n- keep cost low', state: 'open', user: { login: 'bugabinga', type: 'User' }, labels: [{ name: 'annie-harness' }] };
+  const f = await fixture(t), outputPath = join(f.dir, 'outputs'); f.issues.push(request); await writeFile(outputPath, '');
+  const admitted = await f.execute({ GITHUB_OUTPUT: outputPath }), lease = await f.json('lease.json'), checkpoint = await f.json('checkpoint.json');
+  assert.equal(admitted.state, 'admitted'); assert.equal(lease.task.kind, 'harness'); assert.equal(lease.task.incident, requestFingerprint(4)); assert.equal(lease.cap, 5);
+  assert.deepEqual(admitted.harnessRepair, { incident: requestFingerprint(4), kind: 'operator-request', attempt: 1 });
+  const written = Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+  assert.deepEqual(JSON.parse(written.incident).request, { number: 4, url: `https://github.com/${OWN}/issues/4`, title: 'latest models', body: request.body, comments: [] });
+  assert.equal(written.incidents, '', 'a request is already its own issue');
+  // A labelled request never counts as queue input, so it cannot wake ordinary management.
+  const empty = await fixture(t); await empty.execute({ ANNIE_MODE: 'observe' });
+  assert.equal(checkpoint.queue, (await empty.json('checkpoint.json')).queue);
+  // The attempt changes nothing: Annie answers on the issue and waits for feedback instead of buying the same guess again.
+  f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', checkpoint); f.artifact(42, 'annie-lease-42-1', 'lease.json', lease);
+  f.artifact(42, 'honest-annie-model-report-42-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: 'harness', incident: lease.task.incident, day: lease.task.day, base, managementApproved: false, commit: null, releaseCommit: null, phase: 'published', reason: 'no-op', diagnosis: 'enabledModels already tracks provider defaults', usageComplete: true, reportedUsage: { status: 'known', cost: 1 } });
+  f.setClock(now + 3600000); f.setCurrent(43); await writeFile(outputPath, '');
+  const waiting = await f.execute({ GITHUB_OUTPUT: outputPath, ANNIE_MODE: 'observe' }), notices = JSON.parse(Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)])).notices);
+  assert.deepEqual(notices, [{ issue: 4, runId: 42, task: lease.task.fingerprint, phase: 'published', reason: 'no-op', diagnosis: 'enabledModels already tracks provider defaults', attempt: 1 }]);
+  assert.equal(waiting.harnessRepair, null); assert.ok(waiting.harnessWaits.some(w => w.reason === 'awaiting-feedback'));
+  // A later observation no longer re-emits an answered notice.
+  f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', await f.json('checkpoint.json'));
+  f.setClock(now + 3 * 3600000); f.setCurrent(45); await writeFile(outputPath, '');
+  await f.execute({ GITHUB_OUTPUT: outputPath, ANNIE_MODE: 'observe' });
+  assert.equal(Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)])).notices, '');
+  // Oliver replies; the next observation retries with his feedback in the digest.
+  f.runs.push(f.run(45)); f.artifact(45, 'annie-checkpoint-45-1', 'checkpoint.json', await f.json('checkpoint.json'));
+  f.comments.set(4, [{ user: { login: 'annie[bot]', type: 'Bot' }, created_at: new Date(now + 3700000).toISOString(), body: 'bot noise' }, { user: { login: 'bugabinga', type: 'User' }, author_association: 'OWNER', created_at: new Date(now + 3800000).toISOString(), body: 'Pin `zai/*glm*` first.' }]);
+  f.setClock(now + 4 * 3600000); f.setCurrent(46); await writeFile(outputPath, '');
+  const retried = await f.execute({ GITHUB_OUTPUT: outputPath }), again = await f.json('lease.json');
+  assert.equal(again.task.kind, 'harness'); assert.equal(retried.harnessRepair.attempt, 2); assert.notEqual(again.task.fingerprint, lease.task.fingerprint);
+  const retryDigest = JSON.parse(Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)])).incident);
+  assert.deepEqual(retryDigest.request.comments, [{ author: 'bugabinga', at: new Date(now + 3800000).toISOString(), body: 'Pin `zai/*glm*` first.' }]);
+  const foreign = await fixture(t); foreign.setRole('read'); foreign.issues.push({ ...request, user: { login: 'stranger', type: 'User' } });
+  const refused = await foreign.execute(); assert.equal((await foreign.json('lease.json')).task.kind, 'maintenance'); assert.equal(refused.harnessRepair, null);
 });
 // Shared path to a ready job-failed incident (two failing effects runs) whose first harness repair run 44 was just admitted.
 async function admittedRepair(t, { beforeAdmission = () => {} } = {}) {

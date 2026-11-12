@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { validateActions } from './github.mjs';
-import { redact } from './report.mjs';
+import { redact, redactMarkdown } from './report.mjs';
 import { OWN, isSha } from './task.mjs';
 import { githubRead } from './pr.mjs';
 export const planHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const clean = action => Object.fromEntries(Object.entries(action).map(([key, value]) => [key, typeof value === 'string' ? redact(value) : Array.isArray(value) ? value.map(v => redact(v)) : value]));
+const clean = action => Object.fromEntries(Object.entries(action).map(([key, value]) => [key, key === 'body' && typeof value === 'string' ? redactMarkdown(value) : typeof value === 'string' ? redact(value) : Array.isArray(value) ? value.map(v => redact(v)) : value]));
 export function approvedPlan(run, plans) {
   if (run.review?.approve !== true) throw Error('explicit management approval required');
   const actions = validateActions(plans.flatMap(plan => plan.actions)).map(clean);

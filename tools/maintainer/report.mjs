@@ -12,7 +12,7 @@ export const providerEnvNames = () => [...new Set([...getBuiltinProviders().flat
 // Provider env names set in env; unset workflow secrets are empty and count as absent. No provider is special-cased.
 export const providerKeyNames = (env = process.env) => providerEnvNames().filter(name => typeof env[name] === 'string' && env[name]);
 const secretValues = env => [...providerKeyNames(env), 'GH_TOKEN', 'ANNIE_GH_TOKEN', 'REGISTRY_PASSWORD'].map(key => env[key]).filter(value => typeof value === 'string' && value.length >= 4);
-export function redact(value, env = process.env) {
+export function redact(value, env = process.env, limit = 2_000) {
   let result = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
   for (const secret of secretValues(env)) {
     const variants = [secret, encodeURIComponent(secret), Buffer.from(secret).toString('base64'), Buffer.from(secret).toString('base64url')];
@@ -21,8 +21,13 @@ export function redact(value, env = process.env) {
   return result
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[redacted private key]')
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AIza[\w-]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, '[redacted token]')
-    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{16,}\b/gi, 'Bearer [redacted]').slice(0, 2_000);
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{16,}\b/gi, 'Bearer [redacted]').slice(0, limit);
 }
+// GitHub Markdown bodies keep their line structure; each line is redacted like any other model text.
+export const redactMarkdown = (value, env = process.env) => String(value ?? '').replace(/\r\n?/g, '\n')
+  .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[redacted private key]')
+  .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{16,}\b/gi, 'Bearer [redacted]')
+  .split('\n').map(line => redact(line, env, Infinity).trimEnd()).join('\n');
 const findings = (value, env) => Array.isArray(value) ? value.slice(0, 20).map(item => redact(item, env).slice(0, 500)).filter(Boolean) : [];
 const safePhase = (value, env = process.env) => typeof value === 'string' && /^[a-z-]{2,32}$/.test(value) && redact(value, env) === value ? value : 'unknown';
 const safeNumber = value => Number.isFinite(value) && value >= 0 ? value : null;

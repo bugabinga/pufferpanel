@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { defineDoc, defineExtension, defineTool } from '@earendil-works/pi-durable';
 import { arr, int, obj, opt, str } from '@earendil-works/pi-schema';
 import { createHash } from 'node:crypto';
-import { redact } from './report.mjs';
+import { redact, redactMarkdown } from './report.mjs';
 import { PROTECTED_PATHS } from './task.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -32,7 +32,7 @@ async function request(fetchImpl, path, token) {
     return { value: await response.json(), truncated: /(?:^|,)\s*<[^>]+>;\s*rel="next"/.test(response.headers.get('link') ?? '') };
   } catch { return { error: 'network-or-timeout' }; } finally { clearTimeout(timer); }
 }
-const summary = (item, token) => ({ number: item?.number, title: safe(item?.title, token).slice(0, 500), updatedAt: typeof item?.updated_at === 'string' ? item.updated_at : null, author: typeof item?.user?.login === 'string' ? item.user.login.slice(0, 100) : null, head: sha(item?.head?.sha), draft: Boolean(item?.draft), body: safe(item?.body, token) });
+const summary = (item, token) => ({ number: item?.number, title: safe(item?.title, token).slice(0, 500), updatedAt: typeof item?.updated_at === 'string' ? item.updated_at : null, author: typeof item?.user?.login === 'string' ? item.user.login.slice(0, 100) : null, head: sha(item?.head?.sha), draft: Boolean(item?.draft), labels: Array.isArray(item?.labels) ? item.labels.slice(0, 20).map(label => safe(label?.name, token).slice(0, 80)) : [], body: safe(item?.body, token) });
 async function queue(fetchImpl, repo, kind, token, redactionToken = token) {
   const response = await request(fetchImpl, `/repos/${repo}/${kind}?state=open&per_page=${limit}`, token);
   if (response.error) return { error: response.error, items: [], truncated: true };
@@ -79,9 +79,9 @@ export function validateActions(actions) {
     if (action.kind !== 'create-issue' && action.kind !== 'enable-issues' && !issueNumber(action.number)) throw Error('invalid GitHub object number');
     if (action.kind === 'add-label' && (!Array.isArray(action.labels) || action.labels.length < 1 || action.labels.length > 10 || action.labels.some(label => typeof label !== 'string' || !label.trim() || label.length > 80))) throw Error('invalid labels');
     if (action.kind === 'create-issue' && (typeof action.title !== 'string' || !action.title.trim() || action.title.length > 500)) throw Error('invalid issue title');
-    if (['comment', 'create-issue'].includes(action.kind) && (typeof action.body !== 'string' || !action.body.trim() || action.body.length > 4000)) throw Error('invalid action body');
+    if (['comment', 'create-issue'].includes(action.kind) && (typeof action.body !== 'string' || !action.body.trim() || action.body.length > 4000)) throw Error(`invalid action body: need 1..4000 characters of GitHub Markdown, got ${typeof action.body === 'string' ? action.body.length : 'none'}; shorten it, never cut it off`);
     if (action.kind !== 'create-issue' && action.kind !== 'enable-issues' && (typeof action.expectedUpdatedAt !== 'string' || !Number.isFinite(Date.parse(action.expectedUpdatedAt)))) throw Error('invalid expectedUpdatedAt');
-    return { kind: action.kind, number: action.number ?? null, labels: action.labels?.map(label => safe(label).trim()) ?? null, title: action.kind === 'create-issue' ? safe(action.title).trim() : null, body: action.body ? safe(action.body) : null, expectedUpdatedAt: action.expectedUpdatedAt ?? null };
+    return { kind: action.kind, number: action.number ?? null, labels: action.labels?.map(label => safe(label).trim()) ?? null, title: action.kind === 'create-issue' ? safe(action.title).trim() : null, body: action.body ? redactMarkdown(action.body).slice(0, 4000).trimEnd() : null, expectedUpdatedAt: action.expectedUpdatedAt ?? null };
   });
 }
 const actionSchema = obj({ kind: str(), number: opt(int()), labels: opt(arr(str())), title: opt(str()), body: opt(str()), expectedUpdatedAt: opt(str()) });
@@ -102,7 +102,7 @@ export function installGitHubTools(registry, { root, worktree, runDoc }) {
     if (await gitOk(worktree, 'diff', '--quiet', base, '--', ...PROTECTED_PATHS)) return { output: [{ type: 'text', text: JSON.stringify({ base, upstreamSha: run.upstreamSha, conflicts: [], merged: true }) }] };
     throw Error('protected paths changed by upstream merge');
   } });
-  const propose = defineTool({ name: 'propose_github', description: 'Persist one bounded non-executing GitHub management proposal for this run.', parameters: obj({ actions: arr(actionSchema, { minItems: 1, maxItems: 10 }) }, { open: true }), replay: 'safe', execute: async ({ actions }, api, context) => {
+  const propose = defineTool({ name: 'propose_github', description: 'Persist one bounded non-executing GitHub management proposal for this run. Bodies are GitHub Markdown of at most 4000 characters, posted with line breaks intact; follow the GitHub writing rules.', parameters: obj({ actions: arr(actionSchema, { minItems: 1, maxItems: 10 }) }, { open: true }), replay: 'safe', execute: async ({ actions }, api, context) => {
     const run = (await api.snapshot(runDoc, root.id, context))?.run;
     if (!run?.requestId || !run?.day) throw Error('active maintenance run unavailable');
     const plan = { actions: validateActions(actions), at: Date.now(), runId: run.requestId };
