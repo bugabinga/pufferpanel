@@ -310,6 +310,7 @@ A daily quality round may honestly no-op; identical handled inputs never force s
 The calendar slot is reserved before model execution; verified terminal no-source reports release it, while approved source keeps its immutable slot and blocks replacement work.
 Management-only work never consumes that slot.
 Anonymous registry HEAD must prove the numbered tag absent before new source admission; collision or unknown availability prevents pay.
+An unreachable or erroring registry holds only that source task as state `registry-unknown`: observe still completes, writes its checkpoint, and runs incidents, notices, retries, and harness or management work, and the next observation tries the source task again.
 Pending approved unpersisted source/management effects with a live candidate and fewer than three effects attempts take priority across midnight and suppress fresh model work.
 A source record is released iff a non-expired release report proves publication digest, persisted source, and matching release commit; management receipt statuses are irrelevant.
 A management-only record is terminal once any completed release report exists.

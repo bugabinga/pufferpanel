@@ -554,10 +554,12 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   if (next) fresh.republish = [...fresh.republish.filter(r => r.runId !== republish.runId), { runId: republish.runId, attempts: (next.entry?.attempts ?? 0) + 1, nextAt: now + 30 * 60_000 }];
   fresh.republish = fresh.republish.slice(-20);
   let state = republish ? 'republishing' : pending.length || ledger.blockers.length ? 'effects-pending' : task ? 'useful-input' : 'no-op';
-  let lease = null;
+  let lease = null, slot = null;
   if (mode === 'maintain' && task && !republish && !pending.length && !ledger.blockers.length && !(fresh.environment?.nextAt > now) && env.HONEST_ANNIE_ENABLED === 'true' && env.GITHUB_RUN_ATTEMPT === '1' && ledger.allowance > 0) {
     if (providersHeld) state = 'providers-held';
-    else if (['maintenance', 'pr'].includes(task.kind) && (fresh.slots.includes(day) || branch.protected !== false || !await publicationAvailable(fetchImpl, day))) state = 'source-slot-unavailable';
+    else if (['maintenance', 'pr'].includes(task.kind) && (fresh.slots.includes(day) || branch.protected !== false)) state = 'source-slot-unavailable';
+    // The registry decides only whether today's tag is free: unknown holds this source task, never the rest of observe.
+    else if (['maintenance', 'pr'].includes(task.kind) && (slot = await publicationAvailable(fetchImpl, day).catch(() => 'unknown')) !== true) state = slot === 'unknown' ? 'registry-unknown' : 'source-slot-unavailable';
     else {
       const rules = await api.pages(`/repos/${OWN}/rules/branches/trunk`);
       if (rules.length) state = 'protected-policy';

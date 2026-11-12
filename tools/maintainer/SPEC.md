@@ -185,6 +185,7 @@ PR fingerprints bind number/H/B/policy, excluding clock/upstream/reviews/attempt
 Ordinary rejection and deterministic preparation failure remain handled until relevant input changes.
 Missing or expired checkpoint state blocks admission rather than silently resetting deduplication; initial bootstrap must be explicit.
 Management-only tasks cannot change source/history or reserve an image slot.
+An unknown registry answer holds only source admission, never observation or other work.
 Source work reserves one calendar opportunity before pay; terminal verified no-source work releases it, while an approved unpersisted source with a live candidate and fewer than three effects attempts blocks new source work across UTC midnight.
 Source is released iff a release report proves publication digest, persisted source, and matching release commit; a management-only record is terminal once any completed release report exists.
 Unpersisted work with a missing or expired candidate or an exhausted effects ceiling becomes `abandoned`: reported, non-blocking, and not handled, so later batches may redo it.

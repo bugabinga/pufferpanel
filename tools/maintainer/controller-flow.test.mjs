@@ -192,9 +192,21 @@ test('same-day slot, unknown registry, current protection and rerun guard preven
     if (mode === 'collision') f.setRegistry(200);
     if (mode === 'outage') f.setRegistry(401);
     if (mode === 'protected') f.setProtected(true);
-    if (mode === 'outage') await assert.rejects(f.execute(), /availability unknown/);
     else assert.equal((await f.execute(mode === 'rerun' ? { GITHUB_RUN_ATTEMPT: '2' } : {})).paid, false);
   }
+});
+test('registry outage holds only source work: observe completes, writes its checkpoint, and a harness request still runs', async t => {
+  for (const outage of [() => new Response(null, { status: 503 }), () => { throw new TypeError('fetch failed'); }]) {
+    const f = await fixture(t); f.setRegistryImpl(outage);
+    const held = await f.execute();
+    assert.equal(held.state, 'registry-unknown'); assert.equal(held.paid, false);
+    await assert.rejects(readFile(join(f.dir, 'lease.json'))); assert.deepEqual((await f.json('checkpoint.json')).slots, []);
+    assert.equal((await f.json('observer.json')).state, 'registry-unknown');
+  }
+  const f = await fixture(t); f.setRegistryImpl(() => { throw new TypeError('fetch failed'); });
+  f.issues.push({ number: 4, title: 'latest models', body: 'pin it', state: 'open', user: { login: 'bugabinga', type: 'User' }, labels: [{ name: 'annie-harness' }] });
+  const admitted = await f.execute();
+  assert.equal(admitted.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'harness');
 });
 test('lost/expired decision checkpoint fails closed even when bootstrap flag remains on', async t => {
   const f = await fixture(t);
