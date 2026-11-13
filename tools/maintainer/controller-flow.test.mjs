@@ -459,9 +459,9 @@ test('operator request: a labelled issue from a write author admits a $5 harness
   const written = Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
   assert.deepEqual(JSON.parse(written.incident).request, { number: 4, url: `https://github.com/${OWN}/issues/4`, title: 'latest models', body: request.body, comments: [] });
   assert.equal(written.incidents, '', 'a request is already its own issue');
-  // A labelled request never counts as queue input, so it cannot wake ordinary management.
-  const empty = await fixture(t); await empty.execute({ ANNIE_MODE: 'observe' });
-  assert.equal(checkpoint.queue, (await empty.json('checkpoint.json')).queue);
+  // Labels stay out of the queue digest: labelling an issue never buys a management run.
+  const unlabelled = await fixture(t); unlabelled.issues.push({ ...request, labels: [] }); await unlabelled.execute({ ANNIE_MODE: 'observe' });
+  assert.equal(checkpoint.queue, (await unlabelled.json('checkpoint.json')).queue);
   // The attempt changes nothing: Annie answers on the issue and waits for feedback instead of buying the same guess again.
   f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', checkpoint); f.artifact(42, 'annie-lease-42-1', 'lease.json', lease);
   f.artifact(42, 'honest-annie-model-report-42-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: 'harness', incident: lease.task.incident, day: lease.task.day, base, managementApproved: false, commit: null, releaseCommit: null, phase: 'published', reason: 'no-op', diagnosis: 'enabledModels already tracks provider defaults', usageComplete: true, reportedUsage: { status: 'known', cost: 1 } });

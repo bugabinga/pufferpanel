@@ -118,7 +118,7 @@ After two observations, a model-free job with the native token and `issues: writ
 A repairable incident admits a `harness` task within allowance and providers, under a $5 cap and without a calendar slot, and never while an attempt for it is in flight or a harness PR for it is open.
 Another attempt needs the last PR closed unmerged, the last PR merged with evidence or recurrence after the merge, or no PR from the last attempt plus a policy change or 24h; at most three attempts per incident, and a policy change alone never retries.
 An unattributable open harness PR or an unknown PR lookup admits no harness repair; a duplicate delivery for an incident with an open PR comments on the incident instead of pushing or opening another.
-A harness change request is an open issue labelled `annie-harness`, by Oliver or by an ordinary run's reviewed `add-label` proposal; with a current write-permission author it becomes an `operator-request` incident, ready at once, reported on that issue instead of an incident issue, and never part of the management queue.
+A harness change request is an open issue labelled `annie-harness`, by Oliver or by an ordinary run's reviewed `add-label` proposal; with a current write-permission author it becomes an `operator-request` incident, ready at once, and reported on that issue instead of an incident issue; labels never change the management queue digest.
 An attempt ending without a PR answers the request issue once; a request PR closes its issue on merge; another attempt needs feedback from the author or owner after the last attempt, or a reopen, never time or policy alone.
 Its executor sees a bounded redacted incident digest as untrusted spotlit data and must never weaken checks, budgets, or security boundaries.
 A harness PR's own `pull_request` workflows run with a token whose read-only default a `permissions:` key overrides, and trunk is unprotected.
@@ -147,6 +147,8 @@ Calendar numbered tags remain immutable, so a second distinct revision on the sa
 
 ## Reviewed GitHub management
 
+Management tasks get a triage-only prompt and a tool guard refusing every worktree write; shell mutations outside that guard still fail after the turn.
+A model phase that threw after every model call settled reports `failed` with its known cost, so one host refusal never holds a whole lease cap; interrupted or unsettled phases stay unknown.
 Management-only approval stops at `managing`, exits successfully, and never runs source gates, creates a source commit, or publishes an image.
 Only current-run bounded independently approved canonical plans cross jobs as a publication-safe sanitized hash-bound operational artifact, separate from public reports.
 Host execution rechecks whole-plan hash/repo/source/approval, exact current target identity/open state/updatedAt, admin permission class for `enable-issues`, and bounded idempotence coverage; native-token mutations let their HTTP status decide.

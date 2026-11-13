@@ -533,7 +533,7 @@ An open issue asking to change Annie herself gets the `annie-harness` label from
 A bot-applied label triggers no workflow, so such a request starts at the next half-hourly run.
 Observe turns each such issue whose author has current write, maintain, or admin permission into an `operator-request` incident, fingerprinted by issue number, at most five per observation.
 A request is ready on its first observation and is already its own issue, so no `annie-incident` issue is created; removing the label or closing the issue clears it.
-Labelled issues are excluded from the management queue digest, and `maintenance.md` tells ordinary runs never to comment on them.
+The queue digest ignores labels, so labelling an issue never buys a management run; `maintenance.md` tells ordinary runs never to comment on labelled requests.
 Feedback means comments by the request author or the repository owner; bots, including Annie, never count.
 The digest carries a `request` field with the issue URL, title, Markdown body of at most 10 000 redacted characters, and the last five feedback comments of at most 1 000 characters each, which keeps the digest under 48 KiB; the executor treats it as the goal, newest feedback first, but not as permission to widen any limit.
 Everything else follows the incident rules above: $5 cap, independent review, harness gate, delivery as an `annie/harness/` PR that only Oliver merges, and the delivery comment lands on the request issue.

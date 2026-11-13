@@ -85,6 +85,11 @@ test('harness guard variant allows only tools/maintainer and honest-annie.yml, s
   for (const path of ['.github/workflows/evil.yml', '.github/workflows/build.yml', '.github/workflows/annie-pr-wake.yml', '.github/actionlint.yaml', 'README.md']) await assert.rejects(confinePath(worktree, path, [], HARNESS_PATHS), /outside the harness repair scope/, path);
   assert.match(classifyCommand('echo x > .github/workflows/evil.yml', { worktree, protectedPaths: [], allowedPaths: HARNESS_PATHS }), /outside the harness repair scope/);
   assert.equal(classifyCommand('echo x > /tmp/scratch && echo y > tools/maintainer/z.mjs', { worktree, protectedPaths: [], allowedPaths: HARNESS_PATHS }), null);
+  // Management tasks never change source: every worktree write is refused at the tool call, scratch space stays usable.
+  assert.equal(guardFor(worktree, { ...f.task, kind: 'management' }).name, 'pufferpanel-management-guard');
+  for (const path of ['README.md', 'go.mod']) await assert.rejects(confinePath(worktree, path, undefined, []), /GitHub management task, which never changes source/, path);
+  assert.match(classifyCommand('echo x > README.md', { worktree, allowedPaths: [] }), /GitHub management task/);
+  assert.equal(classifyCommand('echo x > /tmp/scratch', { worktree, allowedPaths: [] }), null);
 });
 
 test('faux real-Harness harness task: guarded executor edits tools/maintainer, reviewer approves read-only, real harness gate passes, export says harness', async t => {

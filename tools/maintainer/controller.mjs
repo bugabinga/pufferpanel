@@ -374,7 +374,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   const policy = digest(await protectedPolicy(read, run.head_sha));
   if (branch.commit.sha !== run.head_sha && digest(await protectedPolicy(read, branch.commit.sha)) !== policy) fail('trunk policy moved since trusted checkout');
   const day = new Date(now).toISOString().slice(0, 10);
-  // Harness requests belong to the harness lane: they never wake ordinary maintenance or management.
+  // Harness requests belong to the harness lane; labels stay out of the queue digest, so labelling never buys a management run.
   const requested = issue => !issue.pull_request && issue.labels?.some(label => label?.name === REQUEST_LABEL);
   const requests = [];
   for (const issue of issues.filter(requested).slice(0, 5)) {
@@ -383,7 +383,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     const feedback = (await api.pages(`/repos/${OWN}/issues/${issue.number}/comments`)).filter(item => item?.user?.type !== 'Bot' && (item.user?.login === issue.user.login || item.author_association === 'OWNER'));
     requests.push({ number: issue.number, title: issue.title ?? '', body: issue.body ?? '', comments: feedback.slice(-5).map(item => ({ author: item.user.login, at: String(item.created_at ?? ''), body: item.body ?? '' })), activity: Math.max(0, ...[issue.created_at, ...feedback.map(item => item.created_at)].map(value => Date.parse(value) || 0)) });
   }
-  const queue = digest(issues.filter(i => !i.pull_request && !requested(i) && i.user?.type !== 'Bot' && i.user?.login !== 'honest_annie').map(i => ({ number: i.number, title: i.title, bodyHash: digest(i.body ?? ''), state: i.state })).sort((a,b) => a.number-b.number));
+  const queue = digest(issues.filter(i => !i.pull_request && i.user?.type !== 'Bot' && i.user?.login !== 'honest_annie').map(i => ({ number: i.number, title: i.title, bodyHash: digest(i.body ?? ''), state: i.state })).sort((a,b) => a.number-b.number));
   const queueChanged = checkpoint.queue !== undefined && checkpoint.queue !== queue;
   const eligible = [];
   for (const pr of prs) {

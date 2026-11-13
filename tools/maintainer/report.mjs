@@ -92,7 +92,10 @@ export function outcomeFor(run, interrupted = false) {
 export function reportFor(run, { env = process.env, interrupted = false, gateEvents = null } = {}) {
   if (run?.sourceIdentity) run = { ...run, ...run.sourceIdentity, spent: run.spend, reportedUsage: run.reportedUsage?.status === 'known' ? run.reportedUsage.cost : null };
   const identity = source(run, env);
-  const modelPending = interrupted || ['admitted', 'executing', 'reviewing'].includes(run?.phase);
+  // A model phase that threw after every model call settled ended this job: no call is in flight, so it reports failed with
+  // its known cost. The durable run keeps its phase, so a local restart can still resume it.
+  const settledFailure = !interrupted && Boolean(run?.error) && run.usageComplete === true && ['executing', 'reviewing'].includes(run?.phase);
+  const modelPending = interrupted || ['admitted', 'executing', 'reviewing'].includes(run?.phase) && !settledFailure;
   const phaseCosts = Object.fromEntries(Object.entries(run?.modelPhaseCost ?? {}).filter(([phase]) => /^[a-z-]{2,32}$/.test(phase) && redact(phase, env) === phase).map(([phase, value]) => [phase, { cost: safeNumber(value?.cost), status: ['known', 'unknown', 'not-run'].includes(value?.status) ? value.status : 'unknown' }]));
   const reason = run?.reason ?? run?.review?.reason ?? (run?.phase === 'rejected' ? 'review-rejected' : run?.phase === 'failed' ? 'maintenance-failed' : null);
   const report = {
@@ -129,13 +132,13 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     ledgerReservation: sha(run?.ledgerReservation, 64, env),
     actionReceipts: Array.isArray(run?.actionReceipts) ? run.actionReceipts.slice(0, 10).map(r => ({ kind: safePhase(r.kind), number: Number.isInteger(r.number) ? r.number : null, status: ['applied', 'skipped', 'failed'].includes(r.status) ? r.status : 'failed', reason: r.reason ? redact(r.reason, env).slice(0, 200) : null })) : [],
     day: typeof run?.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(run.day) && redact(run.day, env) === run.day ? run.day : null,
-    phase: safePhase(run?.phase, env),
+    phase: settledFailure ? 'failed' : safePhase(run?.phase, env),
     spend: safeNumber(run?.spent),
     version: typeof run?.version === 'string' ? redact(run.version, env).slice(0, 64) : null,
     commit: identity.commit,
     base: identity.base,
     tree: identity.tree,
-    outcome: outcomeFor(run, interrupted),
+    outcome: settledFailure ? 'failed' : outcomeFor(run, interrupted),
     reason: reason ? redact(reason, env).slice(0, 500) : null,
     findings: findings(run?.review?.findings ?? run?.findings, env),
     // Rejection memory evidence: blocking finding ids with short impacts, and the candidate's changed-file area.

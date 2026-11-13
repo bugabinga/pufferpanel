@@ -14,7 +14,7 @@ const GIT_METADATA = '.git';
 const under = (rel, prefix) => rel === prefix || rel.startsWith(`${prefix}/`);
 const inside = rel => rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 // Harness repairs: an allow-list instead; anything else under .github could run on the PR with a write token.
-const scopeReason = (allowed, path) => `${path} is outside the harness repair scope: change only ${allowed.map(prefix => prefix.endsWith('.yml') ? prefix : `${prefix}/**`).join(' and ')}; other .github files can run with write tokens on the PR`;
+const scopeReason = (allowed, path) => !allowed.length ? `${path}: this is a GitHub management task, which never changes source; write nothing in the worktree and propose GitHub actions instead` : `${path} is outside the harness repair scope: change only ${allowed.map(prefix => prefix.endsWith('.yml') ? prefix : `${prefix}/**`).join(' and ')}; other .github files can run with write tokens on the PR`;
 const outsideScope = (rel, allowed) => allowed && !allowed.some(prefix => under(rel, prefix));
 const protectedReason = (hit, path) => hit === GIT_METADATA ? `${path} is Git metadata; the host manages .git, leave it unchanged` : `${path} is in ${hit}, the host-trusted harness/CI policy; leave it unchanged and report needed changes as blockers`;
 // The path forms the durable write/edit tools accept: '@' prefix, Unicode spaces, '~', and file:// URLs.

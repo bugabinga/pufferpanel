@@ -15,6 +15,12 @@ test('excerpt ends at a line or sentence boundary, closes a cut code fence, and 
   assert.equal(excerpt('intro\n```js\nconst a = 1;\nconst b = 2;\n```\nafter', 30), 'intro\n```js\nconst a = 1;\n```\n\n[truncated]');
   for (const limit of [1480, 2980]) assert.ok(excerpt(`\`\`\`\n${'y '.repeat(limit)}`, limit).length <= limit + 20);
 });
+test('a model phase that threw after every call settled reports failed with its known cost; open or interrupted ones stay unknown', () => {
+  const run = { taskKind: 'management', day: '2026-04-03', base: 'a'.repeat(40), phase: 'executing', error: { phase: 'executing' }, usageComplete: true, reportedUsage: 1.76, ledgerReservation: 'e'.repeat(64), fingerprint: 'f'.repeat(64), blocker: 'management task changed source' };
+  const settled = reportFor(run), collected = reportFor(settled);
+  for (const report of [settled, collected]) assert.deepEqual([report.phase, report.outcome, report.usageComplete, report.reportedUsage], ['failed', 'failed', true, { status: 'known', cost: 1.76 }]);
+  for (const open of [reportFor(run, { interrupted: true }), reportFor({ ...run, error: undefined }), reportFor({ ...run, usageComplete: false }), reportFor({ ...run, phase: 'admitted' })]) assert.deepEqual(open.reportedUsage, { status: 'unknown' });
+});
 test('inert keeps Markdown but neutralises mentions, closing keywords, and HTML', () => {
   assert.equal(inert('**Fix** `a` in #4, ask @oliver'), '**Fix** `a` in #4, ask @\u200boliver');
   assert.equal(inert('Closes #12, fixes: #3, Resolved owner/repo#9'), 'Closes #\u200b12, fixes: #\u200b3, Resolved owner/repo#\u200b9');
