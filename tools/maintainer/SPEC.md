@@ -97,8 +97,8 @@ Redaction is defense-in-depth, not an OS sandbox or a guarantee that arbitrary m
 Validate the exact private container storage configuration before paid model requests.
 Stay provider-independent through Pi's normal model runtime, standard provider credentials, and pi-ai error classification, with no provider or model special-cased in code.
 Work with whichever pi-ai provider API keys are configured; CI forwards every pi-ai provider credential name and known companion explicitly, never the whole secrets context.
-Choose models as Pi does: optional `enabledModels` preference first, then Pi's saved default, then each authenticated provider's Pi default model in Pi's order; no hand-curated model list.
-Use the first available candidate with known pricing; independent review prefers a candidate from a different provider.
+Choose models as Pi does, with one extension: optional `enabledModels` preference first, then Pi's saved default, then each authenticated provider's cheapest priced image-capable catalog model (else its cheapest priced model) ahead of its Pi default model in Pi's order; no hand-curated model list.
+Use the first available candidate with known pricing; independent review prefers a candidate from a different provider, and the reviewer is image-capable whenever any candidate is, so visual review keeps screenshots.
 Fail closed when no candidate is available.
 After a provider error pi-ai never retries, or a transient one once Pi's retry policy is spent, move work to the next available model inside the original lease, cap, and deadline.
 Never re-dispatch to an exhausted provider within the run; deterministic provider failures are environment failures, not hourly retries.
@@ -200,7 +200,7 @@ Current branch/rules policy blocks ordinary maintenance pushes as well as PR pus
 
 ## Acceptance evidence
 
-Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection from Pi defaults and `enabledModels`, cross-run provider holds, the forwarded provider env list against pi-ai's mapping, and in-lease provider failover.
+Offline tests cover source protection, real temporary Git/SQLite recovery, invalid/rejected reviews, diagnostic redaction, exact-store preflight, trusted-author admission, head/base races, retryable publication, trigger deduplication, budget admission, credential-based model selection from the catalog tier, Pi defaults, and `enabledModels`, cross-run provider holds, the forwarded provider env list against pi-ai's mapping, and in-lease provider failover.
 Offline tests cover budgeted script classifiers, refused image generation and raw dispatch, commit message composition, bounds, redaction, and interrupted-commit recovery, and rejection memory accumulation, expiry, intake, and host refusal.
 Shell and workflow validation pass.
 Offline tests cover incident detection and dedupe, idempotent incident issues against a fake GitHub, harness task schema and caps, guard selection, the harness gate runner, a faux harness run through export, PR delivery success and failures, and self-integration refusals.

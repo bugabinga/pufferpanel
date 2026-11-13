@@ -96,6 +96,11 @@ const putRun = async (root, run) => {
 export const usageCost = usage => Object.values(usage?.models ?? {}).reduce((sum, value) => sum + value.cost.total, 0);
 
 export const priced = model => [model.cost, ...(model.cost?.tiers ?? [])].every(cost => ['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isFinite(cost?.[key]) && cost[key] >= 0));
+// Worst catalog price tier per million tokens, input plus output: the rank for cost-efficient selection.
+export const catalogPrice = model => Math.max(...[model.cost, ...(model.cost?.tiers ?? [])].map(tier => tier.input + tier.output));
+// A provider's cheapest priced model that accepts image input, else its cheapest priced model; ties keep catalog order.
+// Image input leads because the reviewer must be able to see screenshots.
+export const cheapestVisionModel = models => models.filter(priced).sort((a, b) => (a.input?.includes('image') ? 0 : 1) - (b.input?.includes('image') ? 0 : 1) || catalogPrice(a) - catalogPrice(b))[0];
 // Pi exports neither its per-provider default models nor findInitialModel; read them from the pinned package's resolver,
 // proven to be the module behind the public resolveModelScopeWithDiagnostics. A moved export fails loudly at import.
 export const piModelResolver = await import(new URL('./core/model-resolver.js', import.meta.resolve('@earendil-works/pi-coding-agent')));
@@ -103,14 +108,17 @@ if (piModelResolver.resolveModelScopeWithDiagnostics !== resolveModelScopeWithDi
 // Trusted observe output ANNIE_PROVIDER_HOLDS: providers still held after quota/auth failures; malformed input fails closed.
 export const heldProviders = (text, now = Date.now()) => new Set(text ? validateHolds(JSON.parse(text)).filter(hold => hold.until > now).map(hold => hold.provider) : []);
 // Candidates in Pi's order: settings `enabledModels` (globs, `:thinking`) resolved against authenticated models, Pi's saved
-// default model, then each authenticated provider's Pi default model in findInitialModel's provider order. Unknown prices and
-// held providers are skipped; thinking is the pattern suffix, else `defaultThinkingLevel`, else high, clamped to the model.
+// default model, then per provider in findInitialModel's provider order its cheapest priced image-capable catalog model (else
+// its cheapest priced model) ahead of its Pi default, whose table is pinned inside the package and drifts stale: it still
+// names the deprecated, text-only MiniMax-M2.7 while the catalog carries newer, cheaper, image-capable models, so selection
+// tracks catalog updates instead of hard-coded model ids. Unknown prices and held providers are skipped; thinking is the
+// pattern suffix, else `defaultThinkingLevel`, else high, clamped to the model.
 export async function selectModels(settings, runtime, held = new Set()) {
   const patterns = settings.enabledModels ?? [];
   if (!Array.isArray(patterns) || patterns.some(pattern => typeof pattern !== 'string')) fail('invalid enabledModels');
   const { scopedModels } = await resolveModelScopeWithDiagnostics(patterns, runtime);
   const authenticated = await runtime.getAvailable(), find = (provider, id) => authenticated.find(model => model.provider === provider && model.id === id);
-  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...Object.entries(piModelResolver.defaultModelPerProvider).map(([provider, id]) => ({ model: find(provider, id) }))];
+  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...Object.entries(piModelResolver.defaultModelPerProvider).flatMap(([provider, id]) => [{ model: cheapestVisionModel(authenticated.filter(model => model.provider === provider)) }, { model: find(provider, id) }])];
   const candidates = [];
   for (const { model, thinkingLevel } of ordered) {
     if (!model || !priced(model) || candidates.some(choice => choice.provider === model.provider && choice.modelId === model.id)) continue;

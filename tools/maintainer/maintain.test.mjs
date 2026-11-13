@@ -552,6 +552,29 @@ test('selection orders enabledModels, Pi saved default, then provider defaults; 
   await assert.rejects(selectModels({}, { getAvailable: async () => [] }), /no configured model available$/);
   assert.equal(versionFor('2026-04-03'), '2026.4.3'); assert.equal(stateDirectory({ HOME: '/x' }), '/x/.pi/agent/maintenance/pufferpanel');
 });
+test('selection prefers a provider\'s cheapest priced image-capable catalog model over its stale text-only Pi default', async () => {
+  const table = piModelResolver.defaultModelPerProvider, cost = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 };
+  const models = [
+    { provider: 'zai', id: table.zai, cost, input: ['text'], reasoning: true },
+    { provider: 'minimax', id: table.minimax, cost, input: ['text'], reasoning: true },
+    { provider: 'minimax', id: 'MiniMax-M3', cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0, tiers: [{ inputTokensAbove: 512000, input: 0.6, output: 2.4, cacheRead: 0.12, cacheWrite: 0 }] }, input: ['text', 'image'], reasoning: true },
+    { provider: 'minimax', id: 'MiniMax-M3.1-Flash', cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0, tiers: [{ inputTokensAbove: 512000, input: 0.3, output: 1.2, cacheRead: 0.03, cacheWrite: 0 }] }, input: ['text', 'image'], reasoning: true },
+    { provider: 'minimax', id: 'unpriced', cost: {}, input: ['text', 'image'], reasoning: true },
+  ];
+  const runtime = { getAvailable: async () => models };
+  let choices = await selectModels({}, runtime);
+  // The cheapest image-capable catalog model leads its provider; the deprecated text-only Pi default stays as fallback.
+  assert.deepEqual(choices.available, [{ provider: 'zai', modelId: table.zai, thinkingLevel: 'high' }, { provider: 'minimax', modelId: 'MiniMax-M3.1-Flash', thinkingLevel: 'high' }, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' }]);
+  assert.deepEqual(choices.executor, choices.available[0]);
+  assert.deepEqual(choices.reviewer, choices.available[1]);
+  // Ranking uses each model's worst price tier, so MiniMax-M3 (3.0 per M above 512k tokens) loses to the flash tier (1.5), and unpriced models never lead.
+  assert.ok(!choices.available.some(choice => ['MiniMax-M3', 'unpriced'].includes(choice.modelId)));
+  // An explicit enabledModels pin still overrides the catalog tier.
+  choices = await selectModels({ enabledModels: ['minimax/MiniMax-M3'] }, runtime);
+  assert.deepEqual(choices.executor, { provider: 'minimax', modelId: 'MiniMax-M3', thinkingLevel: 'high' });
+  choices = await selectModels({}, runtime, new Set(['zai']));
+  assert.deepEqual(choices.executor, { provider: 'minimax', modelId: 'MiniMax-M3.1-Flash', thinkingLevel: 'high' });
+});
 test('provider holds from trusted observation are strict, and expired holds release their provider', () => {
   const now = Date.parse('2026-04-19T00:00:00Z'), hold = { provider: 'zai', until: now + 1, reason: 'quota' };
   assert.deepEqual([...heldProviders(JSON.stringify([hold, { provider: 'minimax', until: now, reason: 'auth' }]), now)], ['zai']);

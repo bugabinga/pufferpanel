@@ -52,35 +52,41 @@ test('Pi default model table comes from the pinned resolver behind the public sc
   const providers = getBuiltinProviders(), table = Object.entries(piModelResolver.defaultModelPerProvider);
   assert.ok(table.length > 0); for (const [provider, id] of table) assert.ok(providers.includes(provider) && typeof id === 'string' && id, provider);
 });
-test('selection takes the Pi default of each credentialed provider in findInitialModel order, prefers an independent reviewer, and fails closed', async t => {
+test('selection takes each credentialed provider\'s cheapest image-capable catalog model ahead of its stale Pi default, prefers an independent reviewer, and fails closed', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   const set = providerEnv(t), table = piModelResolver.defaultModelPerProvider, settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
   const select = async (vars, extra = {}, held) => { set(vars); return selectModels({ ...settings, ...extra }, await createRuntime(dir), held); };
   // Pi's own first choice for the same credentials, as an interactive session without settings would start.
   const piFirst = async vars => { set(vars); const runtime = await createRuntime(dir); await runtime.getAvailable(); const { model } = await piModelResolver.findInitialModel({ scopedModels: [], isContinuing: false, modelRuntime: runtime }); return { provider: model.provider, modelId: model.id }; };
-  const first = choices => ({ provider: choices.executor.provider, modelId: choices.executor.modelId });
   assert.deepEqual(settings, {});
   await assert.rejects(select({}), /no configured model available/);
-  for (const [vars, provider] of [[{ ZAI_API_KEY: 'zai-only' }, 'zai'], [{ MINIMAX_API_KEY: 'minimax-only' }, 'minimax'], [{ DEEPSEEK_API_KEY: 'deepseek-only' }, 'deepseek']]) {
+  // The pinned catalog's cheapest image-capable model per provider; a pi-ai dependency bump can change these ids deliberately.
+  for (const [vars, provider, id] of [[{ ZAI_API_KEY: 'zai-only' }, 'zai', 'glm-5.3-flash'], [{ MINIMAX_API_KEY: 'minimax-only' }, 'minimax', 'MiniMax-M3.1-Flash'], [{ DEEPSEEK_API_KEY: 'deepseek-only' }, 'deepseek', 'deepseek-flash']]) {
     const choices = await select(vars);
-    assert.deepEqual(choices.executor, { provider, modelId: table[provider], thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
-    assert.deepEqual(first(choices), await piFirst(vars));
+    assert.deepEqual(choices.executor, { provider, modelId: id, thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
+    // Pi's own interactive default for the same credentials stays the stale table entry, not the catalog tier.
+    assert.deepEqual(await piFirst(vars), { provider, modelId: table[provider] });
   }
   const both = { ZAI_API_KEY: 'zai', MINIMAX_API_KEY: 'minimax' };
   let choices = await select(both);
-  assert.deepEqual(choices.executor, { provider: 'zai', modelId: table.zai, thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' });
-  assert.deepEqual(first(choices), await piFirst(both));
-  // A Pi enabledModels preference (glob, thinking suffix) leads; the remaining Pi defaults follow as fallbacks.
+  assert.deepEqual(choices.executor, { provider: 'zai', modelId: 'glm-5.3-flash', thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: 'MiniMax-M3.1-Flash', thinkingLevel: 'high' });
+  // Regression: the reviewer used to fall to the deprecated, text-only Pi default MiniMax-M2.7, so visual review lost screenshots.
+  const runtime = await createRuntime(dir);
+  for (const choice of [choices.executor, choices.reviewer]) assert.ok(runtime.getModel(choice.provider, choice.modelId)?.input?.includes('image'));
+  // The stale Pi defaults stay as fallbacks after each provider's catalog tier.
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}`), ['zai/glm-5.3-flash', `zai/${table.zai}`, 'minimax/MiniMax-M3.1-Flash', `minimax/${table.minimax}`]);
+  // A Pi enabledModels preference (glob, thinking suffix) leads; the catalog tier and Pi defaults follow as fallbacks.
   choices = await select(both, { enabledModels: ['minimax/*M3:medium'] });
-  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), [`minimax/MiniMax-M3:medium`, `zai/${table.zai}:high`, `minimax/${table.minimax}:high`]);
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), ['minimax/MiniMax-M3:medium', 'zai/glm-5.3-flash:high', `zai/${table.zai}:high`, 'minimax/MiniMax-M3.1-Flash:high', `minimax/${table.minimax}:high`]);
   assert.equal(choices.reviewer.provider, 'zai');
   choices = await select(both, {}, new Set(['zai']));
-  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax', 'minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
   await assert.rejects(select(both, {}, new Set(['zai', 'minimax'])), /held providers/);
   // Cloudflare is an ordinary provider: unusable without its account companion, a coding candidate with it.
   await assert.rejects(select({ CLOUDFLARE_API_KEY: 'cf' }), /no configured model available/);
   choices = await select({ CLOUDFLARE_API_KEY: 'cf', CLOUDFLARE_ACCOUNT_ID: 'acct' });
-  assert.deepEqual(first(choices), { provider: 'cloudflare-workers-ai', modelId: table['cloudflare-workers-ai'] });
+  assert.equal(choices.executor.provider, 'cloudflare-workers-ai');
+  assert.ok(choices.available.some(choice => choice.modelId === table['cloudflare-workers-ai']));
 });
 test('CI initialization confines runtime paths to runner temp and prepare sets bot identity', t => {
   const f = fixture(t); const envFile = join(f.dir, 'github-env'), agent = join(f.dir, 'agent');
