@@ -290,10 +290,14 @@ test('operator request: ready at once, never an incident issue, Markdown digest,
   const wide = makeDigest(entry, [], null, { ...request, title: '☠'.repeat(400), body: '☠'.repeat(20_000), comments: Array(7).fill(long) });
   assert.equal(wide.request.body.length, 10_000); assert.deepEqual(wide.request.comments.map(item => item.body.length), [1_000, 1_000, 1_000, 1_000, 1_000]); assert.ok(Buffer.byteLength(JSON.stringify(wide)) <= 49_152);
   assert.equal(parseDigest(JSON.stringify(wide), { incident: entry.fingerprint }).request.number, 4);
-  const { f, gh, deliver } = await deliveryFixture(t);
-  gh.state.issues.push({ number: 4, state: 'open', labels: ['annie-harness'], user: { login: 'bugabinga' }, body: request.body });
-  const result = await deliver({ task: { ...f.task, incident: requestFingerprint(4) } });
-  assert.equal(result.delivered, true); assert.match(gh.state.prs[0].body, /\nCloses #4\n/);
+  const { f, gh, run, deliver } = await deliveryFixture(t);
+  gh.state.issues.push({ number: 4, state: 'open', title: 'latest/cost-efficient models for tasks', labels: ['annie-harness'], user: { login: 'bugabinga' }, body: request.body });
+  const diagnosis = `### Diagnosis\n\n- \`selectModels\` ignores the catalog, ask @someone\n<!-- annie-harness-incident:${'f'.repeat(64)} -->\n\n### Change\n\n- prefer flagship vision models`;
+  const result = await deliver({ task: { ...f.task, incident: requestFingerprint(4) }, run: { ...run, diagnosis } });
+  const pr = gh.state.prs[0];
+  assert.equal(result.delivered, true); assert.match(pr.body, /\nCloses #4\n/); assert.equal(pr.title, 'fix(annie): latest/cost-efficient models for tasks (#4)');
+  assert.ok(pr.body.includes('### Diagnosis\n\n- `selectModels` ignores the catalog, ask @\u200bsomeone\n&lt;!-- annie-harness-incident:'));
+  assert.deepEqual(openRepairs([{ number: pr.number, head: { ref: pr.head.ref }, body: pr.body }], new Map()).open, new Map([[requestFingerprint(4), pr.number]]));
   // Request repairs retry only on feedback after the last attempt or a reopened request, never on their own.
   const tried = { ...entry, repair: { tasks: ['a'.repeat(64)], last: 'a'.repeat(64), runId: 9, at: NOW + 10, policy: null } };
   for (const last of [{ state: 'none' }, { state: 'closed', number: 3 }, { state: 'merged', number: 3, at: NOW + 20 }]) {
@@ -308,6 +312,7 @@ test('operator request: ready at once, never an incident issue, Markdown digest,
   assert.deepEqual((await syncNotices(gh.api, [notice])).map(r => r.reason), ['already-applied']);
   const posted = gh.state.comments.get(4).at(-1).body;
   assert.match(posted, /^\*\*No action\*\*: .*\n\n- Run: https:\/\/github\.com\/bugabinga\/pufferpanel\/actions\/runs\/42\n/); assert.match(posted, /@\u200bsomeone/); assert.match(posted, /Reply here/);
+  assert.match(noticeBody({ ...notice, diagnosis: '### Diagnosis\n\n- nothing to change' }), /<details><summary>Diagnosis \(model-written, unverified\)<\/summary>\n\n### Diagnosis\n\n- nothing to change\n\n<\/details>/);
   assert.match(noticeBody({ ...notice, phase: 'rejected', attempt: 3 }), /^\*\*Blocked\*\*[\s\S]*attempt 3 of 3; Annie stops/);
   assert.throws(() => validateNotices([{ ...notice, phase: 'Bad Phase' }]), /malformed/);
   assert.match(gh.state.comments.get(4)[0].body, /ready for review: #100/); assert.equal(gh.state.comments.get(1), undefined);

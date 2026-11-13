@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, harnessBranch, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
 import { authorTrust } from './github.mjs';
+import { excerpt } from './report.mjs';
 import { MAX_REPAIRS, REPAIRABLE, REQUEST, REQUEST_LABEL, detectIncidents, foldIncidents, foldRepair, makeDigest, openRepairs, ready, repairDecision, requestFingerprint, syncNotices, syncIncidents, syncable, validateIncidents } from './incident.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
@@ -603,8 +604,8 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     const selected = record.lease?.task, result = record.settlement, request = selected?.kind === 'harness' ? requests.find(r => requestFingerprint(r.number) === selected.incident) : null;
     if (!request || !result || result.commit || record.run.status !== 'completed' || result.phase === 'publishing' || !(Date.parse(record.reportMeta?.created_at) >= noticeSince) || notices.length >= 5) continue;
     const attempt = (fresh.incidents.find(i => i.fingerprint === selected.incident)?.repair?.tasks.indexOf(selected.fingerprint) ?? -1) + 1;
-    const bounded = value => typeof value === 'string' && value ? value.slice(0, 1500) : null;
-    notices.push({ issue: request.number, runId: record.run.id, task: selected.fingerprint, phase: /^[a-z-]{1,20}$/.test(result.phase ?? '') ? result.phase : 'failed', reason: bounded(result.blocker ?? result.reason), diagnosis: bounded(result.diagnosis), attempt: attempt || null });
+    const bounded = (value, limit) => typeof value === 'string' && value ? excerpt(value, limit) : null;
+    notices.push({ issue: request.number, runId: record.run.id, task: selected.fingerprint, phase: /^[a-z-]{1,20}$/.test(result.phase ?? '') ? result.phase : 'failed', reason: bounded(result.blocker ?? result.reason, 1480), diagnosis: bounded(result.diagnosis, 2980), attempt: attempt || null });
   }
   await output('notices', notices.length ? JSON.stringify(notices) : '');
   const issueWork = syncable(fresh.incidents), repairing = lease && task.kind === 'harness' ? fresh.incidents.find(incident => incident.fingerprint === task.incident) : null;

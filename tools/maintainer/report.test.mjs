@@ -5,7 +5,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { PROVIDER_COMPANIONS, collect, providerEnvNames, providerKeyNames, redact, reportFor } from './report.mjs';
+import { PROVIDER_COMPANIONS, collect, excerpt, inert, providerEnvNames, providerKeyNames, redact, reportFor } from './report.mjs';
+
+test('excerpt ends at a line or sentence boundary, closes a cut code fence, and marks truncation', () => {
+  assert.equal(excerpt('  short  ', 10), 'short');
+  assert.equal(excerpt('first line\nsecond line that is long', 18), 'first line\n\n[truncated]');
+  assert.equal(excerpt('One sentence. Another sentence runs on', 20), 'One sentence.\n\n[truncated]');
+  assert.equal(excerpt('x'.repeat(30), 20), `${'x'.repeat(20)}\n\n[truncated]`); // No boundary in the second half: hard cut.
+  assert.equal(excerpt('intro\n```js\nconst a = 1;\nconst b = 2;\n```\nafter', 30), 'intro\n```js\nconst a = 1;\n```\n\n[truncated]');
+  for (const limit of [1480, 2980]) assert.ok(excerpt(`\`\`\`\n${'y '.repeat(limit)}`, limit).length <= limit + 20);
+});
+test('inert keeps Markdown but neutralises mentions, closing keywords, and HTML', () => {
+  assert.equal(inert('**Fix** `a` in #4, ask @oliver'), '**Fix** `a` in #4, ask @\u200boliver');
+  assert.equal(inert('Closes #12, fixes: #3, Resolved owner/repo#9'), 'Closes #\u200b12, fixes: #\u200b3, Resolved owner/repo#\u200b9');
+  assert.equal(inert('<img src=x> <!-- annie:1 --> a < b </details>'), '&lt;img src=x> &lt;!-- annie:1 --> a < b &lt;/details>');
+});
 
 async function scratch(t) { const dir = await mkdtemp(join(tmpdir(), 'maintainer-report-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
 test('report labels no-op as not released and preserves bounded review diagnostics', () => {

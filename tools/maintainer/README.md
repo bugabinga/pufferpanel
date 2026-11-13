@@ -511,7 +511,9 @@ The same branch only recurs on an effects retry of the same task, which reuses a
 Before any PAT use, delivery looks for another open harness PR for the same incident, by body marker or, for older PRs, by Annie's own "ready for review: #N" announcement on the incident issue.
 If one exists, delivery pushes and opens nothing and comments that the earlier PR still awaits review/merge.
 It never updates the earlier PR's branch: that would change code under Oliver's review, leave its description and review findings stale, and need a force push.
-The PR body links the incident with Refs, not Closes, quotes the model's diagnosis as unverified, and lists review findings, changed files, and gates.
+The PR body links an incident without closing it, or closes an operator request; a request PR is titled after its issue.
+The executor's final answer is the PR description: Markdown with Diagnosis, Change, and Risks headings, kept as written up to 4000 characters, labelled unverified, then review findings, changed files, and gates.
+Model Markdown is cut only at a line or sentence boundary with a `[truncated]` marker and a closed code fence, and `inert` neutralises mentions, closing keywords, and inline HTML, so it cannot ping people, close other issues on merge, embed images, or forge Annie's hidden markers.
 Every outcome is commented on the incident issue: ready for review, ready on the branch but PR creation failed, or could not be delivered with the reason.
 Receipts `harness-branch`, `harness-pr`, and `incident-comment` reach the release report and Actions summary.
 The release report is uploaded only once the outcome is visible as a PR or comment; otherwise the record stays pending for at most three effects attempts and then raises `effects-abandoned`.

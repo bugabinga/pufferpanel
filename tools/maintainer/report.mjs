@@ -28,6 +28,20 @@ export const redactMarkdown = (value, env = process.env) => String(value ?? '').
   .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[redacted private key]')
   .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{16,}\b/gi, 'Bearer [redacted]')
   .split('\n').map(line => redact(line, env, Infinity).trimEnd()).join('\n');
+// Bounded model Markdown ends at the last line or sentence boundary in the second half of the limit, else at the limit,
+// closes a code fence it cut open, and says it was truncated.
+export function excerpt(value, limit) {
+  const whole = String(value ?? '').trim();
+  if (whole.length <= limit) return whole;
+  const head = whole.slice(0, limit), cut = Math.max(head.lastIndexOf('\n'), head.lastIndexOf('. ') + 1);
+  const kept = (cut > limit / 2 ? head.slice(0, cut) : head).trimEnd();
+  return `${kept}${(kept.match(/^\s*(`{3,}|~{3,})/gm) ?? []).length % 2 ? '\n```' : ''}\n\n[truncated]`;
+}
+// Model Markdown posted by the bot keeps its formatting but cannot mention people, close issues on merge, embed HTML
+// (images, details, hidden markers that Annie's own lookups could mistake for hers).
+export const inert = value => String(value ?? '').replace(/@/g, '@\u200b')
+  .replace(/\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:?\s+)([\w.-]+\/[\w.-]+)?#(\d)/gi, '$1$2$3#\u200b$4')
+  .replace(/<(?=[A-Za-z!/?])/g, '&lt;');
 const findings = (value, env) => Array.isArray(value) ? value.slice(0, 20).map(item => redact(item, env).slice(0, 500)).filter(Boolean) : [];
 const safePhase = (value, env = process.env) => typeof value === 'string' && /^[a-z-]{2,32}$/.test(value) && redact(value, env) === value ? value : 'unknown';
 const safeNumber = value => Number.isFinite(value) && value >= 0 ? value : null;
@@ -86,7 +100,7 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     fingerprint: sha(run?.fingerprint, 64, env),
     incident: sha(run?.incident, 64, env),
     // Harness PR body input: the executor's bounded redacted final answer, model-written and unverified.
-    diagnosis: run?.taskKind === 'harness' && run.diagnosis ? redact(run.diagnosis, env).slice(0, 1500) : null,
+    diagnosis: run?.taskKind === 'harness' && run.diagnosis ? excerpt(redactMarkdown(run.diagnosis, env), 4000) : null,
     prNumber: Number.isInteger(run?.prNumber) && run.prNumber > 0 ? run.prNumber : null,
     prHead: sha(run?.prHead, 40, env),
     prAuthor: /^[A-Za-z0-9-]{1,39}$/.test(run?.prAuthor ?? '') && redact(run.prAuthor, env) === run.prAuthor ? run.prAuthor : null,

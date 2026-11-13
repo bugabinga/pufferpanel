@@ -1,7 +1,7 @@
 // Harness self-repair: model-free incident detection over trusted observation, idempotent incident issues, and delivery of a
 // reviewed harness fix as a PR from its own branch. Annie never merges, pushes trunk, or integrates these PRs herself.
 import { createHash } from 'node:crypto';
-import { redact, redactMarkdown, text } from './report.mjs';
+import { excerpt, inert, redact, redactMarkdown, text } from './report.mjs';
 import { git } from './pr.mjs';
 import { HARNESS_BRANCH_PREFIX, OWN, harnessBranch } from './task.mjs';
 import { harnessScope } from './scope.mjs';
@@ -22,6 +22,8 @@ const safe = (value, limit = 200) => redact(value).replace(/[^\x20-\x7e]/g, '?')
 const stable = value => safe(value).replace(/\d+/g, '#'); // Identity text never carries counters, times, or IDs.
 const iso = ms => new Date(ms).toISOString();
 const md = (value, limit) => text(value, limit).replace(/@/g, '@\u200b');
+// One line of model text inside a bullet: whitespace collapsed, Markdown kept, mentions and markers inert.
+const line = (value, limit = 500) => inert(String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, limit));
 const item = (kind, identity, detail, runs = []) => ({ fingerprint: digest({ kind, identity }), kind, detail: safe(detail), runs: [...new Set(runs)].filter(id => Number.isSafeInteger(id) && id > 0).sort((a, b) => b - a) });
 const failed = conclusion => ['failure', 'timed_out', 'startup_failure'].includes(conclusion);
 
@@ -208,14 +210,14 @@ async function awaiting(api, entry, number) {
 
 // Harness attempts on an operator request that end without a PR still answer the request issue, once per attempt.
 export const validateNotices = value => {
-  if (!Array.isArray(value) || value.length > 5 || value.some(n => !n || typeof n !== 'object' || Object.keys(n).sort().join() !== 'attempt,diagnosis,issue,phase,reason,runId,task' || !Number.isSafeInteger(n.issue) || n.issue < 1 || !Number.isSafeInteger(n.runId) || n.runId < 1 || !/^[a-f0-9]{64}$/.test(n.task ?? '') || !/^[a-z-]{1,20}$/.test(n.phase ?? '') || !(n.attempt === null || Number.isSafeInteger(n.attempt) && n.attempt >= 1) || ![n.reason, n.diagnosis].every(v => v === null || typeof v === 'string' && v.length <= 1500))) throw Error('malformed request notices');
+  if (!Array.isArray(value) || value.length > 5 || value.some(n => !n || typeof n !== 'object' || Object.keys(n).sort().join() !== 'attempt,diagnosis,issue,phase,reason,runId,task' || !Number.isSafeInteger(n.issue) || n.issue < 1 || !Number.isSafeInteger(n.runId) || n.runId < 1 || !/^[a-f0-9]{64}$/.test(n.task ?? '') || !/^[a-z-]{1,20}$/.test(n.phase ?? '') || !(n.attempt === null || Number.isSafeInteger(n.attempt) && n.attempt >= 1) || ![[n.reason, 1500], [n.diagnosis, 3000]].every(([v, max]) => v === null || typeof v === 'string' && v.length <= max))) throw Error('malformed request notices');
   return value;
 };
 export function noticeBody(n) {
   const last = n.attempt !== null && n.attempt >= MAX_REPAIRS;
   return [n.phase === 'published' ? '**No action**: Annie looked at this request and changed nothing.' : '**Blocked**: this attempt ended without a PR.', '',
     `- Run: https://github.com/${OWN}/actions/runs/${n.runId}`, `- Outcome: \`${n.phase}\`${n.reason ? `, ${md(n.reason, 200)}` : ''}`,
-    ...(n.diagnosis ? [`- Diagnosis (model-written, unverified): ${md(n.diagnosis, 1500)}`] : []), '',
+    ...(n.diagnosis ? ['', '<details><summary>Diagnosis (model-written, unverified)</summary>', '', inert(n.diagnosis), '', '</details>'] : []), '',
     last ? `That was attempt ${n.attempt} of ${MAX_REPAIRS}; Annie stops trying on this issue.` : `Reply here with corrections or more detail and Annie tries again${n.attempt ? ` (attempt ${n.attempt} of ${MAX_REPAIRS} used)` : ''}.`,
     `<!-- annie-request:${n.task} -->`].join('\n');
 }
@@ -231,12 +233,15 @@ export async function syncNotices(api, notices) {
   }
   return receipts;
 }
+export const isRequest = (task, issue) => Boolean(issue) && requestFingerprint(issue) === task.incident;
+const shortTitle = value => { const whole = line(value, 200); return whole.length <= 60 ? whole : `${whole.slice(0, 60).replace(/\s+\S*$/, '')}\u2026`; };
+export const harnessPullTitle = (task, issue, title) => isRequest(task, issue) && title?.trim() ? `fix(annie): ${shortTitle(title)} (#${issue})` : `fix(annie): harness repair for ${issue ? `#${issue}` : `incident ${task.incident.slice(0, 8)}`}`;
 export function harnessPullBody({ run, task, issue, branch, changed }) {
-  return [`\u2620\ufe0f Annie harness self-repair for ${issue ? `incident #${issue}` : `incident ${task.incident.slice(0, 16)} (issue lookup failed)`}, from \`${branch}\`.`,
-    'Oliver reviews and merges this himself; Annie never merges, pushes trunk, or integrates harness PRs.', '',
-    '### Diagnosis (model-written, unverified)', `> ${md(run.diagnosis ?? 'none recorded', 1500)}`, '',
-    '### Independent review findings', ...(run.findings?.length ? run.findings.slice(0, 20).map(finding => `- ${md(finding)}`) : ['- none blocking or advisory']), '',
-    '### Changed files', ...changed.slice(0, 50).map(name => `- ${md(name)}`), '',
+  return [`\u2620\ufe0f Annie's ${isRequest(task, issue) ? `answer to #${issue}` : issue ? `harness repair for incident #${issue}` : `harness repair for incident ${task.incident.slice(0, 16)} (issue lookup failed)`}, from \`${branch}\`. Only Oliver merges it.`, '',
+    '> [!NOTE]', '> Written by the executor model and unverified; the review findings below are independent.', '',
+    inert(run.diagnosis || '### Diagnosis\n\nnone recorded'), '',
+    '### Review findings', ...(run.findings?.length ? run.findings.slice(0, 20).map(finding => `- ${line(finding)}`) : ['- none blocking or advisory']), '',
+    '### Changed files', ...changed.slice(0, 50).map(name => `- \`${line(name, 200).replace(/`/g, '')}\``), '',
     '### Gates', 'Maintain-side and fresh credential-free release-side harness gates passed: npm ci, npm test, bash -n, workflow YAML parse, actionlint.',
     `Base ${run.base}, tree ${run.tree}, candidate ${run.commit}, task ${task.fingerprint.slice(0, 16)}.`,
     // Merging answers an operator request, so it closes that issue; a reopened request asks again.
@@ -258,7 +263,8 @@ async function openTwin(native, incident, branch, issue) {
 export async function deliverHarness({ source, bundle, run, task, gate, native, pat, hasPat }) {
   const branch = harnessBranch(task.fingerprint), receipts = [], note = (kind, status, extra = {}) => receipts.push({ kind, status, number: null, reason: null, ...extra });
   let pushed = false, pr = null, problem = null, issue = null, twin = null;
-  try { issue = (await incidentIssues(native, true)).get(task.incident)?.number ?? null; } catch (error) { note('incident-lookup', 'failed', { reason: safe(error.message) }); }
+  let issueTitle = null;
+  try { const found = (await incidentIssues(native, true)).get(task.incident); issue = found?.number ?? null; issueTitle = typeof found?.title === 'string' ? found.title : null; } catch (error) { note('incident-lookup', 'failed', { reason: safe(error.message) }); }
   try {
     if (gate !== 'success') throw Error(`fresh harness gate ${/^[a-z_]{1,20}$/.test(gate ?? '') ? gate : 'missing'}`);
     await git(source, 'bundle', 'verify', bundle);
@@ -286,7 +292,7 @@ export async function deliverHarness({ source, bundle, run, task, gate, native, 
     // thus the task fingerprint and branch, so a found PR is this task's own earlier proposal.
     if (open) { pr = open; note('harness-pr', 'skipped', { number: open.number, reason: open.state === 'open' ? 'already-open' : open.merged_at ? 'already-merged' : 'closed-unmerged' }); }
     else {
-      const created = await write(pat, `/repos/${OWN}/pulls`, 'POST', { title: `fix(annie): harness repair for incident ${task.incident.slice(0, 8)}`, head: branch, base: 'trunk', body: harnessPullBody({ run, task, issue, branch, changed }) }).catch(error => { throw Error(`PR creation failed (${safe(error.message, 80)}); check ANNIE_GH_TOKEN Pull requests write`); });
+      const created = await write(pat, `/repos/${OWN}/pulls`, 'POST', { title: harnessPullTitle(task, issue, issueTitle), head: branch, base: 'trunk', body: harnessPullBody({ run, task, issue, branch, changed }) }).catch(error => { throw Error(`PR creation failed (${safe(error.message, 80)}); check ANNIE_GH_TOKEN Pull requests write`); });
       if (!Number.isSafeInteger(created.number)) throw Error('PR creation returned no number');
       pr = created; note('harness-pr', 'applied', { number: created.number });
     }
