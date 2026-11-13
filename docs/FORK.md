@@ -10,7 +10,7 @@ This document records fork-specific technical behavior rather than an upstream c
 The Go module requires Go 1.27.4 in [`go.mod`](../go.mod).
 Swagger generation uses the pinned module tool through `go tool swag` in [`Dockerfile`](../Dockerfile).
 Frontend workspaces use Yarn Classic 1.22.22 as declared in [`client/package.json`](../client/package.json).
-The frontend build stage in [`Dockerfile`](../Dockerfile) pins Node 26.13.0-alpine; the template-tester image keeps Node 26.10.0 from its verified compatibility build.
+The frontend build stage in [`Dockerfile`](../Dockerfile) pins Node 26.13.1-alpine (tag verified on Docker Hub); the template-tester image keeps Node 26.10.0 from its verified compatibility build.
 `yarn clean` in [`client/`](../client/package.json) removes workspace `dist` output and the Vite dependency cache with `rm -rf`; Vite has no `clean` subcommand, and running `vite clean` starts a dev server instead, so that upstream script text is deliberately not used.
 From `client/`, run `yarn workspace frontend update:ace` to regenerate vendored Ace assets.
 [`client/frontend/scripts/update-ace.sh`](../client/frontend/scripts/update-ace.sh) copies only regular non-symlink source files into regular non-symlink existing destination files and fails when an expected source file is absent.
