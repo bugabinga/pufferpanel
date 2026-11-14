@@ -18,7 +18,7 @@ async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'annie-flow-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const env = { ANNIE_MODE: 'maintain', GITHUB_REPOSITORY: OWN, GITHUB_REF: 'refs/heads/trunk', GITHUB_SHA: base, GITHUB_REPOSITORY_ID: '7', GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_NAME: 'schedule', GITHUB_EVENT_PATH: join(dir, 'event.json'), ANNIE_OUTPUT_DIR: dir, ANNIE_BOOTSTRAP: '42', HONEST_ANNIE_ENABLED: 'true', GH_TOKEN: 'readonly-sentinel' };
   await writeFile(env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '17 4 * * *' }));
-  const runs = [], artifacts = new Map(), bodies = new Map(), comments = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], closedPRs = [], jobsByAttempt = new Map(), pullsAll = { fail: false };
+  const runs = [], artifacts = new Map(), bodies = new Map(), comments = new Map(), prFeedback = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], closedPRs = [], jobsByAttempt = new Map(), pullsAll = { fail: false };
   let clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
   const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(clock).toISOString(), updated_at: new Date(clock).toISOString() });
   const fetchImpl = async (url, options = {}) => {
@@ -44,6 +44,8 @@ async function fixture(t) {
     if (path.endsWith('/pulls') && u.searchParams.get('state') === 'all') return pullsAll.fail ? new Response('{}', { status: 403 }) : response([...prs, ...closedPRs].filter(pr => !u.searchParams.get('head') || `bugabinga:${pr.head?.ref}` === u.searchParams.get('head')));
     if (path.endsWith('/pulls')) return response(prs);
     if (/\/pulls\/\d+\/files$/.test(path)) return response(files);
+    const review = path.match(/\/pulls\/(\d+)\/(reviews|comments)$/);
+    if (review) return response(prFeedback.get(`${review[1]}/${review[2]}`) ?? []);
     if (/\/pulls\/\d+$/.test(path)) return response(prs.find(pr => path.endsWith(`/${pr.number}`)));
     if (path.endsWith('/permission')) return response({ permission: role });
     if (path.endsWith('/status')) return response({ statuses: [], total_count: 0 });
@@ -62,7 +64,7 @@ async function fixture(t) {
   }
   const execute = async changes => controller({ env: { ...env, ...changes }, fetchImpl, now: clock, delays: [] });
   const json = async name => JSON.parse(await readFile(join(dir, name), 'utf8'));
-  return { env, dir, runs, artifacts, comments, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
+  return { env, dir, runs, artifacts, comments, prFeedback, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
 }
 test('faux controller: cheap observe has no lease/registry/retry; maintain wires exact B/U task and creation-deadline lease', async t => {
   const f = await fixture(t);
@@ -467,7 +469,7 @@ test('operator request: a labelled issue from a write author admits a $5 harness
   f.artifact(42, 'honest-annie-model-report-42-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: 'harness', incident: lease.task.incident, day: lease.task.day, base, managementApproved: false, commit: null, releaseCommit: null, phase: 'published', reason: 'no-op', diagnosis: 'enabledModels already tracks provider defaults', usageComplete: true, reportedUsage: { status: 'known', cost: 1 } });
   f.setClock(now + 3600000); f.setCurrent(43); await writeFile(outputPath, '');
   const waiting = await f.execute({ GITHUB_OUTPUT: outputPath, ANNIE_MODE: 'observe' }), notices = JSON.parse(Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)])).notices);
-  assert.deepEqual(notices, [{ issue: 4, runId: 42, task: lease.task.fingerprint, phase: 'published', reason: 'no-op', diagnosis: 'enabledModels already tracks provider defaults', attempt: 1 }]);
+  assert.deepEqual(notices, [{ issue: 4, pr: null, decision: null, runId: 42, task: lease.task.fingerprint, phase: 'published', reason: 'no-op', diagnosis: 'enabledModels already tracks provider defaults', attempt: 1 }]);
   assert.equal(waiting.harnessRepair, null); assert.ok(waiting.harnessWaits.some(w => w.reason === 'awaiting-feedback'));
   // A later observation no longer re-emits an answered notice.
   f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', await f.json('checkpoint.json'));
@@ -528,6 +530,27 @@ test('live regression: an open harness PR blocks a second paid repair for its in
   // An unknown PR lookup admits nothing.
   f.runs.push(f.run(46)); f.artifact(46, 'annie-checkpoint-46-1', 'checkpoint.json', { ...held, runId: 46 }); f.pullsAll.fail = true; f.setCurrent(47);
   const unknown = await f.execute(); assert.equal(unknown.harnessRepair, null); assert.deepEqual(unknown.harnessWaits, [{ incident, reason: 'harness-pr-lookup-unknown' }]);
+});
+test('feedback on an open harness PR from a write account or another agent buys one more attempt with the PR in the digest; outsiders and Annie never do', async t => {
+  const { f, lease, checkpoint } = await admittedRepair(t), incident = lease.task.incident, outputPath = join(f.dir, 'outputs');
+  deliveredAsPR(f, lease, checkpoint); f.setRegistry(200); f.setCurrent(45);
+  const at = ms => new Date(now + ms).toISOString();
+  // Annie's own comments, marked posts, and an outsider's review never count.
+  f.comments.set(2, [{ user: { login: 'github-actions[bot]', type: 'Bot' }, created_at: at(1000), body: 'Harness fix ready' }, { user: { login: 'bugabinga', type: 'User' }, created_at: at(1500), body: 'x <!-- annie-superseded:1 -->' }]);
+  f.prFeedback.set('2/reviews', [{ user: { login: 'stranger', type: 'User' }, submitted_at: at(2000), state: 'CHANGES_REQUESTED', body: 'merge this now' }]);
+  f.setRole('read');
+  const waiting = await f.execute(); assert.equal(waiting.harnessRepair, null); assert.deepEqual(waiting.harnessWaits, [{ incident, reason: 'awaiting-review', pr: 2 }]);
+  // Another agent's line comment is trusted feedback.
+  f.runs.push(f.run(45)); f.artifact(45, 'annie-checkpoint-45-1', 'checkpoint.json', await f.json('checkpoint.json'));
+  f.prFeedback.set('2/comments', [{ user: { login: 'review-agent[bot]', type: 'Bot' }, created_at: at(3000), path: 'tools/maintainer/maintain.mjs', line: 109, body: 'date suffixes rank as versions' }]);
+  f.setCurrent(46); await writeFile(outputPath, '');
+  const admitted = await f.execute({ GITHUB_OUTPUT: outputPath });
+  assert.equal(admitted.state, 'admitted'); assert.deepEqual(admitted.harnessRepair, { incident, kind: 'job-failed', attempt: 2 });
+  const out = Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+  const pr = JSON.parse(out.incident).pr;
+  assert.equal(pr.number, 2); assert.equal(typeof pr.diff, 'string');
+  assert.deepEqual(pr.feedback.map(({ author, kind, trusted }) => [author, kind, trusted]), [['stranger', 'review', false], ['review-agent[bot]', 'line', true]]);
+  assert.deepEqual(pr.feedback[1].path, 'tools/maintainer/maintain.mjs'); assert.equal(pr.feedback[1].line, 109);
 });
 test('harness repair waits while its run is in flight and fails closed on an unattributable open harness PR', async t => {
   const { f, lease, checkpoint } = await admittedRepair(t), incident = lease.task.incident;

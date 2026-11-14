@@ -7,7 +7,7 @@ import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, harness
 import { checkPR, protectedPolicy } from './pr.mjs';
 import { authorTrust } from './github.mjs';
 import { excerpt } from './report.mjs';
-import { MAX_REPAIRS, REPAIRABLE, REQUEST, REQUEST_LABEL, detectIncidents, foldIncidents, foldRepair, makeDigest, openRepairs, ready, repairDecision, requestFingerprint, syncNotices, syncIncidents, syncable, validateIncidents } from './incident.mjs';
+import { MAX_REPAIRS, REPAIRABLE, REQUEST, REQUEST_LABEL, detectIncidents, foldIncidents, foldRepair, makeDigest, openRepairs, ready, repairDecision, requestFingerprint, syncNotices, DECISION, syncIncidents, syncable, validateIncidents } from './incident.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
 export const WAKE_PATH = '.github/workflows/annie-pr-wake.yml';
@@ -334,7 +334,18 @@ export async function publicationAvailable(fetchImpl, day) {
   fail('anonymous publication availability unknown');
 }
 // Untrusted repair input fetched read-only by trusted observe: failing jobs/steps, two redacted log tails, sanitized report fields.
-async function harnessDigest(api, incident, records, request = null) {
+// Feedback on an open harness PR: conversation comments, reviews, and line comments by anyone but Annie herself. Write-
+// permission accounts and other apps or agents (bot accounts) are trusted and can buy another attempt; everyone else is
+// context only. Bodies are untrusted data either way.
+export async function prFeedback(api, number, trust) {
+  const [comments, reviews, lines] = await Promise.all([api.pages(`/repos/${OWN}/issues/${number}/comments`), api.pages(`/repos/${OWN}/pulls/${number}/reviews`), api.pages(`/repos/${OWN}/pulls/${number}/comments`)]);
+  const items = [...comments.map(item => ({ item, kind: 'comment', at: item?.created_at })), ...reviews.map(item => ({ item, kind: 'review', at: item?.submitted_at, state: item?.state })), ...lines.map(item => ({ item, kind: 'line', at: item?.created_at, path: item?.path, line: item?.line ?? item?.original_line }))]
+    .filter(({ item, at }) => item?.user?.login && item.user.login !== 'github-actions[bot]' && Number.isFinite(Date.parse(at)) && !String(item.body ?? '').includes('<!-- annie-') && (String(item.body ?? '').trim() || ['CHANGES_REQUESTED', 'APPROVED'].includes(item.state)));
+  const feedback = [];
+  for (const { item, kind, at, state, path, line } of items.sort((a, b) => Date.parse(a.at) - Date.parse(b.at))) feedback.push({ author: item.user.login, kind, at, ...(state ? { state } : {}), ...(path ? { path, line: Number.isSafeInteger(line) ? line : null } : {}), trusted: item.user.type === 'Bot' || await trust(item.user.login), body: String(item.body ?? '') });
+  return { feedback, latest: Math.max(0, ...feedback.filter(entry => entry.trusted).map(entry => Date.parse(entry.at))) };
+}
+async function harnessDigest(api, incident, records, request = null, pr = null) {
   const runs = [], settled = value => ['success', 'skipped', null, undefined].includes(value); let logs = 0;
   for (const runId of incident.runs.slice(0, 3)) {
     try {
@@ -346,7 +357,7 @@ async function harnessDigest(api, incident, records, request = null) {
       runs.push({ runId, jobs });
     } catch (error) { runs.push({ runId, error: error.message }); }
   }
-  return makeDigest(incident, runs, records.find(record => incident.runs.includes(record.run.id) && record.settlement)?.settlement ?? null, request);
+  return makeDigest(incident, runs, records.find(record => incident.runs.includes(record.run.id) && record.settlement)?.settlement ?? null, request, pr);
 }
 const outputs = env => async (name, value) => { if (env.GITHUB_OUTPUT) await writeFile(env.GITHUB_OUTPUT, `${name}=${typeof value === 'string' ? value : JSON.stringify(value)}\n`, { flag: 'a' }); };
 export async function controller({ env = process.env, fetchImpl = fetch, now = Date.now(), delays } = {}) {
@@ -525,9 +536,14 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   const known = new Map([...fresh.incidents.flatMap(incident => (incident.repair?.tasks ?? []).map(fp => [harnessBranch(fp), incident.fingerprint])), ...attempts.map(a => [harnessBranch(a.task), a.incident])]);
   const { open: openPRs, unknown: unattributed } = openRepairs(prs, known);
   for (const incident of fresh.incidents) { delete incident.pr; if (incident.status === 'open' && openPRs.has(incident.fingerprint)) incident.pr = openPRs.get(incident.fingerprint); }
-  let repairs = [], lookupFailed = false; const waits = [];
+  let repairs = [], lookupFailed = false; const waits = [], reviews = new Map(), trusted = new Map();
+  const trust = async login => { if (!trusted.has(login)) trusted.set(login, (await authorTrust(login, { fetchImpl, token: env.GH_TOKEN })).eligible); return trusted.get(login); };
   for (const incident of fresh.incidents.filter(entry => ready(entry) && REPAIRABLE.has(entry.kind))) {
     const running = attempts.some(a => a.incident === incident.fingerprint && a.running), repair = incident.repair;
+    if (incident.pr && !running) {
+      try { reviews.set(incident.fingerprint, await prFeedback(api, incident.pr, trust)); }
+      catch { waits.push({ incident: incident.fingerprint, reason: 'pr-feedback-unknown', pr: incident.pr }); continue; }
+    }
     let last = null;
     if (repair && !running && !incident.pr && repair.tasks.length < MAX_REPAIRS) {
       const branchName = harnessBranch(repair.last);
@@ -538,7 +554,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     }
     const request = incident.kind === REQUEST ? requests.find(r => requestFingerprint(r.number) === incident.fingerprint) : null;
     const evidenceAt = request ? request.activity : Math.max(0, ...incident.runs.map(id => ledger.runs.find(r => r.id === id)).filter(Boolean).map(r => time(r.created_at)));
-    const decision = repairDecision({ entry: incident, running, last, policy, now, evidenceAt });
+    const decision = repairDecision({ entry: incident, running, last, policy, now, evidenceAt, feedbackAt: Math.max(reviews.get(incident.fingerprint)?.latest ?? 0, request?.activity ?? 0) });
     if (decision.admit) repairs.push({ incident: incident.fingerprint, attempt: decision.attempt });
     else waits.push({ incident: incident.fingerprint, reason: decision.reason, ...(decision.pr ? { pr: decision.pr } : {}) });
   }
@@ -602,14 +618,16 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   const notices = [];
   for (const record of ledger.records) {
     const selected = record.lease?.task, result = record.settlement, request = selected?.kind === 'harness' ? requests.find(r => requestFingerprint(r.number) === selected.incident) : null;
-    if (!request || !result || result.commit || record.run.status !== 'completed' || result.phase === 'publishing' || !(Date.parse(record.reportMeta?.created_at) >= noticeSince) || notices.length >= 5) continue;
+    // An attempt over a still-open harness PR answered its feedback, so it replies there.
+    const pr = selected?.kind === 'harness' ? fresh.incidents.find(i => i.fingerprint === selected.incident)?.pr ?? null : null;
+    if (!request && !pr || !result || result.commit || record.run.status !== 'completed' || result.phase === 'publishing' || !(Date.parse(record.reportMeta?.created_at) >= noticeSince) || notices.length >= 5) continue;
     const attempt = (fresh.incidents.find(i => i.fingerprint === selected.incident)?.repair?.tasks.indexOf(selected.fingerprint) ?? -1) + 1;
     const bounded = (value, limit) => typeof value === 'string' && value ? excerpt(value, limit) : null;
-    notices.push({ issue: request.number, runId: record.run.id, task: selected.fingerprint, phase: /^[a-z-]{1,20}$/.test(result.phase ?? '') ? result.phase : 'failed', reason: bounded(result.blocker ?? result.reason, 1480), diagnosis: bounded(result.diagnosis, 2980), attempt: attempt || null });
+    notices.push({ issue: request?.number ?? null, pr, decision: pr ? DECISION.exec(result.diagnosis ?? '')?.[1]?.toLowerCase() ?? null : null, runId: record.run.id, task: selected.fingerprint, phase: /^[a-z-]{1,20}$/.test(result.phase ?? '') ? result.phase : 'failed', reason: bounded(result.blocker ?? result.reason, 1480), diagnosis: bounded(result.diagnosis, 2980), attempt: attempt || null });
   }
   await output('notices', notices.length ? JSON.stringify(notices) : '');
   const issueWork = syncable(fresh.incidents), repairing = lease && task.kind === 'harness' ? fresh.incidents.find(incident => incident.fingerprint === task.incident) : null;
-  await output('incidents', issueWork.length ? JSON.stringify(issueWork) : ''); await output('incident', repairing ? JSON.stringify(await harnessDigest(api, repairing, ledger.records, repairing.kind === REQUEST ? requests.find(r => requestFingerprint(r.number) === repairing.fingerprint) ?? null : null)) : '');
+  await output('incidents', issueWork.length ? JSON.stringify(issueWork) : ''); await output('incident', repairing ? JSON.stringify(await harnessDigest(api, repairing, ledger.records, repairing.kind === REQUEST ? requests.find(r => requestFingerprint(r.number) === repairing.fingerprint) ?? null : null, repairing.pr ? { number: repairing.pr, feedback: reviews.get(repairing.fingerprint)?.feedback ?? [], diff: await api.request(`/repos/${OWN}/pulls/${repairing.pr}`, { headers: { Accept: 'application/vnd.github.diff' } }).then(res => res.text(), error => `diff unavailable: ${error.message}`) } : null)) : '');
   const summary = { state, mode, providerHolds: fresh.providerHolds.map(hold => ({ ...hold, until: new Date(hold.until).toISOString() })), holdsExpireAt, effectsRetry: retry, observationBlockers: ledger.blockers, allowance: ledger.allowance, readyPRs: eligible.length, pendingEffects: pending.map(r => ({ runId: r.run.id, source: r.settlement?.releaseCommit ?? null, blocker: !singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`) ? 'candidate-missing' : singleton(r.artifacts, `honest-annie-candidate-${r.run.id}-1`).expired ? 'candidate-expired' : r.run.run_attempt >= 3 ? 'effects-retry-exhausted' : null })),  supersededEffects: superseded, republish, republishEffects: republishable.map(r => ({ runId: r.record.run.id, source: r.source, version: r.version, attempts: r.entry?.attempts ?? 0 })), heldEffects: held.map(({ runId, source, reason }) => ({ runId, source, reason })), abandonedEffects: abandoned.map(({ runId, source, reason }) => ({ runId, source, reason })), issuesDisabled: repo.has_issues === false, paid: Boolean(lease), bootstrap: !ledger.checkpoint, incidents: fresh.incidents.map(i => ({ fingerprint: i.fingerprint, kind: i.kind, detail: i.detail, count: i.count, status: i.status, ready: ready(i) })), harnessRepair: repairing ? { incident: repairing.fingerprint, kind: repairing.kind, attempt: repairing.repair.tasks.length } : null, harnessWaits: waits };
   await writeFile(join(dir, 'observer.json'), JSON.stringify(summary));
   if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `## ☠️ Annie: ${state}\n\nSurveillance is cheap. Blind spending is how you fund a disaster.\n\nMode: ${mode}; allowance: $${ledger.allowance}; ready PRs: ${eligible.length}; pending effects: ${pending.length}; republish: ${republish ? republish.version : 'none'}; held: ${held.length}; abandoned: ${abandoned.length}; provider holds: ${fresh.providerHolds.map(hold => `${hold.provider} ${hold.reason}`).join(', ') || 'none'}${holdsExpireAt ? `, all providers held until ${holdsExpireAt}` : ''}.\n${abandoned.map(a => `\n- abandoned run ${a.runId} (${a.source?.slice(0, 12) ?? 'no source'}): ${a.reason}`).join('')}\nIncidents: ${fresh.incidents.filter(i => i.status === 'open').length} open, ${fresh.incidents.filter(ready).length} reported${issueWork.length ? ', issue sync requested' : ''}${repairing ? `; harness self-repair attempt ${repairing.repair.tasks.length} admitted for ${repairing.kind} ${repairing.fingerprint.slice(0, 12)}, delivered only as a PR for Oliver` : ''}${waits.length ? `; harness repairs waiting: ${waits.map(w => `${w.incident?.slice(0, 12) ?? 'all'} ${w.reason}${w.pr ? ` #${w.pr}` : ''}`).join(', ')}` : ''}.\n${fresh.incidents.filter(ready).map(i => `\n- incident ${i.kind}: ${i.detail.replace(/[^A-Za-z0-9 :;,.()#/_+-]/g, '_')} (${i.count} observations)`).join('')}\n`, { flag: 'a' });

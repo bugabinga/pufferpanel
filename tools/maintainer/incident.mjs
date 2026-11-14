@@ -92,10 +92,12 @@ export function validateIncidents(value) {
 // without a PR, once trusted policy changed or 24h passed. A policy change alone never retries over an open PR.
 export const MAX_REPAIRS = 3;
 export const harnessIncidentMarker = incident => `<!-- annie-harness-incident:${incident} -->`;
-export function repairDecision({ entry, running = false, last = null, policy, now, evidenceAt = 0 }) {
+export function repairDecision({ entry, running = false, last = null, policy, now, evidenceAt = 0, feedbackAt = 0 }) {
   const repair = entry.repair, attempt = (repair?.tasks.length ?? 0) + 1;
   if (running) return { admit: false, reason: 'in-flight' };
-  if (entry.pr) return { admit: false, reason: 'awaiting-review', pr: entry.pr };
+  // An open harness PR waits for Oliver, unless feedback newer than the last attempt arrived on it (or on the request):
+  // then Annie decides again whether to rework, withdraw, or keep it.
+  if (entry.pr) return !(feedbackAt > (repair?.at ?? Infinity)) ? { admit: false, reason: 'awaiting-review', pr: entry.pr } : repair.tasks.length >= MAX_REPAIRS ? { admit: false, reason: 'attempts-exhausted', pr: entry.pr } : { admit: true, attempt, reason: 'pr-feedback', pr: entry.pr };
   if (!repair) return { admit: true, attempt, reason: 'first' };
   if (repair.tasks.length >= MAX_REPAIRS) return { admit: false, reason: 'attempts-exhausted' };
   if (last?.state === 'open') return { admit: false, reason: 'awaiting-review', pr: last.number };
@@ -131,11 +133,16 @@ export function openRepairs(prs, known) {
 export const logTail = (log, limit = 4000) => String(log ?? '').slice(-4 * limit).split(/\r?\n/).slice(String(log ?? '').length > 4 * limit ? 1 : 0).map(line => redact(line.replace(/^\d{4}-\d{2}-\d{2}T\S+Z /, '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')).trimEnd()).join('\n').slice(-limit);
 const REPORT_KEYS = ['taskKind', 'phase', 'outcome', 'reason', 'blocker', 'sourceRejection', 'modelFailure', 'gateRepair', 'gates', 'sandbox', 'reviewDiagnostics', 'executorDiagnostics', 'findings'];
 const clean = node => typeof node === 'string' ? redact(node).slice(0, 500) : Array.isArray(node) ? node.slice(0, 20).map(clean) : node && typeof node === 'object' ? Object.fromEntries(Object.entries(node).slice(0, 30).map(([key, value]) => [safe(key, 64), clean(value)])) : ['number', 'boolean'].includes(typeof node) ? node : null;
-export function makeDigest(entry, runs = [], report = null, request = null) {
+export function makeDigest(entry, runs = [], report = null, request = null, pr = null) {
   const value = { incident: entry.fingerprint, kind: entry.kind, detail: entry.detail, ...(request ? { request: { number: request.number, url: `https://github.com/${OWN}/issues/${request.number}`, title: safe(request.title, 300), body: redactMarkdown(request.body ?? '').slice(0, 10_000), comments: (request.comments ?? []).slice(-5).map(item => ({ author: safe(item.author, 39), at: safe(item.at, 32), body: redactMarkdown(item.body ?? '').slice(0, 1_000) })) } } : {}), firstSeen: iso(entry.firstSeen), count: entry.count, runs: runs.slice(0, 3).map(run => ({ runId: run.runId, url: `https://github.com/${OWN}/actions/runs/${run.runId}`, ...(run.error ? { error: safe(run.error) } : {}), jobs: (run.jobs ?? []).slice(0, 10).map(job => ({ name: safe(job.name), conclusion: safe(job.conclusion, 32), steps: (job.steps ?? []).slice(0, 20).map(step => ({ name: safe(step.name), conclusion: safe(step.conclusion, 32) })), ...(typeof job.log === 'string' ? { log: logTail(job.log) } : {}) })) })), report: report ? clean(Object.fromEntries(REPORT_KEYS.filter(key => key in report).map(key => [key, report[key]]))) : null };
   if (JSON.stringify(value).length > 49_152) for (const run of value.runs) for (const job of run.jobs) delete job.log;
   if (JSON.stringify(value).length > 49_152) value.runs = [];
   if (JSON.stringify(value).length > 49_152) value.report = null;
+  // The open harness PR under feedback: its diff (the previous candidate) and the feedback, untrusted data with authors.
+  if (pr) value.pr = { number: pr.number, url: `https://github.com/${OWN}/pull/${pr.number}`, diff: redactMarkdown(pr.diff ?? '').slice(0, 16_000), feedback: (pr.feedback ?? []).slice(-12).map(item => ({ author: safe(item.author, 60), kind: safe(item.kind, 20), trusted: item.trusted === true, at: safe(item.at, 32), ...(item.path ? { path: safe(item.path, 200), line: Number.isSafeInteger(item.line) ? item.line : null } : {}), ...(item.state ? { state: safe(item.state, 20) } : {}), body: redactMarkdown(item.body ?? '').slice(0, 1_500) })) };
+  // parseDigest bounds bytes: shrink the bulkiest untrusted text first until the whole digest fits.
+  const fits = () => Buffer.byteLength(JSON.stringify(value)) <= 49_152;
+  for (const cut of [() => value.pr && (value.pr.diff = value.pr.diff.slice(0, Math.floor(value.pr.diff.length / 2))), () => value.pr?.feedback.length && value.pr.feedback.shift(), () => value.request && (value.request.body = value.request.body.slice(0, Math.floor(value.request.body.length / 2))), () => value.request?.comments.length && value.request.comments.shift()]) for (let i = 0; i < 12 && !fits(); i++) cut();
   return value;
 }
 export function parseDigest(value, task) {
@@ -208,36 +215,50 @@ async function awaiting(api, entry, number) {
   return receipt;
 }
 
-// Harness attempts on an operator request that end without a PR still answer the request issue, once per attempt.
+// Harness attempts that end without a new PR still answer, once per attempt: on the open harness PR whose feedback they
+// answered, else on the request issue. A withdraw decision also closes that PR.
+const issueRef = value => value === null || Number.isSafeInteger(value) && value >= 1;
+export const DECISION = /^\s*(?:#+\s*)?\**Decision:?\**:?\s*\**(withdraw|keep)\b/im;
 export const validateNotices = value => {
-  if (!Array.isArray(value) || value.length > 5 || value.some(n => !n || typeof n !== 'object' || Object.keys(n).sort().join() !== 'attempt,diagnosis,issue,phase,reason,runId,task' || !Number.isSafeInteger(n.issue) || n.issue < 1 || !Number.isSafeInteger(n.runId) || n.runId < 1 || !/^[a-f0-9]{64}$/.test(n.task ?? '') || !/^[a-z-]{1,20}$/.test(n.phase ?? '') || !(n.attempt === null || Number.isSafeInteger(n.attempt) && n.attempt >= 1) || ![[n.reason, 1500], [n.diagnosis, 3000]].every(([v, max]) => v === null || typeof v === 'string' && v.length <= max))) throw Error('malformed request notices');
+  if (!Array.isArray(value) || value.length > 5 || value.some(n => !n || typeof n !== 'object' || Object.keys(n).sort().join() !== 'attempt,decision,diagnosis,issue,phase,pr,reason,runId,task' || !issueRef(n.issue) || !issueRef(n.pr) || n.issue === null && n.pr === null || ![null, 'withdraw', 'keep'].includes(n.decision) || n.decision && n.pr === null || !Number.isSafeInteger(n.runId) || n.runId < 1 || !/^[a-f0-9]{64}$/.test(n.task ?? '') || !/^[a-z-]{1,20}$/.test(n.phase ?? '') || !(n.attempt === null || Number.isSafeInteger(n.attempt) && n.attempt >= 1) || ![[n.reason, 1500], [n.diagnosis, 3000]].every(([v, max]) => v === null || typeof v === 'string' && v.length <= max))) throw Error('malformed request notices');
   return value;
 };
 export function noticeBody(n) {
   const last = n.attempt !== null && n.attempt >= MAX_REPAIRS;
-  return [n.phase === 'published' ? '**No action**: Annie looked at this request and changed nothing.' : '**Blocked**: this attempt ended without a PR.', '',
-    `- Run: https://github.com/${OWN}/actions/runs/${n.runId}`, `- Outcome: \`${n.phase}\`${n.reason ? `, ${md(n.reason, 200)}` : ''}`,
-    ...(n.diagnosis ? ['', '<details><summary>Diagnosis (model-written, unverified)</summary>', '', inert(n.diagnosis), '', '</details>'] : []), '',
-    last ? `That was attempt ${n.attempt} of ${MAX_REPAIRS}; Annie stops trying on this issue.` : `Reply here with corrections or more detail and Annie tries again${n.attempt ? ` (attempt ${n.attempt} of ${MAX_REPAIRS} used)` : ''}.`,
+  const head = n.decision === 'withdraw' ? '**Withdrawn**: Annie read the feedback and closes this PR.' : n.decision === 'keep' ? '**Keeping this PR**: Annie read the feedback and stands by the change.' : n.phase === 'published' ? `**No action**: Annie looked at this ${n.pr ? 'feedback' : 'request'} and changed nothing.` : '**Blocked**: this attempt ended without a PR.';
+  // An answer to feedback is the point of the comment, so it stays visible; other diagnoses fold away.
+  const answer = !n.diagnosis ? [] : n.decision ? ['', inert(n.diagnosis)] : ['', '<details><summary>Diagnosis (model-written, unverified)</summary>', '', inert(n.diagnosis), '', '</details>'];
+  return [head, '', `- Run: https://github.com/${OWN}/actions/runs/${n.runId}`, `- Outcome: \`${n.phase}\`${n.reason ? `, ${md(n.reason, 200)}` : ''}`, ...answer, '',
+    n.decision === 'withdraw' ? '' : last ? `That was attempt ${n.attempt} of ${MAX_REPAIRS}; Annie stops trying here.` : `Reply here with corrections or more detail and Annie tries again${n.attempt ? ` (attempt ${n.attempt} of ${MAX_REPAIRS} used)` : ''}.`,
     `<!-- annie-request:${n.task} -->`].join('\n');
 }
 export async function syncNotices(api, notices) {
   const receipts = [];
   for (const n of validateNotices(notices)) {
-    const receipt = { kind: 'request-notice', fingerprint: n.task.slice(0, 16), number: n.issue, status: 'failed', reason: null };
+    const target = n.pr ?? n.issue, receipt = { kind: 'request-notice', fingerprint: n.task.slice(0, 16), number: target, status: 'failed', reason: null };
     try {
-      if ((await api.pages(`/repos/${OWN}/issues/${n.issue}/comments`)).some(item => typeof item?.body === 'string' && item.body.includes(`<!-- annie-request:${n.task} -->`))) Object.assign(receipt, { status: 'skipped', reason: 'already-applied' });
-      else { await comment(api, n.issue, noticeBody(n)); Object.assign(receipt, { status: 'applied' }); }
+      if ((await api.pages(`/repos/${OWN}/issues/${target}/comments`)).some(item => typeof item?.body === 'string' && item.body.includes(`<!-- annie-request:${n.task} -->`))) Object.assign(receipt, { status: 'skipped', reason: 'already-applied' });
+      else { await comment(api, target, noticeBody(n)); Object.assign(receipt, { status: 'applied' }); }
     } catch (error) { receipt.reason = safe(error.message); }
     receipts.push(receipt);
+    if (n.decision !== 'withdraw' || receipt.status === 'failed') continue;
+    // Only Annie's own open harness PR from this repository is ever closed.
+    const close = { kind: 'harness-withdraw', fingerprint: n.task.slice(0, 16), number: n.pr, status: 'failed', reason: null };
+    try {
+      const pr = await api.get(`/repos/${OWN}/pulls/${n.pr}`);
+      if (!String(pr?.head?.ref ?? '').startsWith(HARNESS_BRANCH_PREFIX) || pr.head?.repo?.full_name !== OWN) throw Error('not an Annie harness PR');
+      if (pr.state !== 'open') Object.assign(close, { status: 'skipped', reason: 'already-closed' });
+      else { await write(api, `/repos/${OWN}/pulls/${n.pr}`, 'PATCH', { state: 'closed' }); Object.assign(close, { status: 'applied' }); }
+    } catch (error) { close.reason = safe(error.message); }
+    receipts.push(close);
   }
   return receipts;
 }
 export const isRequest = (task, issue) => Boolean(issue) && requestFingerprint(issue) === task.incident;
 const shortTitle = value => { const whole = line(value, 200); return whole.length <= 60 ? whole : `${whole.slice(0, 60).replace(/\s+\S*$/, '')}\u2026`; };
 export const harnessPullTitle = (task, issue, title) => isRequest(task, issue) && title?.trim() ? `fix(annie): ${shortTitle(title)} (#${issue})` : `fix(annie): harness repair for ${issue ? `#${issue}` : `incident ${task.incident.slice(0, 8)}`}`;
-export function harnessPullBody({ run, task, issue, branch, changed }) {
-  return [`\u2620\ufe0f Annie's ${isRequest(task, issue) ? `answer to #${issue}` : issue ? `harness repair for incident #${issue}` : `harness repair for incident ${task.incident.slice(0, 16)} (issue lookup failed)`}, from \`${branch}\`. Only Oliver merges it.`, '',
+export function harnessPullBody({ run, task, issue, branch, changed, supersedes = null }) {
+  return [`\u2620\ufe0f Annie's ${isRequest(task, issue) ? `answer to #${issue}` : issue ? `harness repair for incident #${issue}` : `harness repair for incident ${task.incident.slice(0, 16)} (issue lookup failed)`}, from \`${branch}\`${supersedes ? `, superseding #${supersedes} after its feedback` : ''}. Only Oliver merges it.`, '',
     '> [!NOTE]', '> Written by the executor model and unverified; the review findings below are independent.', '',
     inert(run.diagnosis || '### Diagnosis\n\nnone recorded'), '',
     '### Review findings', ...(run.findings?.length ? run.findings.slice(0, 20).map(finding => `- ${line(finding)}`) : ['- none blocking or advisory']), '',
@@ -276,9 +297,9 @@ export async function deliverHarness({ source, bundle, run, task, gate, native, 
     // The shared scope rule again, before any PAT use: a PR's own workflows would run with write tokens on open.
     const scope = await harnessScope(source, run.base, commit);
     if (scope) throw Error(scope);
-    // One open proposal per incident: an earlier open PR stays untouched, so nothing new is pushed or opened.
+    // One open proposal per incident: admission only runs another attempt over an open PR on newer feedback, so a new
+    // candidate supersedes that PR. Its branch is never rewritten under review; the old PR closes after the new one opens.
     twin = await openTwin(native, task.incident, branch, issue);
-    if (twin) { note('harness-pr', 'skipped', { number: twin, reason: 'awaiting-earlier-pr' }); throw Error(`#${twin} for this incident still awaits review/merge`); }
     if (!hasPat) throw Error('ANNIE_GH_TOKEN missing in honest-annie-release');
     const auth = ['-c', 'credential.helper=', '-c', 'credential.helper=!f() { printf "username=x-access-token\\npassword=%s\\n" "$ANNIE_GH_TOKEN"; }; f'];
     const ref = `refs/heads/${branch}`, remote = async () => (await git(source, ...auth, 'ls-remote', 'origin', ref)).split(/\s/)[0];
@@ -292,13 +313,20 @@ export async function deliverHarness({ source, bundle, run, task, gate, native, 
     // thus the task fingerprint and branch, so a found PR is this task's own earlier proposal.
     if (open) { pr = open; note('harness-pr', 'skipped', { number: open.number, reason: open.state === 'open' ? 'already-open' : open.merged_at ? 'already-merged' : 'closed-unmerged' }); }
     else {
-      const created = await write(pat, `/repos/${OWN}/pulls`, 'POST', { title: harnessPullTitle(task, issue, issueTitle), head: branch, base: 'trunk', body: harnessPullBody({ run, task, issue, branch, changed }) }).catch(error => { throw Error(`PR creation failed (${safe(error.message, 80)}); check ANNIE_GH_TOKEN Pull requests write`); });
+      const created = await write(pat, `/repos/${OWN}/pulls`, 'POST', { title: harnessPullTitle(task, issue, issueTitle), head: branch, base: 'trunk', body: harnessPullBody({ run, task, issue, branch, changed, supersedes: twin }) }).catch(error => { throw Error(`PR creation failed (${safe(error.message, 80)}); check ANNIE_GH_TOKEN Pull requests write`); });
       if (!Number.isSafeInteger(created.number)) throw Error('PR creation returned no number');
       pr = created; note('harness-pr', 'applied', { number: created.number });
     }
-  } catch (error) { problem = safe(error.message); if (!twin) note(pushed ? 'harness-pr' : 'harness-branch', 'failed', { reason: problem }); }
-  const message = twin ? `Harness fix from \`${branch}\` not delivered: #${twin} for this incident still awaits review/merge, and Annie leaves it unchanged.` : pr?.state === 'closed' ? (pr.merged_at ? `Harness fix from \`${branch}\` was already merged as #${pr.number}.` : `Harness fix from \`${branch}\` was proposed as #${pr.number}, which was closed unmerged; Annie will not reopen it.`) : pr ? `Harness fix ready for review: #${pr.number} from \`${branch}\`. Only Oliver merges it.` : pushed ? `Harness fix ready on branch \`${branch}\` but PR creation failed: ${md(problem)}` : `Harness fix could not be delivered: ${md(problem)}`;
-  const key = `<!-- annie-delivery:${digest({ task: task.fingerprint, message })} -->`;
+  } catch (error) { problem = safe(error.message); note(pushed ? 'harness-pr' : 'harness-branch', 'failed', { reason: problem }); }
+  if (twin && pr?.state === 'open' && pr.number !== twin) try {
+    const marker = `<!-- annie-superseded:${task.fingerprint} -->`;
+    if (!(await native.pages(`/repos/${OWN}/issues/${twin}/comments`)).some(item => typeof item?.body === 'string' && item.body.includes(marker))) await comment(pat, twin, `\u2620\ufe0f Superseded by #${pr.number}, which answers the feedback here.\n${marker}`);
+    await write(pat, `/repos/${OWN}/pulls/${twin}`, 'PATCH', { state: 'closed' });
+    note('harness-supersede', 'applied', { number: twin });
+  } catch (error) { note('harness-supersede', 'failed', { number: twin, reason: safe(error.message) }); }
+  const message = pr?.state === 'closed' ? (pr.merged_at ? `Harness fix from \`${branch}\` was already merged as #${pr.number}.` : `Harness fix from \`${branch}\` was proposed as #${pr.number}, which was closed unmerged; Annie will not reopen it.`) : pr ? `Harness fix ready for review: #${pr.number} from \`${branch}\`${twin && pr.number !== twin ? `, superseding #${twin}` : ''}. Only Oliver merges it.` : pushed ? `Harness fix ready on branch \`${branch}\` but PR creation failed: ${md(problem)}` : `Harness fix could not be delivered: ${md(problem)}`;
+  // A retry after the superseded PR closed says the same thing without naming it again.
+  const key = `<!-- annie-delivery:${digest({ task: task.fingerprint, message: message.replace(/, superseding #\d+/, '') })} -->`;
   let told = false;
   if (!issue) note('incident-comment', 'failed', { reason: 'incident issue not found' });
   else try {

@@ -12,7 +12,7 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, createHostHooks, ensureWorktree, guardFor, installReviewer, ModelCodemode, ModelCodingTools, snapshot } from './maintain.mjs';
 import { HARNESS_CAP, validateTask } from './task.mjs';
-import { MAX_REPAIRS, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, requestFingerprint, noticeBody, syncIncidents, syncNotices, syncable, validateIncidents, validateNotices } from './incident.mjs';
+import { MAX_REPAIRS, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, requestFingerprint, DECISION, noticeBody, syncIncidents, syncNotices, syncable, validateIncidents, validateNotices } from './incident.mjs';
 import { GitHub, digest as sha256, makeLease, verifyLease, POLICY_PATH } from './controller.mjs';
 import { checkPR } from './pr.mjs';
 import { HARNESS_PATHS, harnessScope, harnessScopeViolation } from './scope.mjs';
@@ -197,6 +197,8 @@ function fakeGitHub({ prStatus = 201, issues = [] } = {}) {
     if (path === '/labels/annie-incident') return state.labels.has('annie-incident') ? json({}) : json({}, 404);
     if (path === '/labels') { state.labels.add(body.name); return json(body, 201); }
     if (path === '/pulls' && method === 'GET') return json(state.prs.filter(pr => (!searchParams.get('head') || `bugabinga:${pr.head.ref}` === searchParams.get('head')) && (searchParams.get('state') === 'all' || pr.state === 'open')));
+    const pull = path.match(/^\/pulls\/(\d+)$/);
+    if (pull) { const found = state.prs.find(pr => pr.number === Number(pull[1])); if (!found) return json({}, 404); if (method === 'PATCH') Object.assign(found, body); return json(found); }
     if (path === '/pulls' && method === 'POST') { if (prStatus !== 201) return json({ message: 'Resource not accessible by personal access token' }, prStatus); const pr = { ...body, number: 100 + state.prs.length, state: 'open', head: { ref: body.head } }; state.prs.push(pr); return json(pr, 201); }
     throw Error('unexpected fake GitHub request ' + method + ' ' + path);
   };
@@ -312,7 +314,7 @@ test('operator request: ready at once, never an incident issue, Markdown digest,
   }
   assert.equal(repairDecision({ entry: { ...tried, repair: { ...tried.repair, tasks: ['a', 'b', 'c'].map(c => c.repeat(64)) } }, last: { state: 'none' }, policy: 'p', now: NOW + 100, evidenceAt: NOW + 11 }).reason, 'attempts-exhausted');
   // A PR-less attempt answers the request issue once, in GitHub Markdown.
-  const notice = { issue: 4, runId: 42, task: 'a'.repeat(64), phase: 'published', reason: 'no-op', diagnosis: 'defaults already track @someone', attempt: 1 };
+  const notice = { issue: 4, pr: null, decision: null, runId: 42, task: 'a'.repeat(64), phase: 'published', reason: 'no-op', diagnosis: 'defaults already track @someone', attempt: 1 };
   assert.deepEqual((await syncNotices(gh.api, [notice])).map(r => r.status), ['applied']);
   assert.deepEqual((await syncNotices(gh.api, [notice])).map(r => r.reason), ['already-applied']);
   const posted = gh.state.comments.get(4).at(-1).body;
@@ -320,6 +322,27 @@ test('operator request: ready at once, never an incident issue, Markdown digest,
   assert.match(noticeBody({ ...notice, diagnosis: '### Diagnosis\n\n- nothing to change' }), /<details><summary>Diagnosis \(model-written, unverified\)<\/summary>\n\n### Diagnosis\n\n- nothing to change\n\n<\/details>/);
   assert.match(noticeBody({ ...notice, phase: 'rejected', attempt: 3 }), /^\*\*Blocked\*\*[\s\S]*attempt 3 of 3; Annie stops/);
   assert.throws(() => validateNotices([{ ...notice, phase: 'Bad Phase' }]), /malformed/);
+  for (const bad of [{ issue: null }, { decision: 'keep' }, { pr: 0 }, { decision: 'merge', pr: 6 }]) assert.throws(() => validateNotices([{ ...notice, ...bad }]), /malformed/);
+  // Answers to PR feedback go to the PR: keep replies visibly, withdraw also closes Annie's own harness PR, never another.
+  gh.state.prs.push({ number: 6, state: 'open', head: { ref: 'annie/harness/670d104b400d', repo: { full_name: 'bugabinga/pufferpanel' } }, body: '' }, { number: 7, state: 'open', head: { ref: 'feature', repo: { full_name: 'bugabinga/pufferpanel' } }, body: '' });
+  const keep = { ...notice, task: 'b'.repeat(64), pr: 6, decision: 'keep', diagnosis: 'Decision: keep\n\n- the executor needs images for snapshots' };
+  assert.deepEqual((await syncNotices(gh.api, [keep])).map(r => [r.kind, r.status, r.number]), [['request-notice', 'applied', 6]]);
+  assert.match(gh.state.comments.get(6)[0].body, /^\*\*Keeping this PR\*\*[\s\S]*\n\nDecision: keep\n\n- the executor needs images/); assert.equal(gh.state.prs.find(pr => pr.number === 6).state, 'open');
+  const withdraw = { ...notice, task: 'c'.repeat(64), pr: 6, decision: 'withdraw', diagnosis: 'Decision: withdraw\n\nThe feedback is right.' };
+  assert.deepEqual((await syncNotices(gh.api, [withdraw])).map(r => [r.kind, r.status]), [['request-notice', 'applied'], ['harness-withdraw', 'applied']]);
+  assert.equal(gh.state.prs.find(pr => pr.number === 6).state, 'closed'); assert.match(gh.state.comments.get(6).at(-1).body, /^\*\*Withdrawn\*\*/);
+  assert.deepEqual((await syncNotices(gh.api, [{ ...withdraw, task: 'd'.repeat(64), pr: 7 }])).map(r => [r.kind, r.status, r.reason]), [['request-notice', 'applied', null], ['harness-withdraw', 'failed', 'not an Annie harness PR']]);
+  assert.equal(gh.state.prs.find(pr => pr.number === 7).state, 'open');
+  for (const [text, decision] of [['Decision: withdraw', 'withdraw'], ['### Decision: keep', 'keep'], ['**Decision:** Keep', 'Keep'], ['I decided to keep it', undefined]]) assert.equal(DECISION.exec(text)?.[1], decision, text);
+  // Open PR feedback newer than the last attempt admits one more attempt; older feedback or a spent allowance does not.
+  const open = { ...tried, pr: 6 };
+  assert.deepEqual(repairDecision({ entry: open, policy: 'p', now: NOW + 100, feedbackAt: NOW + 11 }), { admit: true, attempt: 2, reason: 'pr-feedback', pr: 6 });
+  assert.equal(repairDecision({ entry: open, policy: 'p', now: NOW + 100, feedbackAt: NOW + 5 }).reason, 'awaiting-review');
+  assert.equal(repairDecision({ entry: { ...open, repair: { ...open.repair, tasks: ['a', 'b', 'c'].map(c => c.repeat(64)) } }, policy: 'p', now: NOW + 100, feedbackAt: NOW + 11 }).reason, 'attempts-exhausted');
+  assert.equal(repairDecision({ entry: { ...open, repair: undefined }, policy: 'p', now: NOW + 100, feedbackAt: NOW + 11 }).reason, 'awaiting-review');
+  // The PR digest stays inside parseDigest's byte bound with a huge diff and many long comments.
+  const big = makeDigest(entry, [], null, request, { number: 6, diff: '\u2620'.repeat(40_000), feedback: Array(30).fill({ author: 'x', kind: 'comment', trusted: true, at: 'now', body: '\u2620'.repeat(5_000) }) });
+  assert.ok(Buffer.byteLength(JSON.stringify(big)) <= 49_152); assert.ok(big.pr.feedback.length >= 1 && big.pr.diff.length > 0);
   assert.match(gh.state.comments.get(4)[0].body, /ready for review: #100/); assert.equal(gh.state.comments.get(1), undefined);
 });
 test('delivery without ANNIE_GH_TOKEN pushes nothing and says so on the incident', async t => {
@@ -440,22 +463,27 @@ test('incident issue says awaiting review/merge of #N exactly once per PR', asyn
   await syncIncidents(gh.api, state.map(({ pr, ...entry }) => entry)); assert.equal(gh.state.comments.get(1).length, 2);
 });
 
-test('a second delivery for an incident with an open harness PR comments instead of pushing or opening another', async t => {
+test('a candidate delivered over an open harness PR for its incident supersedes and closes it, never rewriting its branch', async t => {
   for (const legacy of [false, true]) {
-    const { gh, deliver, branchAt } = await deliveryFixture(t);
+    const { gh, commit, deliver, branchAt } = await deliveryFixture(t);
     // Attempt 1's PR #50 is open: by its body marker, or for an older PR by Annie's delivery comment naming it.
     gh.state.prs.push({ number: 50, state: 'open', head: { ref: 'annie/harness/10fe087581c4' }, body: legacy ? 'older body' : `x\n${harnessIncidentMarker(INCIDENT)}` });
     if (legacy) gh.state.comments.set(1, [{ body: 'Harness fix ready for review: #50 from `annie/harness/10fe087581c4`.\n<!-- annie-delivery:abc -->', user: { login: 'github-actions[bot]' } }]);
     const result = await deliver();
-    assert.equal(result.delivered, false); assert.equal(result.communicated, true); assert.throws(branchAt);
-    assert.equal(gh.state.prs.length, 1);
-    assert.deepEqual(result.receipts.map(r => [r.kind, r.status, r.reason]), [['harness-pr', 'skipped', 'awaiting-earlier-pr'], ['incident-comment', 'applied', null]]);
-    assert.match(gh.state.comments.get(1).at(-1).body, /not delivered: #50 for this incident still awaits review\/merge/);
-    assert.equal((await deliver()).receipts.at(-1).reason, 'already-applied');
-    // Annie's own not-delivered comments never become attribution evidence, and a PR marked for another incident never blocks.
-    gh.state.prs[0].body = harnessIncidentMarker('e'.repeat(64));
-    assert.equal((await deliver()).delivered, true);
+    assert.equal(result.delivered, true); assert.equal(branchAt(), commit);
+    assert.deepEqual(result.receipts.map(r => [r.kind, r.status, r.number]), [['harness-branch', 'applied', null], ['harness-pr', 'applied', 101], ['harness-supersede', 'applied', 50], ['incident-comment', 'applied', 1]]);
+    assert.equal(gh.state.prs[0].state, 'closed'); assert.equal(gh.state.prs[0].head.ref, 'annie/harness/10fe087581c4');
+    assert.match(gh.state.prs[1].body, /superseding #50 after its feedback/); assert.match(gh.state.comments.get(50)[0].body, /^\u2620\ufe0f Superseded by #101/);
+    assert.match(gh.state.comments.get(1).at(-1).body, /ready for review: #101 from `annie\/harness\/eeeeeeeeeeee`, superseding #50/);
+    // A retry finds its own PR open and the old one closed: nothing new is pushed, opened, or closed.
+    const again = await deliver();
+    assert.deepEqual(again.receipts.map(r => [r.kind, r.status, r.reason]), [['harness-branch', 'skipped', 'already-pushed'], ['harness-pr', 'skipped', 'already-open'], ['incident-comment', 'skipped', 'already-applied']]);
+    assert.equal(gh.state.prs.length, 2); assert.equal(gh.state.comments.get(50).length, 1);
   }
+  // A PR marked for another incident is never touched.
+  const { gh, deliver } = await deliveryFixture(t);
+  gh.state.prs.push({ number: 50, state: 'open', head: { ref: 'annie/harness/10fe087581c4' }, body: harnessIncidentMarker('e'.repeat(64)) });
+  assert.equal((await deliver()).delivered, true); assert.equal(gh.state.prs[0].state, 'open');
 });
 
 test('PR files screen fails closed on a full page or a continuation instead of screening only page one', async () => {

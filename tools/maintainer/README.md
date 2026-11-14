@@ -481,7 +481,7 @@ Each checkpoint incident keeps `repair` memory `{tasks, last, runId, at, policy}
 Open PRs come from the complete open-PR list; an `annie/harness/` PR is attributed by its `annie-harness-incident` body marker or by a known attempt branch, and fork heads are ignored.
 An open harness PR that cannot be attributed, or an unknown lookup of the last attempt's PR, admits no harness repair at all.
 This covers the live PR #2, whose body predates the marker, only while its run is in the ledger or `repair` memory; otherwise every repair waits until Oliver closes or merges it.
-No repair starts while an attempt for the incident is in flight or awaits review in an open PR; a trusted policy change alone never retries.
+No repair starts while an attempt for the incident is in flight, or while its open PR awaits review without newer trusted feedback (see Feedback on harness PRs); a trusted policy change alone never retries.
 Another attempt needs (a) the last PR closed unmerged with the incident still present, (b) the last PR merged and either evidence from a run created after the merge or a recurrence after clearing, or (c) no PR from the last attempt and either a different admission policy or 24h, with an unknown admission policy waiting 24h.
 Kinds whose evidence never moves, such as an abandoned run, therefore never retry after a merge.
 At most three attempts are made per incident.
@@ -509,8 +509,19 @@ Job `harness-deliver` holds `ANNIE_GH_TOKEN` and runs no candidate code; it is n
 It checks the bundle by Git plumbing (commit C, parents `[B]`, tree T) and the scope rule before any PAT use, pushes C without force to `annie/harness/` plus the first 12 hex of the task fingerprint, and opens a PR against trunk.
 The same branch only recurs on an effects retry of the same task, which reuses an existing branch or PR and distinguishes open, merged, and closed-unmerged.
 Before any PAT use, delivery looks for another open harness PR for the same incident, by body marker or, for older PRs, by Annie's own "ready for review: #N" announcement on the incident issue.
-If one exists, delivery pushes and opens nothing and comments that the earlier PR still awaits review/merge.
+If one exists, the new candidate supersedes it: delivery opens the new PR, then comments "Superseded by #N" on the earlier one and closes it, because admission only runs another attempt over an open PR after newer feedback.
 It never updates the earlier PR's branch: that would change code under Oliver's review, leave its description and review findings stale, and need a force push.
+
+### Feedback on harness PRs
+
+Annie answers feedback on her open harness PRs: conversation comments, reviews, and line comments, read with complete pagination on every observation.
+Her own comments (`github-actions[bot]`) and any post carrying an `<!-- annie-` marker are ignored.
+Feedback from an account with write, maintain, or admin permission, or from any bot account (other agents and apps), is trusted: if it is newer than the last attempt's admission, it admits one more attempt within the three-attempt limit; for a request, feedback on the request issue counts too.
+Feedback from anyone else reaches the executor as untrusted context, marked `trusted: false`, but never buys an attempt.
+The digest gains a `pr` field with the open PR's diff (at most 16 000 characters) and its last twelve feedback items with author, kind, state, path, and line; untrusted text shrinks first when the digest nears 48 KiB.
+The executor judges each point on its merits and decides: rework (a new candidate, delivered as a superseding PR), withdraw (no change, final answer starting `Decision: withdraw`; the incidents job comments on the PR and closes it, only if its head is an `annie/harness/` branch of this repository), or keep (no change, `Decision: keep`, and a point-by-point answer posted visibly on the PR).
+The incidents job therefore has `pull-requests: write`, still without secrets or contents write.
+A failed lookup of PR feedback admits nothing for that incident and is reported as `pr-feedback-unknown`.
 The PR body links an incident without closing it, or closes an operator request; a request PR is titled after its issue.
 The executor's final answer is the PR description: Markdown with Diagnosis, Change, and Risks headings, kept as written up to 4000 characters, labelled unverified, then review findings, changed files, and gates.
 Model Markdown is cut only at a line or sentence boundary with a `[truncated]` marker and a closed code fence, and `inert` neutralises mentions, closing keywords, and inline HTML, so it cannot ping people, close other issues on merge, embed images, or forge Annie's hidden markers.

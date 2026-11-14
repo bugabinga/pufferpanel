@@ -154,7 +154,8 @@ test('workflow confines secrets and paid jobs to trusted trunk; actions use full
 test('self-repair jobs: incidents and gate stay secretless, delivery holds the PAT but never runs candidate code or writes contents; wake stays secretless', () => {
   const workflow = readFileSync(join(moduleDir, '../../.github/workflows/honest-annie.yml'), 'utf8'), jobs = YAML.parse(workflow).jobs;
   const secrets = job => JSON.stringify(job).match(/secrets\.[A-Z_]+/g) ?? [];
-  assert.deepEqual(jobs.incidents.permissions, { contents: 'read', issues: 'write' }); assert.deepEqual(secrets(jobs.incidents), []); assert.equal(jobs.incidents.environment, undefined);
+  // pull-requests: write lets a withdraw decision close Annie's own harness PR; still no secrets or contents write.
+  assert.deepEqual(jobs.incidents.permissions, { contents: 'read', issues: 'write', 'pull-requests': 'write' }); assert.deepEqual(secrets(jobs.incidents), []); assert.equal(jobs.incidents.environment, undefined);
   assert.match(jobs.incidents.if, /vars\.HONEST_ANNIE_ENABLED == 'true'/); assert.match(jobs.incidents.if, /github\.ref == 'refs\/heads\/trunk'/);
   assert.deepEqual(jobs['harness-gate'].permissions, { contents: 'read' }); assert.deepEqual(secrets(jobs['harness-gate']), []); assert.equal(jobs['harness-gate'].environment, undefined);
   assert.deepEqual(jobs['harness-gate'].steps.filter(step => step.run?.includes('ci.sh')).map(step => step.run), ['bash tools/maintainer/ci.sh init', 'bash tools/maintainer/ci.sh import', 'bash tools/maintainer/ci.sh gate']);
