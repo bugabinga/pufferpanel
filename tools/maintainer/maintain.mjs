@@ -96,6 +96,28 @@ const putRun = async (root, run) => {
 export const usageCost = usage => Object.values(usage?.models ?? {}).reduce((sum, value) => sum + value.cost.total, 0);
 
 export const priced = model => [model.cost, ...(model.cost?.tiers ?? [])].every(cost => ['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isFinite(cost?.[key]) && cost[key] >= 0));
+// The worst catalog price tier, input plus output per million tokens: a size signal used to prefer flagship size over
+// cheap variants of one generation and to keep the reviewer at least as strong as the executor.
+export const worstTier = model => Math.max(...[model.cost, ...(model.cost?.tiers ?? [])].map(tier => tier.input + tier.output));
+// The lineage encoded in a catalog id: the family is the id up to its first digit, without trailing separators or a lone
+// "v" ("MiniMax-M2.7" and "MiniMax-M3" -> "minimax-m", "glm-5.3-flash" -> "glm"), and the generation is the digit run
+// after it as a tuple ("3.1" -> [3, 1]). No model id is named in code; families and releases are read as catalogs update.
+export const modelLineage = id => {
+  const text = String(id ?? ''), head = /^[^0-9]*/.exec(text)[0];
+  const trim = value => value.replace(/[^\w]+$/, '').toLowerCase();
+  const base = trim(head), family = base.endsWith('v') ? trim(base.slice(0, -1)) : base;
+  const generation = (/^\d+(?:[.-]\d+)*/.exec(text.slice(head.length).replace(/^[^0-9]+/, '')) ?? [''])[0].split(/[^\d]+/).filter(Boolean).map(Number);
+  return { family, generation };
+};
+// Positive when generation a is newer: tuple compare, missing parts count as older.
+export const generationRank = (a, b) => { for (let i = 0; i < Math.max(a.length, b.length); i++) { const left = a[i] ?? -1, right = b[i] ?? -1; if (left !== right) return left - right; } return 0; };
+// A provider's flagship pick: the newest generation of its Pi-default model's family — Pi's default names the flagship
+// family — that accepts image input, taking that generation's priciest model, never the cheapest variant or a free tier.
+export const flagshipVisionModel = (models, anchorId) => {
+  const anchor = modelLineage(anchorId), ofFamily = id => { const lineage = modelLineage(id); return lineage.family === anchor.family || !lineage.generation.length && (lineage.family.startsWith(anchor.family) || anchor.family.startsWith(lineage.family)); };
+  return models.filter(model => model && priced(model) && Array.isArray(model.input) && model.input.includes('image') && ofFamily(model.id))
+    .sort((a, b) => generationRank(modelLineage(b.id).generation, modelLineage(a.id).generation) || worstTier(b) - worstTier(a))[0];
+};
 // Pi exports neither its per-provider default models nor findInitialModel; read them from the pinned package's resolver,
 // proven to be the module behind the public resolveModelScopeWithDiagnostics. A moved export fails loudly at import.
 export const piModelResolver = await import(new URL('./core/model-resolver.js', import.meta.resolve('@earendil-works/pi-coding-agent')));
@@ -103,23 +125,28 @@ if (piModelResolver.resolveModelScopeWithDiagnostics !== resolveModelScopeWithDi
 // Trusted observe output ANNIE_PROVIDER_HOLDS: providers still held after quota/auth failures; malformed input fails closed.
 export const heldProviders = (text, now = Date.now()) => new Set(text ? validateHolds(JSON.parse(text)).filter(hold => hold.until > now).map(hold => hold.provider) : []);
 // Candidates in Pi's order: settings `enabledModels` (globs, `:thinking`) resolved against authenticated models, Pi's saved
-// default model, then each authenticated provider's Pi default model in findInitialModel's provider order. Unknown prices and
-// held providers are skipped; thinking is the pattern suffix, else `defaultThinkingLevel`, else high, clamped to the model.
+// default model, then per provider in findInitialModel's provider order its flagship pick ahead of its Pi default, whose
+// table is pinned inside the package and can lag the catalog with deprecated, text-only models. Unknown prices and held
+// providers are skipped; thinking is the pattern suffix, else `defaultThinkingLevel`, else high, clamped to the model.
 export async function selectModels(settings, runtime, held = new Set()) {
   const patterns = settings.enabledModels ?? [];
   if (!Array.isArray(patterns) || patterns.some(pattern => typeof pattern !== 'string')) fail('invalid enabledModels');
   const { scopedModels } = await resolveModelScopeWithDiagnostics(patterns, runtime);
   const authenticated = await runtime.getAvailable(), find = (provider, id) => authenticated.find(model => model.provider === provider && model.id === id);
-  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...Object.entries(piModelResolver.defaultModelPerProvider).map(([provider, id]) => ({ model: find(provider, id) }))];
-  const candidates = [];
+  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...Object.entries(piModelResolver.defaultModelPerProvider).flatMap(([provider, id]) => [{ model: flagshipVisionModel(authenticated.filter(model => model.provider === provider), id) }, { model: find(provider, id) }])];
+  const picked = [];
   for (const { model, thinkingLevel } of ordered) {
-    if (!model || !priced(model) || candidates.some(choice => choice.provider === model.provider && choice.modelId === model.id)) continue;
-    candidates.push({ provider: model.provider, modelId: model.id, thinkingLevel: clampThinkingLevel(model, thinkingLevel ?? settings.defaultThinkingLevel ?? 'high') });
+    if (!model || !priced(model) || picked.some(choice => choice.provider === model.provider && choice.modelId === model.id)) continue;
+    picked.push({ provider: model.provider, modelId: model.id, thinkingLevel: clampThinkingLevel(model, thinkingLevel ?? settings.defaultThinkingLevel ?? 'high'), vision: model.input?.includes('image') === true, strength: worstTier(model) });
   }
-  const available = candidates.filter(choice => !held.has(choice.provider));
+  const available = picked.filter(choice => !held.has(choice.provider));
   if (!available.length) fail(`no configured model available${held.size ? `; held providers: ${[...held].join(', ')}` : ''}`);
-  // Independent review prefers another provider when one is available.
-  return { executor: available[0], reviewer: { ...available.find(choice => choice.provider !== available[0].provider) ?? available[0] }, available, providers: [...new Set(candidates.map(choice => choice.provider))] };
+  const executor = available[0], strong = available.filter(choice => choice.strength >= executor.strength), vision = strong.some(choice => choice.vision);
+  // Independent review prefers another provider, but the gating reviewer is never a weaker — cheaper worst-tier — model
+  // than the executor, and keeps image input whenever a not-weaker candidate has it, so visual review keeps screenshots.
+  const reviewer = strong.find(choice => choice.provider !== executor.provider && choice.vision) ?? (vision ? strong.find(choice => choice.vision) : undefined) ?? strong.find(choice => choice.provider !== executor.provider) ?? executor;
+  const bare = ({ provider, modelId, thinkingLevel }) => ({ provider, modelId, thinkingLevel });
+  return { executor: bare(executor), reviewer: bare(reviewer), available: available.map(bare), providers: [...new Set(picked.map(choice => choice.provider))] };
 }
 export function createRuntime(agentDir) {
   return ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), modelsStorePath: join(agentDir, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false });

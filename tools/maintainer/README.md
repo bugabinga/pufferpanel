@@ -54,17 +54,20 @@ One local flock owns the storage; do not run this storage from multiple processe
 
 ## Models and limits
 
-There is no hand-curated model list: every provider with usable credentials contributes Pi's own default model for that provider.
-Candidates follow Pi's `findInitialModel` order: models matching the Pi agent `settings.json` `enabledModels` patterns first, then Pi's saved `defaultProvider`/`defaultModel`, then each authenticated provider's Pi default in Pi's provider order.
+There is no hand-curated model list: every provider with usable credentials contributes the newest model of its flagship family that accepts image input, with Pi's own default model for that provider as fallback.
+The flagship family is the family of the provider's Pi default — Pi's default names the flagship — and the generation is read from the catalog id, so a catalog update moves the pick without code changes; when one generation has several image-capable models, the one with the priciest worst tier is taken, never the cheapest variant or a free tier.
+Candidates follow Pi's `findInitialModel` order: models matching the Pi agent `settings.json` `enabledModels` patterns first, then Pi's saved `defaultProvider`/`defaultModel`, then each authenticated provider's flagship pick ahead of its Pi default in Pi's provider order.
 `enabledModels` uses Pi's standard patterns, including globs and `:thinking` suffixes, resolved by Pi's public `resolveModelScopeWithDiagnostics` against authenticated models; a non-array or non-string entry fails closed.
 Thinking is the pattern suffix, else `defaultThinkingLevel`, else `high`, clamped to the model, so non-reasoning models run with `off`.
 Candidates without known catalog prices are skipped; a zero price counts as known, as for subscription token plans.
-The executor uses the first candidate; the separate reviewer conversation prefers the first candidate from a different provider, else the executor's model.
+The executor uses the first candidate; the separate reviewer conversation prefers a candidate from a different provider, is never a weaker — cheaper worst-tier — model than the executor, and keeps image input whenever a not-weaker candidate has it.
+Image input is preferred, not guaranteed: a provider whose flagship family has no image model, or an `enabledModels` pin to a text-only model, still yields a text-only reviewer, and `ui_snapshot` then omits screenshots and says so in its result.
 No candidate fails closed before any model request.
 Providers without a Pi default model, such as custom `models.json` providers, take part only through `enabledModels` or the saved default.
 Pi exports neither its per-provider default table nor `findInitialModel`, and its package `exports` allow only `.` and `./rpc-entry`.
 `maintain.mjs` therefore imports `dist/core/model-resolver.js` beside the pinned package entry and refuses to load unless that module's `resolveModelScopeWithDiagnostics` is the public one and the table is a non-empty provider→id map; a test also checks every table key is a built-in pi-ai provider.
-CI uses checked-in `ci-settings.json`, which is empty: Pi defaults decide, and an `enabledModels` entry there would take precedence.
+That table is pinned inside the package and can lag the catalog with deprecated, text-only defaults, which is why each provider's flagship pick is ordered ahead of it.
+CI uses checked-in `ci-settings.json`, which is empty: the flagship tier and Pi defaults decide, and an `enabledModels` entry there would take precedence.
 CI authenticates through pi-ai's standard provider environment variables, such as `ZAI_API_KEY` or `MINIMAX_API_KEY`; no desktop auth/settings files or OAuth logins are copied.
 Existing Pi OAuth/API credentials and model overrides are accessed through `ModelRuntime`, never copied into prompts or logs.
 Provider errors are classified by pi-ai: errors it would retry are `transient`; other errors, such as rejected auth or exhausted quota, are `environment`; context overflow stays with Pi's compaction.

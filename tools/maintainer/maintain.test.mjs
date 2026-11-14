@@ -12,7 +12,7 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-work
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { advance, RunDoc, selectModels, heldProviders, piModelResolver, providerFailure, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER, LENGTH_REMINDER, REPAIR_FLOOR_MS } from './maintain.mjs';
+import { advance, RunDoc, selectModels, heldProviders, piModelResolver, providerFailure, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER, LENGTH_REMINDER, REPAIR_FLOOR_MS, worstTier } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 import { fakeReviewSandbox } from './fake-podman.mjs';
 import { createGuard } from './guard.mjs';
@@ -534,19 +534,45 @@ test('model shells never inherit provider credentials or the model secret JSON',
   const env = modelShellEnv({ PATH: '/bin', HOME: '/h', ZAI_API_KEY: 'z', ANTHROPIC_API_KEY: 'a', OPENAI_API_KEY: 'o', GH_TOKEN: 'g', ANNIE_MODEL_SECRETS: '{}' }, '/intake');
   assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH', 'PUFFER_MAINT_INTAKE', 'TMPDIR']);
 });
-test('selection orders enabledModels, Pi saved default, then provider defaults; skips unpriced and held; fails closed', async () => {
-  const cost = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, table = piModelResolver.defaultModelPerProvider;
-  const models = [{ provider: 'zai', id: table.zai, cost, reasoning: true }, { provider: 'zai', id: 'free', cost: {}, reasoning: true }, { provider: 'minimax', id: table.minimax, cost, reasoning: true }, { provider: 'custom', id: 'm', cost, reasoning: false }];
+test('selection leads with each provider\'s newest image-capable flagship generation, never weakens the reviewer, and fails closed', async () => {
+  const cost = (input, output) => ({ input, output, cacheRead: 0, cacheWrite: 0 }), table = piModelResolver.defaultModelPerProvider;
+  // Synthetic siblings of the pinned table ids, built by bumping their version numbers: no concrete catalog id is pinned here.
+  const bump = id => id.replace(/\d+/, digits => String(Number(digits) + 1));
+  const zaiFlagship = { provider: 'zai', id: table.zai, cost: cost(10, 10), input: ['text'], reasoning: true };
+  const zaiVision = { provider: 'zai', id: `${bump(table.zai)}-flash`, cost: cost(0.1, 0.3), input: ['text', 'image'], reasoning: true };
+  const staleText = { provider: 'minimax', id: table.minimax, cost: cost(1, 1), input: ['text'], reasoning: true };
+  const currentVision = { provider: 'minimax', id: bump(table.minimax), cost: cost(1, 1), input: ['text', 'image'], reasoning: true };
+  const currentCheap = { provider: 'minimax', id: `${bump(table.minimax)}-flash`, cost: cost(0.05, 0.1), input: ['text', 'image'], reasoning: true };
+  const oldFreeVision = { provider: 'minimax', id: `${table.minimax}-free`, cost: cost(0, 0), input: ['text', 'image'], reasoning: true };
+  const models = [zaiFlagship, { provider: 'zai', id: 'free', cost: {}, reasoning: true }, zaiVision, staleText, currentCheap, currentVision, oldFreeVision, { provider: 'custom', id: 'm', cost: cost(1, 1), reasoning: false }];
   const runtime = { getAvailable: async () => models }, select = (settings, held) => selectModels(settings, runtime, held);
+  const tier = modelId => worstTier(models.find(model => model.id === modelId));
   let choices = await select({});
-  assert.deepEqual(choices.available, [{ provider: 'zai', modelId: table.zai, thinkingLevel: 'high' }, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' }]);
-  assert.deepEqual(choices.reviewer, choices.available[1]); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  // Regression: the flagship tier leads each provider with the newest image-capable generation of its family — the
+  // deprecated text-only Pi default no longer decides, and neither does the same generation's cheapest nor an older
+  // free image model; the Pi defaults stay as fallbacks after their flagship tier.
+  assert.deepEqual(choices.available, [
+    { provider: 'zai', modelId: zaiVision.id, thinkingLevel: 'high' },
+    { provider: 'zai', modelId: zaiFlagship.id, thinkingLevel: 'high' },
+    { provider: 'minimax', modelId: currentVision.id, thinkingLevel: 'high' },
+    { provider: 'minimax', modelId: staleText.id, thinkingLevel: 'high' }]);
+  assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  assert.ok(!choices.available.some(choice => [currentCheap.id, oldFreeVision.id, 'free'].includes(choice.modelId)));
+  // The reviewer prefers another provider and keeps image input; it is never weaker than the executor.
+  assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: currentVision.id, thinkingLevel: 'high' });
+  assert.ok(tier(choices.reviewer.modelId) >= tier(choices.executor.modelId));
+  // An enabledModels pin to a model nothing else matches makes the reviewer the executor's own model, never a weaker one.
+  choices = await select({ enabledModels: [`zai/${zaiFlagship.id}`] });
+  assert.deepEqual(choices.executor, { provider: 'zai', modelId: zaiFlagship.id, thinkingLevel: 'high' });
+  assert.deepEqual(choices.reviewer, choices.executor);
+  choices = await select({ enabledModels: [`minimax/${staleText.id}:medium`, 'zai/free:low'] });
+  assert.deepEqual(choices.available[0], { provider: 'minimax', modelId: staleText.id, thinkingLevel: 'medium' });
+  // A text-only executor still gets an image-capable, not-weaker reviewer when one exists.
+  assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: currentVision.id, thinkingLevel: 'high' });
   choices = await select({ defaultProvider: 'custom', defaultModel: 'm', defaultThinkingLevel: 'low' });
-  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), ['custom/m:off', `zai/${table.zai}:low`, `minimax/${table.minimax}:low`]);
-  choices = await select({ enabledModels: ['zai/free:low', 'minimax/*:medium'] });
-  assert.deepEqual(choices.available.map(choice => `${choice.provider}:${choice.thinkingLevel}`), ['minimax:medium', 'zai:high']);
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), ['custom/m:off', `zai/${zaiVision.id}:low`, `zai/${zaiFlagship.id}:low`, `minimax/${currentVision.id}:low`, `minimax/${staleText.id}:low`]);
   choices = await select({}, new Set(['zai']));
-  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax', 'minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
   await assert.rejects(select({}, new Set(['zai', 'minimax'])), /no configured model available; held providers: zai, minimax/);
   await assert.rejects(select({ enabledModels: 'zai/*' }), /invalid enabledModels/);
   await assert.rejects(selectModels({}, { getAvailable: async () => [] }), /no configured model available$/);
