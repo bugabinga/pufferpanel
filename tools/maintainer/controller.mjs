@@ -12,6 +12,8 @@ import { MAX_REPAIRS, REPAIRABLE, REQUEST, REQUEST_LABEL, detectIncidents, foldI
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
 export const WAKE_PATH = '.github/workflows/annie-pr-wake.yml';
 const HOUR = 3_600_000, DAY = 24 * HOUR, MARGIN = 5 * 60_000;
+// Admission needs this much of the two-hour paid horizon left: executor, reviewer, gates, and the in-run gate repair floor.
+export const MIN_PAID_HORIZON = 90 * 60_000;
 export const digest = value => createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)).digest('hex');
 const fail = reason => { throw Error(reason); };
 const integer = value => Number.isSafeInteger(value) && value > 0;
@@ -573,7 +575,10 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   let state = republish ? 'republishing' : pending.length || ledger.blockers.length ? 'effects-pending' : task ? 'useful-input' : 'no-op';
   let lease = null, slot = null;
   if (mode === 'maintain' && task && !republish && !pending.length && !ledger.blockers.length && !(fresh.environment?.nextAt > now) && env.HONEST_ANNIE_ENABLED === 'true' && env.GITHUB_RUN_ATTEMPT === '1' && ledger.allowance > 0) {
-    if (providersHeld) state = 'providers-held';
+    // The paid horizon runs from run creation, queue time included. A run that waited behind another one has too little left
+    // for real work: its lease would only be cut off, report unknown usage, and hold its whole cap for a day.
+    if (time(run.created_at) + 2 * HOUR - now < MIN_PAID_HORIZON) state = 'horizon-too-short';
+    else if (providersHeld) state = 'providers-held';
     else if (['maintenance', 'pr'].includes(task.kind) && (fresh.slots.includes(day) || branch.protected !== false)) state = 'source-slot-unavailable';
     // The registry decides only whether today's tag is free: unknown holds this source task, never the rest of observe.
     else if (['maintenance', 'pr'].includes(task.kind) && (slot = await publicationAvailable(fetchImpl, day).catch(() => 'unknown')) !== true) state = slot === 'unknown' ? 'registry-unknown' : 'source-slot-unavailable';

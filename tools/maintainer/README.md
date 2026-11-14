@@ -204,6 +204,7 @@ Runner loss or a failed maintenance job discards its draft and checkpoints; the 
 Hosted maintenance has both a `$15` per-job cap and a `$15` rolling-24h cap across immutable original-attempt leases.
 Every workflow rerun is unpaid; only selective retries of the known model-free effects job may perform already-approved effects.
 The model/gate wrapper has a two-hour deadline; the separate no-model release job has its own timeout.
+That deadline counts from run creation, so a run that waited behind another run in the shared concurrency group is admitted only with at least 90 minutes left; otherwise it reports `horizon-too-short` and pays nothing, instead of being cut off mid-turn with unknown usage holding its whole cap for a day.
 CI validates private Podman storage after runtime preparation and before exposing model credentials, then always removes its explicit short runroot; release cleanup also removes registry auth.
 Each model/release/republish job writes a sanitized Actions summary and uploads only its explicit `report.json` for 14 days, including on failure; raw logs, transcripts, SQLite, environment data, and source diffs are not uploaded.
 Reviewed bundles/plans remain separate explicitly approved 14-day artifacts, never blanket report/log uploads.

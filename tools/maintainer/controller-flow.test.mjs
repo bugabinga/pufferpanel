@@ -19,8 +19,8 @@ async function fixture(t) {
   const env = { ANNIE_MODE: 'maintain', GITHUB_REPOSITORY: OWN, GITHUB_REF: 'refs/heads/trunk', GITHUB_SHA: base, GITHUB_REPOSITORY_ID: '7', GITHUB_RUN_ID: '42', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_NAME: 'schedule', GITHUB_EVENT_PATH: join(dir, 'event.json'), ANNIE_OUTPUT_DIR: dir, ANNIE_BOOTSTRAP: '42', HONEST_ANNIE_ENABLED: 'true', GH_TOKEN: 'readonly-sentinel' };
   await writeFile(env.GITHUB_EVENT_PATH, JSON.stringify({ schedule: '17 4 * * *' }));
   const runs = [], artifacts = new Map(), bodies = new Map(), comments = new Map(), prFeedback = new Map(), calls = [], issues = [], jobs = [], prs = [], files = [], closedPRs = [], jobsByAttempt = new Map(), pullsAll = { fail: false };
-  let clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
-  const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(clock).toISOString(), updated_at: new Date(clock).toISOString() });
+  let currentCreated = null, clock = now, currentId = 42, registry = 404, protectedBranch = false, role = 'write', head = base, registryImpl = null, changedPolicy = null, compareImpl = null;
+  const run = id => ({ id, run_attempt: 1, workflow_id: 8, path: POLICY_PATH, repository: { id: 7 }, head_repository: { id: 7 }, head_branch: 'trunk', head_sha: base, event: 'schedule', status: 'completed', created_at: new Date(id === currentId && currentCreated !== null ? currentCreated : clock).toISOString(), updated_at: new Date(clock).toISOString() });
   const fetchImpl = async (url, options = {}) => {
     calls.push({ url, options });
     if (url.startsWith('https://registry.')) return registryImpl ? registryImpl(url, options) : new Response(null, { status: registry });
@@ -64,7 +64,7 @@ async function fixture(t) {
   }
   const execute = async changes => controller({ env: { ...env, ...changes }, fetchImpl, now: clock, delays: [] });
   const json = async name => JSON.parse(await readFile(join(dir, name), 'utf8'));
-  return { env, dir, runs, artifacts, comments, prFeedback, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
+  return { env, dir, runs, artifacts, comments, prFeedback, calls, issues, jobs, jobsByAttempt, prs, files, closedPRs, pullsAll, setRole: value => { role = value; }, artifact, execute, json, fetchImpl, run, setClock: v => { clock = v; }, setCurrent: id => { currentId = id; env.GITHUB_RUN_ID = String(id); }, setCreated: v => { currentCreated = v; }, setRegistry: v => { registry = v; }, setProtected: v => { protectedBranch = v; }, setHead: v => { head = v; }, setRegistryImpl: v => { registryImpl = v; }, setChangedPolicy: v => { changedPolicy = v; }, setCompareImpl: v => { compareImpl = v; } };
 }
 test('faux controller: cheap observe has no lease/registry/retry; maintain wires exact B/U task and creation-deadline lease', async t => {
   const f = await fixture(t);
@@ -209,6 +209,13 @@ test('registry outage holds only source work: observe completes, writes its chec
   f.issues.push({ number: 4, title: 'latest models', body: 'pin it', state: 'open', user: { login: 'bugabinga', type: 'User' }, labels: [{ name: 'annie-harness' }] });
   const admitted = await f.execute();
   assert.equal(admitted.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'harness');
+});
+test('a run that queued behind another one is not admitted once less than 90 minutes of its paid horizon remain', async t => {
+  const late = await fixture(t); late.setCreated(now - 31 * 60_000);
+  const held = await late.execute(); assert.equal(held.state, 'horizon-too-short'); assert.equal(held.paid, false);
+  await assert.rejects(readFile(join(late.dir, 'lease.json')));
+  const fresh = await fixture(t); fresh.setCreated(now - 29 * 60_000);
+  assert.equal((await fresh.execute()).state, 'admitted');
 });
 test('lost/expired decision checkpoint fails closed even when bootstrap flag remains on', async t => {
   const f = await fixture(t);
