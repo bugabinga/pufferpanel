@@ -14,6 +14,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { BACKGROUND_CONTEXT as ctx } from '@earendil-works/chord/context';
 import { RunDoc, CallsDoc, budgetModels, callUsage, withinBudget, createRuntime, modelFailureKind } from './maintain.mjs';
 import { reportFor, collect } from './report.mjs';
+import { DAILY_BUDGET as B, RUN_CAP } from './task.mjs';
 import { makeLease, verifyLease, rollingAllowance, GitHub, unzipJSON, trustedRun, verifyWake, chooseTask, prFingerprint, controller, digest, observeLedger, provenZeroDispatch, noCompletionEvidence, POLICY_PATH } from './controller.mjs';
 const now = Date.parse('2026-04-03T04:17:00Z'), HOUR = 3600000, DAY = 24 * HOUR;
 const base = 'a'.repeat(40), head = 'b'.repeat(40), upstreamSha = 'c'.repeat(40), policy = 'p';
@@ -44,21 +45,23 @@ test('rolling24h known complete REPLACES reservation; partial/missing/interrupte
   const l = lease(), settledAt = new Date(now + HOUR).toISOString();
   const known = { phase: 'rejected', ledgerReservation: l.hash, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
   const entry = { lease: l, settlement: known, settledAt };
-  assert.equal(rollingAllowance([entry], now + 20 * HOUR), 13);
-  assert.equal(rollingAllowance([entry], now + 24.5 * HOUR), 13);
-  assert.equal(rollingAllowance([entry], now + 25 * HOUR), 15);
-  for (const settlement of [null, { ...known, usageComplete: false }, { ...known, ledgerReservation: 'x' }, { ...known, reportedUsage: { status: 'unknown' }, knownSubtotal: 2 }, ...['admitted', 'executing', 'reviewing', undefined].map(phase => ({ ...known, phase }))]) assert.equal(rollingAllowance([{ ...entry, settlement }], now + 20 * HOUR), 0);
-  assert.equal(rollingAllowance([{ ...entry, settlement: null }], now + 26 * HOUR), 0);
-  assert.equal(rollingAllowance([{ ...entry, settlement: null }], now + 26 * HOUR + 300001), 15);
-  assert.equal(rollingAllowance([{ ...entry, terminal: false }], now + 30 * HOUR), 0);
-  assert.equal(rollingAllowance([{ unknown: true, updatedAt: settledAt }], now + 20 * HOUR), 0);
+  assert.equal(rollingAllowance([entry], now + 20 * HOUR), B - 2);
+  assert.equal(rollingAllowance([entry], now + 24.5 * HOUR), B - 2);
+  assert.equal(rollingAllowance([entry], now + 25 * HOUR), B);
+  for (const settlement of [null, { ...known, usageComplete: false }, { ...known, ledgerReservation: 'x' }, { ...known, reportedUsage: { status: 'unknown' }, knownSubtotal: 2 }, ...['admitted', 'executing', 'reviewing', undefined].map(phase => ({ ...known, phase }))]) assert.equal(rollingAllowance([{ ...entry, settlement }], now + 20 * HOUR), B - RUN_CAP);
+  assert.equal(rollingAllowance([{ ...entry, settlement: null }], now + 26 * HOUR), B - RUN_CAP);
+  assert.equal(rollingAllowance([{ ...entry, settlement: null }], now + 26 * HOUR + 300001), B);
+  assert.equal(rollingAllowance([{ ...entry, terminal: false }], now + 30 * HOUR), B - RUN_CAP);
+  assert.equal(rollingAllowance([{ unknown: true, updatedAt: settledAt }], now + 20 * HOUR), B - RUN_CAP);
+  // Enough held runs exhaust the shared budget; it never goes negative.
+  assert.equal(rollingAllowance(Array(4).fill({ ...entry, settlement: null }), now + 20 * HOUR), 0);
 });
 test('unknown attempt and later known retry charge independently; no full-cap refund funds replacement', () => {
   const original = makeLease({ run, repoId: 7, workflowId: 8, task, cap: 10, now }), replacement = makeLease({ run: { ...run, id: 43 }, repoId: 7, workflowId: 8, task, cap: 5, now });
   const settledAt = new Date(now).toISOString();
   const settlement = { phase: 'published', ledgerReservation: replacement.hash, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
-  assert.equal(rollingAllowance([{ lease: original, settlement: null }, { lease: replacement, settlement, settledAt }], now), 3);
-  assert.equal(rollingAllowance([{ lease: lease(), settlement: null }, { lease: replacement, settlement, settledAt }], now), 0);
+  assert.equal(rollingAllowance([{ lease: original, settlement: null }, { lease: replacement, settlement, settledAt }], now), B - 12);
+  assert.equal(rollingAllowance([{ lease: lease(), settlement: null }, { lease: replacement, settlement, settledAt }], now), B - RUN_CAP - 2);
 });
 test('zero-dispatch requires terminal native original model-step evidence; fallback never proves completion', () => {
   for (const jobs of [[{ name: 'check', conclusion: 'failure' }], [{ name: 'maintain', conclusion: 'skipped' }], [{ name: 'maintain', conclusion: 'failure', steps: [{ name: 'Maintain or review selected task', conclusion: 'skipped' }] }]]) assert.equal(provenZeroDispatch(run, jobs), true);
@@ -155,7 +158,7 @@ test('actual startup fallback report settles no identity and retains full prepai
   ];
   const api = { pages: async path => path.includes('/artifacts') ? artifacts : [run], artifact: async meta => meta.id === 1 ? l : initial };
   const ledger = await observeLedger(api, { id: 7 }, { id: 8 }, now + HOUR, 43);
-  assert.equal(ledger.allowance, 0); assert.equal(ledger.records[0].settlement, null);
+  assert.equal(ledger.allowance, B - RUN_CAP); assert.equal(ledger.records[0].settlement, null);
 });
 test('ledger duplicate/deleted/partial settlement artifacts fail closed; release report never moves billing timestamp', async () => {
   const l = lease(), cp = { schema: 1, runId: 42, repoId: 7, handled: [], slots: [], paid: true }, model = { ledgerReservation: l.hash, fingerprint: task.fingerprint, taskKind: task.kind, day: task.day, base, phase: 'published', commit: null, releaseCommit: null, managementApproved: false, usageComplete: true, reportedUsage: { status: 'known', cost: 2 } };
@@ -166,9 +169,9 @@ test('ledger duplicate/deleted/partial settlement artifacts fail closed; release
     { id: 4, name: 'honest-annie-release-report-42-2', created_at: new Date(now + 20 * HOUR).toISOString() },
   ];
   const api = { pages: async path => path.includes('/artifacts') ? artifacts : [run], artifact: async meta => ({ 1: cp, 2: l, 3: model, 4: model })[meta.id] };
-  assert.equal((await observeLedger(api, { id: 7 }, { id: 8 }, now + 25 * HOUR, 43)).allowance, 15);
+  assert.equal((await observeLedger(api, { id: 7 }, { id: 8 }, now + 25 * HOUR, 43)).allowance, B);
   artifacts.push({ ...artifacts[1], id: 5 }); await assert.rejects(observeLedger(api, { id: 7 }, { id: 8 }, now, 43), /duplicate/); artifacts.pop();
-  artifacts.splice(1, 1); assert.equal((await observeLedger(api, { id: 7 }, { id: 8 }, now + HOUR, 43)).allowance, 0);
+  artifacts.splice(1, 1); assert.equal((await observeLedger(api, { id: 7 }, { id: 8 }, now + HOUR, 43)).allowance, B - RUN_CAP);
 });
 test('rolling created horizon survives 12000 lifetime runs, old-created rerun today, carried ancient pending ID', async () => {
   const ancient = { ...run, id: 5, created_at: new Date(now - 60 * DAY).toISOString(), updated_at: new Date(now - 40 * DAY).toISOString(), status: 'in_progress' };
@@ -190,13 +193,14 @@ test('rolling created horizon survives 12000 lifetime runs, old-created rerun to
   });
   api.artifact = async () => ({ schema: 1, runId: 42, repoId: 7, handled: [], slots: [], paid: false, pendingRuns: [5], flights: [{ runId: 5, task, queue: 'f'.repeat(64) }] });
   const ledger = await observeLedger(api, { id: 7 }, { id: 8 }, now, 43);
-  assert.equal(ledger.allowance, 0); assert.ok(ledger.outstanding.includes(5)); assert.equal(ledger.runs.length, 3);
+  // The ancient pending run and the old-created rerun each hold a full run cap.
+  assert.equal(ledger.allowance, B - 2 * RUN_CAP); assert.ok(ledger.outstanding.includes(5)); assert.equal(ledger.runs.length, 3);
   assert.equal(calls.filter(url => url.includes('/workflows/8/runs')).length, 1);
   assert.ok(calls.some(url => url.endsWith('/runs/5'))); assert.equal(calls.some(url => url.includes('/runs/100/')), false);
   assert.deepEqual(ledger.blockers, [{ runId: 7, reason: 'expired-candidate-identity' }, { runId: 5, reason: 'admission-unreconciled' }]);
   api.artifact = async () => ({ schema: 1, runId: 42, repoId: 7, handled: [], slots: [], paid: false, pendingRuns: [5, 7], blocked: ledger.blockers });
   const refreshed = await observeLedger(api, { id: 7 }, { id: 8 }, now, 43);
-  assert.deepEqual(refreshed.blockers, ledger.blockers); assert.ok(refreshed.outstanding.includes(7)); assert.equal(refreshed.allowance, 0);
+  assert.deepEqual(refreshed.blockers, ledger.blockers); assert.ok(refreshed.outstanding.includes(7)); assert.equal(refreshed.allowance, B - 2 * RUN_CAP);
 });
 test('saturated filtered history shards bounded windows, persistent saturation refuses admission', async () => {
   let windows = 0;

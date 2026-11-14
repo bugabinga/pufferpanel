@@ -172,7 +172,7 @@ GitHub state checks and API posts/pushes are not one atomic transaction; live ro
 Only attempt 1 may pay, with a prepaid immutable lease verified by artifact ID/digest before provider dispatch.
 The absolute paid horizon is original GitHub run creation plus two hours, including queued/preflight time and cancellation margin.
 A run with less than 90 minutes of that horizon left, typically one that queued behind another run, admits no paid work (`horizon-too-short`).
-Each lease cap is at most $15 and at most remaining shared rolling-24h allowance.
+Each lease cap is at most $15 ($5 for harness repairs) and at most the remaining shared rolling-24h allowance of $50.
 A host-owned durable call intent precedes each provider dispatch, priced for the physical model actually sent; only a completed valid response with pi-ai usage settles it at its normal final usage cost.
 Partial SSE, provider errors, cancellation, missing usage, synthetic zero errors, and missing final reports never refund partial spend.
 A provider error response settles at its full call reservation, so a recovered retry or failover can complete the phase; cancellation, interruption, and missing usage stay unknown.

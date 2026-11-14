@@ -3,7 +3,7 @@ import { inflateRawSync } from 'node:zlib';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, REF, activeRejections, harnessBranch, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
+import { DAILY_BUDGET, HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, RUN_CAP, REF, activeRejections, harnessBranch, isSha, providerId, validChanged, validFindings, validateHolds, validateRejections, validateTask, versionFor } from './task.mjs';
 import { checkPR, protectedPolicy } from './pr.mjs';
 import { authorTrust } from './github.mjs';
 import { excerpt } from './report.mjs';
@@ -39,7 +39,7 @@ export function foldRejections(previous, records, now) {
 export function makeLease({ run, repoId, workflowId, task, cap, now = Date.now() }) {
   if (run.run_attempt !== 1 || !integer(run.id) || !integer(repoId) || !integer(workflowId) || !isSha(run.head_sha) || !allowedEvents.includes(run.event)) fail('ineligible paid execution');
   const createdAt = time(run.created_at), deadline = createdAt + 2 * HOUR;
-  if (createdAt > now || now >= deadline - 90_000 || !Number.isFinite(cap) || cap <= 0 || cap > (task.kind === 'harness' ? HARNESS_CAP : 15)) fail('paid horizon or allowance exhausted');
+  if (createdAt > now || now >= deadline - 90_000 || !Number.isFinite(cap) || cap <= 0 || cap > (task.kind === 'harness' ? HARNESS_CAP : RUN_CAP)) fail('paid horizon or allowance exhausted');
   const lease = { schema: 1, type: 'lease', runId: run.id, attempt: 1, repoId, workflowId, headSha: run.head_sha, event: run.event, createdAt: run.created_at, deadline, cap, task: validateTask(task) };
   return { ...lease, hash: digest(lease) };
 }
@@ -47,19 +47,19 @@ export function verifyLease(lease, { env, task }) {
   const keys = ['schema', 'type', 'runId', 'attempt', 'repoId', 'workflowId', 'headSha', 'event', 'createdAt', 'deadline', 'cap', 'task', 'hash'];
   if (!lease || typeof lease !== 'object' || Object.keys(lease).sort().join(',') !== keys.sort().join(',') || !integer(lease.runId) || !integer(lease.repoId) || !integer(lease.workflowId) || !allowedEvents.includes(lease.event)) fail('invalid prepaid lease schema');
   const { hash, ...body } = lease ?? {};
-  if (body.schema !== 1 || body.type !== 'lease' || hash !== digest(body) || body.attempt !== 1 || String(body.runId) !== env.GITHUB_RUN_ID || env.GITHUB_RUN_ATTEMPT !== '1' || body.headSha !== env.GITHUB_SHA || body.repoId !== Number(env.GITHUB_REPOSITORY_ID) || body.deadline !== time(body.createdAt) + 2 * HOUR || body.cap <= 0 || body.cap > (body.task?.kind === 'harness' ? HARNESS_CAP : 15) || !Number.isFinite(body.cap) || digest(body.task) !== digest(validateTask(task))) fail('invalid prepaid lease binding');
+  if (body.schema !== 1 || body.type !== 'lease' || hash !== digest(body) || body.attempt !== 1 || String(body.runId) !== env.GITHUB_RUN_ID || env.GITHUB_RUN_ATTEMPT !== '1' || body.headSha !== env.GITHUB_SHA || body.repoId !== Number(env.GITHUB_REPOSITORY_ID) || body.deadline !== time(body.createdAt) + 2 * HOUR || body.cap <= 0 || body.cap > (body.task?.kind === 'harness' ? HARNESS_CAP : RUN_CAP) || !Number.isFinite(body.cap) || digest(body.task) !== digest(validateTask(task))) fail('invalid prepaid lease binding');
   return lease;
 }
 export function rollingAllowance(entries, now = Date.now()) {
   let held = 0;
   for (const { lease, settlement, settledAt, terminal = true, unknown = false, updatedAt, deadline = 0 } of entries) {
-    if (unknown) { if (!terminal || Math.max(time(updatedAt), deadline) + DAY + MARGIN > now) held += 15; continue; }
-    if (!lease || lease.cap <= 0 || lease.cap > 15 || !Number.isFinite(lease.cap)) fail('invalid accounting lease');
+    if (unknown) { if (!terminal || Math.max(time(updatedAt), deadline) + DAY + MARGIN > now) held += RUN_CAP; continue; }
+    if (!lease || lease.cap <= 0 || lease.cap > RUN_CAP || !Number.isFinite(lease.cap)) fail('invalid accounting lease');
     const actual = ['gating', 'committing', 'publishing', 'published', 'rejected', 'failed', 'managing'].includes(settlement?.phase) && settlement?.ledgerReservation === lease.hash && settlement?.usageComplete === true && settlement?.reportedUsage?.status === 'known' && Number.isFinite(settlement.reportedUsage.cost) && settlement.reportedUsage.cost >= 0 ? settlement.reportedUsage.cost : null;
     if (actual !== null && terminal) { if (time(settledAt) + DAY > now) held += actual; }
     else if (!terminal || lease.deadline + DAY + MARGIN > now) held += lease.cap;
   }
-  return Math.max(0, 15 - held);
+  return Math.max(0, DAILY_BUDGET - held);
 }
 
 export class GitHub {
@@ -586,7 +586,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
       const rules = await api.pages(`/repos/${OWN}/rules/branches/trunk`);
       if (rules.length) state = 'protected-policy';
       else {
-        lease = makeLease({ run, repoId: repo.id, workflowId: workflow.id, task, cap: task.kind === 'harness' ? Math.min(ledger.allowance, HARNESS_CAP) : ledger.allowance, now });
+        lease = makeLease({ run, repoId: repo.id, workflowId: workflow.id, task, cap: Math.min(ledger.allowance, task.kind === 'harness' ? HARNESS_CAP : RUN_CAP), now });
         fresh.paid = true;
         fresh.flights.push({ runId: run.id, task, queue });
         if (['maintenance', 'pr'].includes(task.kind)) fresh.slots.push(day);

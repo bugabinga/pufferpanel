@@ -19,7 +19,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { ModelRuntime, resolveModelScopeWithDiagnostics } from '@earendil-works/pi-coding-agent';
 import { excerpt, redact, redactMarkdown, reportFor, writeReport } from './report.mjs';
 import { collectGitHubSnapshot, writeIntake, removeIntake, installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
-import { GATE_NAMES, PROTECTED_PATHS, activeRejections, changedFiles, repeatRejected, selectedTask, validateHolds, validateRejections, versionFor } from './task.mjs';
+import { GATE_NAMES, PROTECTED_PATHS, RUN_CAP, activeRejections, changedFiles, repeatRejected, selectedTask, validateHolds, validateRejections, versionFor } from './task.mjs';
 import { parseDigest } from './incident.mjs';
 import { HARNESS_PATHS, HARNESS_WORKFLOW, harnessScopeViolation } from './scope.mjs';
 import { createGuard } from './guard.mjs';
@@ -158,10 +158,10 @@ const runDeadline = run => Math.min(run.startedAt + 7_200_000, run.absoluteDeadl
 // Executor turn plus re-priming, the 30-minute review window, and the fixed gate (16 minutes warm locally, slower on hosted runners), with margin.
 export const REPAIR_FLOOR_MS = 75 * 60_000;
 export function withinBudget(run, now, addition = 0) {
-  const cap = run.budgetCap ?? 15;
+  const cap = run.budgetCap ?? RUN_CAP;
   const deadline = runDeadline(run);
   if (!Number.isFinite(deadline) || now >= deadline) fail('two hour maintenance deadline exceeded');
-  if (!Number.isFinite(cap) || cap <= 0 || cap > 15 || !Number.isFinite(run.spent + addition) || addition < 0 || run.spent + addition > cap) fail('$15 budget exceeded or cost unknown');
+  if (!Number.isFinite(cap) || cap <= 0 || cap > RUN_CAP || !Number.isFinite(run.spent + addition) || addition < 0 || run.spent + addition > cap) fail('$15 budget exceeded or cost unknown');
 }
 
 // Checkpoints surround external effects; the commit and publisher hooks reconcile interrupted effects.

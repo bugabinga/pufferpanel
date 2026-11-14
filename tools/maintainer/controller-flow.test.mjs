@@ -4,6 +4,7 @@ import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requestFingerprint } from './incident.mjs';
+import { DAILY_BUDGET as B, RUN_CAP } from './task.mjs';
 import { controller, digest, harnessFingerprint, retryEffects, verifyUploadedLease, POLICY_PATH } from './controller.mjs';
 const OWN = 'bugabinga/pufferpanel', now = Date.parse('2026-04-03T04:17:00Z'), base = 'a'.repeat(40), U = 'b'.repeat(40), tree = { tree: [{ path: '.github', sha: 'c'.repeat(40) }, { path: 'tools', sha: 'd'.repeat(40) }] };
 const response = body => new Response(JSON.stringify(body));
@@ -72,7 +73,7 @@ test('faux controller: cheap observe has no lease/registry/retry; maintain wires
   assert.equal(f.calls.some(c => c.url.includes('registry.')), false);
   await assert.rejects(readFile(join(f.dir, 'lease.json')));
   const admitted = await f.execute(); assert.equal(admitted.state, 'admitted'); assert.equal(admitted.paid, true);
-  const lease = await f.json('lease.json'); assert.equal(lease.task.base, base); assert.equal(lease.task.upstreamSha, U); assert.equal(lease.task.day, '2026-04-03'); assert.equal(lease.deadline, now + 7200000);
+  const lease = await f.json('lease.json'); assert.equal(lease.cap, RUN_CAP); assert.equal(admitted.allowance, B); assert.equal(lease.task.base, base); assert.equal(lease.task.upstreamSha, U); assert.equal(lease.task.day, '2026-04-03'); assert.equal(lease.deadline, now + 7200000);
   assert.equal(f.calls.filter(c => c.url.includes('registry.')).length, 1);
 });
 test('healthy checkpoint refresh suppresses unchanged daily/noop/rejection; own labels/comments do not create paid work', async t => {
@@ -103,7 +104,7 @@ test('healthy CP → offline check without artifacts → maintain retains allowa
   f.runs.push({ ...f.run(43), event: 'workflow_dispatch' });
   f.jobs.push({ id: 201, name: 'maintain', conclusion: 'skipped' });
   f.setCurrent(44);
-  const result = await f.execute(); assert.equal(result.allowance, 15); assert.equal(result.paid, true);
+  const result = await f.execute(); assert.equal(result.allowance, B); assert.equal(result.paid, true);
 });
 test('pre-dispatch failure frees flight/calendar, shared environment cooldown stops another PR', async t => {
   const f = await fixture(t);
@@ -112,7 +113,7 @@ test('pre-dispatch failure frees flight/calendar, shared environment cooldown st
   assert.deepEqual(cp.handled, []); assert.equal(cp.flights.length, 1);
   f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', cp);
   f.jobs.push({ id: 201, name: 'maintain', conclusion: 'failure', steps: [{ name: 'Validate private Podman store before model runtime and credentials', conclusion: 'failure' }, { name: 'Maintain or review selected task', conclusion: 'skipped' }] });
-  f.setCurrent(43); const result = await f.execute(); assert.equal(result.allowance, 0); assert.equal(result.paid, false); assert.equal(result.readyPRs, 2);
+  f.setCurrent(43); const result = await f.execute(); assert.equal(result.allowance, B - RUN_CAP); assert.equal(result.paid, false); assert.equal(result.readyPRs, 2);
   const next = await f.json('checkpoint.json'); assert.deepEqual(next.slots, [cp.flights[0].task.day]); assert.deepEqual(next.flights, [cp.flights[0]]);
   f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', next);
   f.setClock(now + 27 * 3600000); f.setCurrent(44);
@@ -124,26 +125,26 @@ test('pre-lease cancelled flight holds full cap, then proves skipped effects or 
   f.jobs.push({ id: 201, name: 'maintain', conclusion: 'cancelled', steps: [{ name: 'Maintain or review selected task', conclusion: 'cancelled' }] });
   f.setCurrent(43);
   const blocked = await f.execute({ ANNIE_MODE: 'observe' });
-  assert.equal(blocked.allowance, 0); assert.deepEqual(blocked.observationBlockers, [{ runId: 42, reason: 'admission-unreconciled' }]);
+  assert.equal(blocked.allowance, B - RUN_CAP); assert.deepEqual(blocked.observationBlockers, [{ runId: 42, reason: 'admission-unreconciled' }]);
   assert.deepEqual((await f.json('checkpoint.json')).flights.map(flight => flight.runId), [42]);
   f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', await f.json('checkpoint.json'));
   f.jobs[0] = { id: 202, name: 'maintain', conclusion: 'failure', steps: [{ name: 'Maintain or review selected task', conclusion: 'skipped' }] };
   f.setClock(now + 3 * 3600000); f.setCurrent(44);
   const stillHeld = await f.execute({ ANNIE_MODE: 'observe' });
-  assert.equal(stillHeld.allowance, 0); assert.equal(stillHeld.observationBlockers.length, 0);
+  assert.equal(stillHeld.allowance, B - RUN_CAP); assert.equal(stillHeld.observationBlockers.length, 0);
   assert.deepEqual((await f.json('checkpoint.json')).flights.map(flight => flight.runId), [42]);
   f.runs.push(f.run(44)); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', await f.json('checkpoint.json'));
   f.setClock(now + 27 * 3600000); f.setCurrent(45);
   const reconciled = await f.execute();
-  assert.equal(reconciled.allowance, 15); assert.equal(reconciled.observationBlockers.length, 0); assert.equal(reconciled.paid, true);
+  assert.equal(reconciled.allowance, B); assert.equal(reconciled.observationBlockers.length, 0); assert.equal(reconciled.paid, true);
   assert.deepEqual((await f.json('checkpoint.json')).flights.map(flight => flight.runId), [45]);
 });
 test('ambiguous maintain without markers holds full cap; skipped check alone never refunds foreign run', async t => {
   const f = await fixture(t); await f.execute({ ANNIE_MODE: 'observe' });
   f.runs.push(f.run(42)); f.artifact(42, 'annie-checkpoint-42-1', 'checkpoint.json', await f.json('checkpoint.json'));
   f.runs.push(f.run(41)); f.jobs.push({ id: 201, name: 'maintain', conclusion: 'cancelled' }); f.setCurrent(43);
-  assert.equal((await f.execute()).allowance, 0);
-  f.runs[1].path = 'foreign.yml'; f.jobs[0].conclusion = 'skipped'; assert.equal((await f.execute()).allowance, 0);
+  assert.equal((await f.execute()).allowance, B - RUN_CAP);
+  f.runs[1].path = 'foreign.yml'; f.jobs[0].conclusion = 'skipped'; assert.equal((await f.execute()).allowance, B - RUN_CAP);
 });
 test('invalid JSON is bounded bot retry, never permanent PR blame; known retries remain separately charged', async t => {
   const f = await fixture(t); let result = await f.execute();
@@ -155,7 +156,7 @@ test('invalid JSON is bounded bot retry, never permanent PR blame; known retries
     f.setClock(now + attempt * 3600000 + 1); f.setCurrent(id + 1); result = await f.execute();
     const next = await f.json('checkpoint.json'); assert.equal(next.handled.includes(lease.task.fingerprint), false); assert.equal(next.outcomes[0].attempts, attempt);
   }
-  assert.equal(result.paid, false); assert.ok(Math.abs(result.allowance - 14.7) < 1e-9);
+  assert.equal(result.paid, false); assert.ok(Math.abs(result.allowance - (B - 0.3)) < 1e-9);
 });
 test('release fallback leaves unknown completion pending; expired day14 receipt refresh abandons unpersisted candidate without handling it', async t => {
   const f = await fixture(t); await f.execute(); const lease = await f.json('lease.json');
@@ -165,7 +166,7 @@ test('release fallback leaves unknown completion pending; expired day14 receipt 
   f.artifact(42, 'honest-annie-model-report-42-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: lease.task.kind, day: lease.task.day, base, managementApproved: false, phase: 'publishing', commit: 'e'.repeat(40), releaseCommit: 'e'.repeat(40), usageComplete: false, reportedUsage: { status: 'unknown' } });
   f.artifact(42, 'honest-annie-candidate-42-1', 'not-downloaded', {});
   f.artifact(42, 'honest-annie-release-report-42-3', 'report.json', { fingerprint: null, ledgerReservation: null, reportedUsage: { status: 'unknown' } });
-  f.setCurrent(43); const first = await f.execute(); assert.equal(first.state, 'effects-pending'); assert.equal(first.allowance, 0);
+  f.setCurrent(43); const first = await f.execute(); assert.equal(first.state, 'effects-pending'); assert.equal(first.allowance, B - RUN_CAP);
   const refreshed = await f.json('checkpoint.json');
   f.setClock(now + 14 * 86400000); f.runs.push(f.run(43)); f.artifact(43, 'annie-checkpoint-43-1', 'checkpoint.json', refreshed);
   for (const meta of f.artifacts.get(42)) meta.expired = true;
@@ -183,7 +184,7 @@ test('missing model settlement permits only proven exported candidate effects re
   f.jobsByAttempt.set(2, [{ id: 202, name: 'check', conclusion: 'success' }]);
   f.jobsByAttempt.set(1, [{ id: 200, name: 'maintain', conclusion: 'success', steps: [{ name: 'Export only approved candidates or valid rejection feedback', conclusion: 'success' }] }, { id: 201, name: 'Annie effects (model-free)', conclusion: 'failure' }]);
   f.setCurrent(43); f.setClock(now + 3600000);
-  const result = await f.execute(); assert.equal(result.allowance, 0); assert.equal(result.paid, false); assert.equal(result.effectsRetry.jobAttempt, 1); assert.equal(result.effectsRetry.attempt, 2);
+  const result = await f.execute(); assert.equal(result.allowance, B - RUN_CAP); assert.equal(result.paid, false); assert.equal(result.effectsRetry.jobAttempt, 1); assert.equal(result.effectsRetry.attempt, 2);
   const retried = await retryEffects({ env: { ...f.env, ANNIE_RETRY: JSON.stringify(result.effectsRetry) }, fetchImpl: f.fetchImpl, now: now + 3600000 });
   assert.equal(retried.jobId, 201); assert.equal(f.calls.filter(c => c.options.method === 'POST').length, 1);
   assert.equal(f.calls.some(c => c.url.includes('/actions/artifacts/3/zip')), false);
@@ -456,7 +457,7 @@ test('incidents: failed effects jobs dedupe across observes, then admit one $5 h
   f.runs.push(f.run(44)); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', third); f.artifact(44, 'annie-lease-44-1', 'lease.json', lease);
   f.artifact(44, 'honest-annie-model-report-44-1', 'report.json', { ledgerReservation: lease.hash, fingerprint: lease.task.fingerprint, taskKind: 'harness', incident, day: lease.task.day, base, managementApproved: false, commit: null, releaseCommit: null, phase: 'rejected', reason: 'review-rejected', usageComplete: true, reportedUsage: { status: 'known', cost: 1 } });
   f.setCurrent(45); const next = await f.execute();
-  assert.equal(next.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'maintenance'); assert.equal(next.allowance, 14);
+  assert.equal(next.state, 'admitted'); assert.equal((await f.json('lease.json')).task.kind, 'maintenance'); assert.equal(next.allowance, B - 1);
   assert.ok((await f.json('checkpoint.json')).handled.includes(lease.task.fingerprint));
 });
 test('operator request: a labelled issue from a write author admits a $5 harness repair at once with its Markdown body; others never pay', async t => {

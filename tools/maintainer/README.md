@@ -201,7 +201,7 @@ A body over 4000 characters is refused with its length, never cut, so the execut
 
 Hosted runners retain SQLite and local drafts only within a job.
 Runner loss or a failed maintenance job discards its draft and checkpoints; the next maintenance job starts fresh from `trunk`.
-Hosted maintenance has both a `$15` per-job cap and a `$15` rolling-24h cap across immutable original-attempt leases.
+Hosted maintenance has both a `$15` per-job cap (`RUN_CAP`, `$5` for harness repairs) and a `$50` rolling-24h cap (`DAILY_BUDGET`, both in `task.mjs`) across immutable original-attempt leases, so one run whose usage stays unknown holds at most `$15` of the day.
 Every workflow rerun is unpaid; only selective retries of the known model-free effects job may perform already-approved effects.
 The model/gate wrapper has a two-hour deadline; the separate no-model release job has its own timeout.
 That deadline counts from run creation, so a run that waited behind another run in the shared concurrency group is admitted only with at least 90 minutes left; otherwise it reports `horizon-too-short` and pays nothing, instead of being cut off mid-turn with unknown usage holding its whole cap for a day.
