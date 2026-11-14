@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import YAML from 'yaml';
 import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
 import { resolveModelScopeWithDiagnostics } from '@earendil-works/pi-coding-agent';
-import { createRuntime, piModelResolver, selectModels, snapshot } from './maintain.mjs';
+import { createRuntime, flagshipVisionModel, generationRank, modelLineage, piModelResolver, priced, selectModels, snapshot, worstTier } from './maintain.mjs';
 import { pinnedRunroot } from './fake-podman.mjs';
 import { providerEnvNames } from './report.mjs';
 
@@ -52,35 +52,49 @@ test('Pi default model table comes from the pinned resolver behind the public sc
   const providers = getBuiltinProviders(), table = Object.entries(piModelResolver.defaultModelPerProvider);
   assert.ok(table.length > 0); for (const [provider, id] of table) assert.ok(providers.includes(provider) && typeof id === 'string' && id, provider);
 });
-test('selection takes the Pi default of each credentialed provider in findInitialModel order, prefers an independent reviewer, and fails closed', async t => {
+test('selection takes each credentialed provider\'s newest image-capable flagship generation, keeps a not-weaker image reviewer, and fails closed', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'honest-annie-model-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   const set = providerEnv(t), table = piModelResolver.defaultModelPerProvider, settings = JSON.parse(readFileSync(join(moduleDir, 'ci-settings.json')));
-  const select = async (vars, extra = {}, held) => { set(vars); return selectModels({ ...settings, ...extra }, await createRuntime(dir), held); };
+  const select = async (vars, extra = {}, held) => { set(vars); const runtime = await createRuntime(dir); return { runtime, choices: await selectModels({ ...settings, ...extra }, runtime, held) }; };
   // Pi's own first choice for the same credentials, as an interactive session without settings would start.
   const piFirst = async vars => { set(vars); const runtime = await createRuntime(dir); await runtime.getAvailable(); const { model } = await piModelResolver.findInitialModel({ scopedModels: [], isContinuing: false, modelRuntime: runtime }); return { provider: model.provider, modelId: model.id }; };
-  const first = choices => ({ provider: choices.executor.provider, modelId: choices.executor.modelId });
+  const flagship = (models, provider) => flagshipVisionModel(models.filter(model => model.provider === provider), table[provider]);
   assert.deepEqual(settings, {});
   await assert.rejects(select({}), /no configured model available/);
   for (const [vars, provider] of [[{ ZAI_API_KEY: 'zai-only' }, 'zai'], [{ MINIMAX_API_KEY: 'minimax-only' }, 'minimax'], [{ DEEPSEEK_API_KEY: 'deepseek-only' }, 'deepseek']]) {
-    const choices = await select(vars);
-    assert.deepEqual(choices.executor, { provider, modelId: table[provider], thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, choices.executor);
-    assert.deepEqual(first(choices), await piFirst(vars));
+    const { runtime, choices } = await select(vars);
+    const models = await runtime.getAvailable(), pick = flagship(models, provider);
+    // The flagship tier: the newest image-capable generation of the provider's Pi-default family, else that default itself.
+    assert.equal(choices.executor.provider, provider);
+    assert.equal(choices.executor.modelId, pick?.id ?? table[provider]);
+    if (pick) {
+      const [pickFamily, anchorFamily] = [modelLineage(pick.id).family, modelLineage(table[provider]).family];
+      assert.ok(pickFamily === anchorFamily || pickFamily.startsWith(anchorFamily) || anchorFamily.startsWith(pickFamily));
+      assert.ok(pick.input.includes('image') && priced(pick));
+      for (const model of models) if (model.provider === provider && priced(model) && model.input?.includes('image') && modelLineage(model.id).family === modelLineage(pick.id).family) assert.ok(generationRank(modelLineage(model.id).generation, modelLineage(pick.id).generation) <= 0, model.id);
+    }
+    // One provider: the reviewer is the executor's own model; Pi's interactive default stays the pinned table entry.
+    assert.deepEqual(choices.reviewer, choices.executor);
+    assert.deepEqual(await piFirst(vars), { provider, modelId: table[provider] });
   }
   const both = { ZAI_API_KEY: 'zai', MINIMAX_API_KEY: 'minimax' };
-  let choices = await select(both);
-  assert.deepEqual(choices.executor, { provider: 'zai', modelId: table.zai, thinkingLevel: 'high' }); assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' });
-  assert.deepEqual(first(choices), await piFirst(both));
-  // A Pi enabledModels preference (glob, thinking suffix) leads; the remaining Pi defaults follow as fallbacks.
-  choices = await select(both, { enabledModels: ['minimax/*M3:medium'] });
-  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}:${choice.thinkingLevel}`), [`minimax/MiniMax-M3:medium`, `zai/${table.zai}:high`, `minimax/${table.minimax}:high`]);
-  assert.equal(choices.reviewer.provider, 'zai');
-  choices = await select(both, {}, new Set(['zai']));
-  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
+  let { runtime, choices } = await select(both);
+  const models = await runtime.getAvailable(), entry = choice => models.find(model => model.provider === choice.provider && model.id === choice.modelId);
+  // The reviewer prefers another provider, is never weaker than the executor, and both keep image input while the catalog offers it.
+  assert.ok(choices.reviewer.provider !== choices.executor.provider || choices.reviewer.modelId === choices.executor.modelId);
+  for (const choice of [choices.executor, choices.reviewer]) if (flagship(models, choice.provider)) assert.ok(entry(choice).input.includes('image'), choice.modelId);
+  assert.ok(worstTier(entry(choices.reviewer)) >= worstTier(entry(choices.executor)));
+  // A Pi enabledModels preference (exact id, thinking suffix) leads; the flagship tiers and Pi defaults follow as fallbacks.
+  ({ choices } = await select(both, { enabledModels: [`minimax/${table.minimax}:medium`] }));
+  assert.deepEqual(choices.available[0], { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'medium' });
+  ({ choices } = await select(both, {}, new Set(['zai'])));
+  assert.deepEqual(choices.available.map(choice => choice.provider), ['minimax', 'minimax']); assert.deepEqual(choices.providers, ['zai', 'minimax']);
   await assert.rejects(select(both, {}, new Set(['zai', 'minimax'])), /held providers/);
   // Cloudflare is an ordinary provider: unusable without its account companion, a coding candidate with it.
   await assert.rejects(select({ CLOUDFLARE_API_KEY: 'cf' }), /no configured model available/);
-  choices = await select({ CLOUDFLARE_API_KEY: 'cf', CLOUDFLARE_ACCOUNT_ID: 'acct' });
-  assert.deepEqual(first(choices), { provider: 'cloudflare-workers-ai', modelId: table['cloudflare-workers-ai'] });
+  ({ choices } = await select({ CLOUDFLARE_API_KEY: 'cf', CLOUDFLARE_ACCOUNT_ID: 'acct' }));
+  assert.equal(choices.executor.provider, 'cloudflare-workers-ai');
+  assert.ok(choices.available.some(choice => choice.modelId === table['cloudflare-workers-ai']));
 });
 test('CI initialization confines runtime paths to runner temp and prepare sets bot identity', t => {
   const f = fixture(t); const envFile = join(f.dir, 'github-env'), agent = join(f.dir, 'agent');
