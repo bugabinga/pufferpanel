@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requestFingerprint } from './incident.mjs';
 import { DAILY_BUDGET as B, RUN_CAP } from './task.mjs';
-import { controller, digest, harnessFingerprint, retryEffects, verifyUploadedLease, POLICY_PATH } from './controller.mjs';
+import { controller, digest, harnessFingerprint, makeLease, retryEffects, verifyUploadedLease, POLICY_PATH } from './controller.mjs';
 const OWN = 'bugabinga/pufferpanel', now = Date.parse('2026-04-03T04:17:00Z'), base = 'a'.repeat(40), U = 'b'.repeat(40), tree = { tree: [{ path: '.github', sha: 'c'.repeat(40) }, { path: 'tools', sha: 'd'.repeat(40) }] };
 const response = body => new Response(JSON.stringify(body));
 function zip(value, name) {
@@ -538,6 +538,34 @@ test('live regression: an open harness PR blocks a second paid repair for its in
   // An unknown PR lookup admits nothing.
   f.runs.push(f.run(46)); f.artifact(46, 'annie-checkpoint-46-1', 'checkpoint.json', { ...held, runId: 46 }); f.pullsAll.fail = true; f.setCurrent(47);
   const unknown = await f.execute(); assert.equal(unknown.harnessRepair, null); assert.deepEqual(unknown.harnessWaits, [{ incident, reason: 'harness-pr-lookup-unknown' }]);
+});
+test('live #4 recovery: third run hit the call limit, a policy change admits unique run 4 over PR6 without resetting history or refunding spend', async t => {
+  const f = await fixture(t), outputPath = join(f.dir, 'outputs');
+  f.issues.push({ number: 4, title: 'model selection', body: 'use flagship models', user: { login: 'bugabinga', type: 'User' }, labels: [{ name: 'annie-harness' }] });
+  await f.execute();
+  const first = await f.json('lease.json'), cp = await f.json('checkpoint.json'), incident = first.task.incident, policy = cp.incidents[0].repair.policy;
+  const tasks = [1, 2, 3].map(n => harnessFingerprint(incident, policy, n));
+  cp.runId = 44; cp.flights = []; cp.incidents[0].repair = { tasks, last: tasks[2], runId: 44, at: now, policy };
+  const third = makeLease({ run: f.run(44), repoId: 7, workflowId: 8, task: { ...first.task, fingerprint: tasks[2] }, cap: 5, now });
+  f.runs.push(f.run(44)); f.artifact(44, 'annie-checkpoint-44-1', 'checkpoint.json', cp); f.artifact(44, 'annie-lease-44-1', 'lease.json', third);
+  f.artifact(44, 'honest-annie-model-report-44-1', 'report.json', { ledgerReservation: third.hash, fingerprint: tasks[2], taskKind: 'harness', incident, day: third.task.day, base, phase: 'failed', reason: 'model-or-phase-failed', blocker: 'model request failed: model_error model call limit exceeded', managementApproved: false, commit: null, releaseCommit: null, usageComplete: true, reportedUsage: { status: 'known', cost: 2.87 } });
+  f.prs.push({ number: 6, state: 'open', user: { type: 'Bot' }, head: { ref: `annie/harness/${tasks[1].slice(0, 12)}`, repo: { full_name: OWN } }, body: `<!-- annie-harness-incident:${incident} -->` });
+  f.setCurrent(45); f.setClock(now + 3600000); await writeFile(outputPath, '');
+  const backoff = await f.execute({ GITHUB_OUTPUT: outputPath, ANNIE_MODE: 'observe' });
+  assert.deepEqual(backoff.harnessWaits, [{ incident, reason: 'limit-backoff', pr: 6 }]);
+  const output = Object.fromEntries((await readFile(outputPath, 'utf8')).trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+  const notice = JSON.parse(output.notices)[0]; assert.equal(notice.limit, true); assert.equal(notice.attempt, 2); assert.equal(notice.pr, 6);
+  f.setChangedPolicy(base);
+  const recovered = await f.execute();
+  assert.equal(recovered.state, 'admitted'); assert.deepEqual(recovered.harnessRepair, { incident, kind: 'operator-request', attempt: 4 });
+  assert.ok(Math.abs(recovered.allowance - (B - 2.87)) < 1e-9, 'the failed attempt cost is not refunded');
+  const fourth = await f.json('lease.json'), checkpoint = await f.json('checkpoint.json'), history = checkpoint.incidents[0].repair;
+  assert.equal(fourth.cap, 5); assert.equal(fourth.task.fingerprint, harnessFingerprint(incident, changedPolicy, 4));
+  assert.deepEqual(history.tasks, [...tasks, fourth.task.fingerprint]); assert.deepEqual(history.limits, [tasks[2]]);
+  // A later observation cannot discard the exemption, count it twice, or buy duplicate run 4.
+  f.runs.push(f.run(45)); f.artifact(45, 'annie-checkpoint-45-1', 'checkpoint.json', checkpoint); f.setCurrent(46);
+  const waiting = await f.execute({ ANNIE_MODE: 'observe' }); assert.equal(waiting.harnessRepair, null); assert.equal(waiting.harnessWaits[0].reason, 'in-flight');
+  assert.deepEqual((await f.json('checkpoint.json')).incidents[0].repair, history);
 });
 test('feedback on an open harness PR from a write account or another agent buys one more attempt with the PR in the digest; outsiders and Annie never do', async t => {
   const { f, lease, checkpoint } = await admittedRepair(t), incident = lease.task.incident, outputPath = join(f.dir, 'outputs');

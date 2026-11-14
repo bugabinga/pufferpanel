@@ -7,7 +7,7 @@ import { DAILY_BUDGET, HARNESS_BRANCH_PREFIX, HARNESS_CAP, OWN, RUN_CAP, REF, ac
 import { checkPR, protectedPolicy } from './pr.mjs';
 import { authorTrust } from './github.mjs';
 import { excerpt } from './report.mjs';
-import { MAX_REPAIRS, REPAIRABLE, REQUEST, REQUEST_LABEL, detectIncidents, foldIncidents, foldRepair, makeDigest, openRepairs, ready, repairDecision, requestFingerprint, syncNotices, DECISION, syncIncidents, syncable, validateIncidents } from './incident.mjs';
+import { MAX_REPAIRS, REPAIRABLE, limitFailure, spentRepairs, REQUEST, REQUEST_LABEL, detectIncidents, foldIncidents, foldRepair, makeDigest, openRepairs, ready, repairDecision, requestFingerprint, syncNotices, DECISION, syncIncidents, syncable, validateIncidents } from './incident.mjs';
 
 export const POLICY_PATH = '.github/workflows/honest-annie.yml';
 export const WAKE_PATH = '.github/workflows/annie-pr-wake.yml';
@@ -532,7 +532,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
   }), now);
   // Harness repair admission: one open proposal per incident and bounded retries (repairDecision); unknown PR state admits none.
   const createdAt = id => { const found = ledger.runs.find(r => r.id === id); return found ? time(found.created_at) : now; };
-  const attempts = [...ledger.records.filter(r => !r.zeroDispatch && r.lease?.task.kind === 'harness').map(r => ({ incident: r.lease.task.incident, task: r.lease.task.fingerprint, runId: r.run.id, at: time(r.run.created_at), running: r.run.status !== 'completed' || pending.includes(r) })),
+  const attempts = [...ledger.records.filter(r => !r.zeroDispatch && r.lease?.task.kind === 'harness').map(r => ({ incident: r.lease.task.incident, task: r.lease.task.fingerprint, runId: r.run.id, at: time(r.run.created_at), limit: r.run.status === 'completed' && limitFailure(r.settlement), running: r.run.status !== 'completed' || pending.includes(r) })),
     ...fresh.flights.filter(f => f.task.kind === 'harness').map(f => ({ incident: f.task.incident, task: f.task.fingerprint, runId: f.runId, at: createdAt(f.runId), running: true }))];
   for (const incident of fresh.incidents) { const repair = foldRepair(incident.repair, attempts.filter(a => a.incident === incident.fingerprint)); if (repair) incident.repair = repair; }
   const known = new Map([...fresh.incidents.flatMap(incident => (incident.repair?.tasks ?? []).map(fp => [harnessBranch(fp), incident.fingerprint])), ...attempts.map(a => [harnessBranch(a.task), a.incident])]);
@@ -547,7 +547,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
       catch { waits.push({ incident: incident.fingerprint, reason: 'pr-feedback-unknown', pr: incident.pr }); continue; }
     }
     let last = null;
-    if (repair && !running && !incident.pr && repair.tasks.length < MAX_REPAIRS) {
+    if (repair && !running && !incident.pr && spentRepairs(repair) < MAX_REPAIRS) {
       const branchName = harnessBranch(repair.last);
       try {
         const found = (await api.pages(`/repos/${OWN}/pulls?state=all&head=${encodeURIComponent(`${OWN.split('/')[0]}:${branchName}`)}`)).find(pr => pr?.head?.ref === branchName);
@@ -590,7 +590,7 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
         fresh.paid = true;
         fresh.flights.push({ runId: run.id, task, queue });
         if (['maintenance', 'pr'].includes(task.kind)) fresh.slots.push(day);
-        if (task.kind === 'harness') { const incident = fresh.incidents.find(entry => entry.fingerprint === task.incident); incident.repair = { tasks: [...(incident.repair?.tasks ?? []), task.fingerprint].slice(-5), last: task.fingerprint, runId: run.id, at: now, policy }; }
+        if (task.kind === 'harness') { const incident = fresh.incidents.find(entry => entry.fingerprint === task.incident); incident.repair = { ...incident.repair, tasks: [...(incident.repair?.tasks ?? []), task.fingerprint], last: task.fingerprint, runId: run.id, at: now, policy }; }
         state = 'admitted';
       }
     }
@@ -626,9 +626,11 @@ export async function controller({ env = process.env, fetchImpl = fetch, now = D
     // An attempt over a still-open harness PR answered its feedback, so it replies there.
     const pr = selected?.kind === 'harness' ? fresh.incidents.find(i => i.fingerprint === selected.incident)?.pr ?? null : null;
     if (!request && !pr || !result || result.commit || record.run.status !== 'completed' || result.phase === 'publishing' || !(Date.parse(record.reportMeta?.created_at) >= noticeSince) || notices.length >= 5) continue;
-    const attempt = (fresh.incidents.find(i => i.fingerprint === selected.incident)?.repair?.tasks.indexOf(selected.fingerprint) ?? -1) + 1;
+    const repair = fresh.incidents.find(i => i.fingerprint === selected.incident)?.repair;
+    const index = repair?.tasks.indexOf(selected.fingerprint) ?? -1;
+    const attempt = index < 0 ? null : repair.tasks.slice(0, index + 1).filter(task => !repair.limits?.includes(task)).length;
     const bounded = (value, limit) => typeof value === 'string' && value ? excerpt(value, limit) : null;
-    notices.push({ issue: request?.number ?? null, pr, decision: pr ? DECISION.exec(result.diagnosis ?? '')?.[1]?.toLowerCase() ?? null : null, runId: record.run.id, task: selected.fingerprint, phase: /^[a-z-]{1,20}$/.test(result.phase ?? '') ? result.phase : 'failed', reason: bounded(result.blocker ?? result.reason, 1480), diagnosis: bounded(result.diagnosis, 2980), attempt: attempt || null });
+    notices.push({ issue: request?.number ?? null, pr, decision: pr ? DECISION.exec(result.diagnosis ?? '')?.[1]?.toLowerCase() ?? null : null, runId: record.run.id, task: selected.fingerprint, phase: /^[a-z-]{1,20}$/.test(result.phase ?? '') ? result.phase : 'failed', reason: bounded(result.blocker ?? result.reason, 1480), diagnosis: bounded(result.diagnosis, 2980), attempt, ...(limitFailure(result) ? { limit: true } : {}) });
   }
   await output('notices', notices.length ? JSON.stringify(notices) : '');
   const issueWork = syncable(fresh.incidents), repairing = lease && task.kind === 'harness' ? fresh.incidents.find(incident => incident.fingerprint === task.incident) : null;

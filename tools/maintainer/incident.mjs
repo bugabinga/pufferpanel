@@ -82,24 +82,42 @@ export const ready = entry => entry.status === 'open' && (entry.kind === REQUEST
 export const syncable = entries => entries.filter(entry => entry.kind !== REQUEST && (ready(entry) || entry.status === 'cleared' && entry.count >= 2));
 export function validateIncidents(value) {
   const keys = 'count,detail,fingerprint,firstSeen,kind,lastSeen,runs,since,status', hex = /^[a-f0-9]{64}$/;
-  const repairOk = r => r === undefined || r && typeof r === 'object' && Object.keys(r).sort().join() === 'at,last,policy,runId,tasks' && Array.isArray(r.tasks) && r.tasks.length >= 1 && r.tasks.length <= 5 && r.tasks.every(task => hex.test(task)) && new Set(r.tasks).size === r.tasks.length && r.tasks.includes(r.last) && Number.isSafeInteger(r.runId) && r.runId > 0 && Number.isSafeInteger(r.at) && r.at > 0 && (r.policy === null || hex.test(r.policy));
+  const repairOk = r => r === undefined || r && typeof r === 'object' && Object.keys(r).filter(key => key !== 'limits').sort().join() === 'at,last,policy,runId,tasks' && Array.isArray(r.tasks) && r.tasks.length >= 1 && r.tasks.length <= MAX_REPAIR_RUNS && (r.limits === undefined || Array.isArray(r.limits) && r.limits.every(task => r.tasks.includes(task)) && new Set(r.limits).size === r.limits.length) && r.tasks.every(task => hex.test(task)) && new Set(r.tasks).size === r.tasks.length && r.tasks.includes(r.last) && Number.isSafeInteger(r.runId) && r.runId > 0 && Number.isSafeInteger(r.at) && r.at > 0 && (r.policy === null || hex.test(r.policy));
   if (!Array.isArray(value) || value.length > 20 || new Set(value.map(entry => entry?.fingerprint)).size !== value.length || value.some(entry => !entry || typeof entry !== 'object' || Object.keys(entry).filter(key => !['pr', 'repair'].includes(key)).sort().join() !== keys || !repairOk(entry.repair) || entry.pr !== undefined && (!Number.isSafeInteger(entry.pr) || entry.pr < 1) || !/^[a-f0-9]{64}$/.test(entry.fingerprint) || !KINDS.includes(entry.kind) || typeof entry.detail !== 'string' || !/^[\x20-\x7e]{0,200}$/.test(entry.detail) || !Array.isArray(entry.runs) || entry.runs.length > 5 || entry.runs.some(id => !Number.isSafeInteger(id) || id < 1) || ['firstSeen', 'since', 'lastSeen'].some(key => !Number.isSafeInteger(entry[key]) || entry[key] <= 0) || entry.firstSeen > entry.since || entry.since > entry.lastSeen || !Number.isSafeInteger(entry.count) || entry.count < 1 || entry.count > 1_000_000 || !['open', 'cleared'].includes(entry.status))) throw Error('malformed incidents');
   return value;
 }
 
-// Repair admission, at most one open proposal per incident and three attempts: never while an attempt runs or a PR awaits
+// Repair admission, at most one open proposal per incident and three substantive attempts: never while an attempt runs or a PR awaits
 // Oliver; afterwards only once the PR was (a) closed unmerged, (b) merged with evidence after the merge, or for (c) an attempt
-// without a PR, once trusted policy changed or 24h passed. A policy change alone never retries over an open PR.
+// without a PR, once trusted policy changed or 24h passed. A host limit failure discounts that run and permits a policy/24h retry.
 export const MAX_REPAIRS = 3;
+// Keep complete bounded identity history, never a sliding window that could reuse ordinals or forget substantive attempts.
+export const MAX_REPAIR_RUNS = 64;
+export const spentRepairs = repair => (repair?.tasks.length ?? 0) - (repair?.limits?.length ?? 0);
+// Only exact host-generated call/deadline failures qualify, not provider quota or model-written diagnoses. An interrupted
+// run without this settlement evidence stays conservative. Costs and unknown reservations remain charged independently.
+export const limitFailure = report => report?.phase === 'failed' && [
+  'model request failed: model_error model call limit exceeded',
+  'two hour maintenance deadline exceeded',
+  'two-hour-deadline-exceeded',
+  'model request failed: model_error two hour maintenance deadline exceeded',
+].includes(report.blocker ?? report.reason);
 export const harnessIncidentMarker = incident => `<!-- annie-harness-incident:${incident} -->`;
 export function repairDecision({ entry, running = false, last = null, policy, now, evidenceAt = 0, feedbackAt = 0 }) {
   const repair = entry.repair, attempt = (repair?.tasks.length ?? 0) + 1;
   if (running) return { admit: false, reason: 'in-flight' };
+  if ((repair?.tasks.length ?? 0) >= MAX_REPAIR_RUNS) return { admit: false, reason: 'repair-history-full' };
+  if (repair?.limits?.includes(repair.last) && spentRepairs(repair) < MAX_REPAIRS) {
+    // A limit failure never consumes substantive allowance or the feedback it was answering. Retry only after a trusted
+    // policy change or 24h, including over an open PR. Fresh feedback alone never bypasses this backoff.
+    const retry = repair.policy !== null && repair.policy !== policy || now - repair.at >= DAY;
+    return retry ? { admit: true, attempt, reason: 'limit-retry' } : { admit: false, reason: 'limit-backoff', ...(entry.pr ? { pr: entry.pr } : {}) };
+  }
   // An open harness PR waits for Oliver, unless feedback newer than the last attempt arrived on it (or on the request):
   // then Annie decides again whether to rework, withdraw, or keep it.
-  if (entry.pr) return !(feedbackAt > (repair?.at ?? Infinity)) ? { admit: false, reason: 'awaiting-review', pr: entry.pr } : repair.tasks.length >= MAX_REPAIRS ? { admit: false, reason: 'attempts-exhausted', pr: entry.pr } : { admit: true, attempt, reason: 'pr-feedback', pr: entry.pr };
+  if (entry.pr) return !(feedbackAt > (repair?.at ?? Infinity)) ? { admit: false, reason: 'awaiting-review', pr: entry.pr } : spentRepairs(repair) >= MAX_REPAIRS ? { admit: false, reason: 'attempts-exhausted', pr: entry.pr } : { admit: true, attempt, reason: 'pr-feedback', pr: entry.pr };
   if (!repair) return { admit: true, attempt, reason: 'first' };
-  if (repair.tasks.length >= MAX_REPAIRS) return { admit: false, reason: 'attempts-exhausted' };
+  if (spentRepairs(repair) >= MAX_REPAIRS) return { admit: false, reason: 'attempts-exhausted' };
   if (last?.state === 'open') return { admit: false, reason: 'awaiting-review', pr: last.number };
   // An operator request retries only on Oliver's feedback after the last attempt (or a reopened request): a closed PR,
   // a merged PR, or a no-op alone never buys the same guess again.
@@ -113,9 +131,12 @@ export function repairDecision({ entry, running = false, last = null, policy, no
 export function foldRepair(repair, attempts) {
   const ordered = [...attempts].sort((a, b) => a.runId - b.runId), newest = ordered.at(-1);
   if (!newest) return repair ?? null;
-  const tasks = [...new Set([...(repair?.tasks ?? []), ...ordered.map(a => a.task)])].slice(-5);
-  if (repair && newest.runId <= repair.runId) return { ...repair, tasks: tasks.includes(repair.last) ? tasks : [...tasks.slice(-4), repair.last] };
-  return { tasks, last: newest.task, runId: newest.runId, at: newest.at, policy: null };
+  const tasks = [...new Set([...(repair?.tasks ?? []), ...ordered.map(a => a.task)])];
+  if (tasks.length > MAX_REPAIR_RUNS) throw Error('repair history capacity exceeded');
+  const limits = [...new Set([...(repair?.limits ?? []), ...ordered.filter(a => a.limit).map(a => a.task)])];
+  const history = { tasks, ...(limits.length ? { limits } : {}) };
+  if (repair && newest.runId <= repair.runId) return { ...repair, ...history };
+  return { ...history, last: newest.task, runId: newest.runId, at: newest.at, policy: null };
 }
 // Open harness PRs per incident, by body marker or a known attempt branch; an unattributable one blocks every repair.
 export function openRepairs(prs, known) {
@@ -220,16 +241,16 @@ async function awaiting(api, entry, number) {
 const issueRef = value => value === null || Number.isSafeInteger(value) && value >= 1;
 export const DECISION = /^\s*(?:#+\s*)?\**Decision:?\**:?\s*\**(withdraw|keep)\b/im;
 export const validateNotices = value => {
-  if (!Array.isArray(value) || value.length > 5 || value.some(n => !n || typeof n !== 'object' || Object.keys(n).sort().join() !== 'attempt,decision,diagnosis,issue,phase,pr,reason,runId,task' || !issueRef(n.issue) || !issueRef(n.pr) || n.issue === null && n.pr === null || ![null, 'withdraw', 'keep'].includes(n.decision) || n.decision && n.pr === null || !Number.isSafeInteger(n.runId) || n.runId < 1 || !/^[a-f0-9]{64}$/.test(n.task ?? '') || !/^[a-z-]{1,20}$/.test(n.phase ?? '') || !(n.attempt === null || Number.isSafeInteger(n.attempt) && n.attempt >= 1) || ![[n.reason, 1500], [n.diagnosis, 3000]].every(([v, max]) => v === null || typeof v === 'string' && v.length <= max))) throw Error('malformed request notices');
+  if (!Array.isArray(value) || value.length > 5 || value.some(n => !n || typeof n !== 'object' || Object.keys(n).filter(key => key !== 'limit').sort().join() !== 'attempt,decision,diagnosis,issue,phase,pr,reason,runId,task' || n.limit !== undefined && typeof n.limit !== 'boolean' || !issueRef(n.issue) || !issueRef(n.pr) || n.issue === null && n.pr === null || ![null, 'withdraw', 'keep'].includes(n.decision) || n.decision && n.pr === null || !Number.isSafeInteger(n.runId) || n.runId < 1 || !/^[a-f0-9]{64}$/.test(n.task ?? '') || !/^[a-z-]{1,20}$/.test(n.phase ?? '') || !(n.attempt === null || Number.isSafeInteger(n.attempt) && n.attempt >= 0) || ![[n.reason, 1500], [n.diagnosis, 3000]].every(([v, max]) => v === null || typeof v === 'string' && v.length <= max))) throw Error('malformed request notices');
   return value;
 };
 export function noticeBody(n) {
-  const last = n.attempt !== null && n.attempt >= MAX_REPAIRS;
-  const head = n.decision === 'withdraw' ? '**Withdrawn**: Annie read the feedback and closes this PR.' : n.decision === 'keep' ? '**Keeping this PR**: Annie read the feedback and stands by the change.' : n.phase === 'published' ? `**No action**: Annie looked at this ${n.pr ? 'feedback' : 'request'} and changed nothing.` : '**Blocked**: this attempt ended without a PR.';
+  const last = !n.limit && n.attempt !== null && n.attempt >= MAX_REPAIRS;
+  const head = n.limit ? '**Limit reached**: this run ended without finishing the work; it does not consume a substantive attempt.' : n.decision === 'withdraw' ? '**Withdrawn**: Annie read the feedback and closes this PR.' : n.decision === 'keep' ? '**Keeping this PR**: Annie read the feedback and stands by the change.' : n.phase === 'published' ? `**No action**: Annie looked at this ${n.pr ? 'feedback' : 'request'} and changed nothing.` : '**Blocked**: this attempt ended without a PR.';
   // An answer to feedback is the point of the comment, so it stays visible; other diagnoses fold away.
   const answer = !n.diagnosis ? [] : n.decision ? ['', inert(n.diagnosis)] : ['', '<details><summary>Diagnosis (model-written, unverified)</summary>', '', inert(n.diagnosis), '', '</details>'];
   return [head, '', `- Run: https://github.com/${OWN}/actions/runs/${n.runId}`, `- Outcome: \`${n.phase}\`${n.reason ? `, ${md(n.reason, 200)}` : ''}`, ...answer, '',
-    n.decision === 'withdraw' ? '' : last ? `That was attempt ${n.attempt} of ${MAX_REPAIRS}; Annie stops trying here.` : `Reply here with corrections or more detail and Annie tries again${n.attempt ? ` (attempt ${n.attempt} of ${MAX_REPAIRS} used)` : ''}.`,
+    n.limit ? 'Annie retries after a harness policy change or 24h, within the same spending limits. Existing costs stay charged.' : n.decision === 'withdraw' ? '' : last ? `That was attempt ${n.attempt} of ${MAX_REPAIRS}; Annie stops trying here.` : `Reply here with corrections or more detail and Annie tries again${n.attempt ? ` (attempt ${n.attempt} of ${MAX_REPAIRS} used)` : ''}.`,
     `<!-- annie-request:${n.task} -->`].join('\n');
 }
 export async function syncNotices(api, notices) {

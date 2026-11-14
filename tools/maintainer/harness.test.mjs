@@ -12,7 +12,7 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { advance, createHostHooks, ensureWorktree, guardFor, installReviewer, ModelCodemode, ModelCodingTools, snapshot } from './maintain.mjs';
 import { HARNESS_CAP, validateTask } from './task.mjs';
-import { MAX_REPAIRS, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, requestFingerprint, DECISION, noticeBody, syncIncidents, syncNotices, syncable, validateIncidents, validateNotices } from './incident.mjs';
+import { MAX_REPAIRS, MAX_REPAIR_RUNS, limitFailure, spentRepairs, deliverHarness, detectIncidents, foldIncidents, foldRepair, harnessIncidentMarker, incidentBody, makeDigest, openRepairs, parseDigest, ready, repairDecision, requestFingerprint, DECISION, noticeBody, syncIncidents, syncNotices, syncable, validateIncidents, validateNotices } from './incident.mjs';
 import { GitHub, digest as sha256, makeLease, verifyLease, POLICY_PATH } from './controller.mjs';
 import { checkPR } from './pr.mjs';
 import { HARNESS_PATHS, harnessScope, harnessScopeViolation } from './scope.mjs';
@@ -438,6 +438,31 @@ test('repair decisions: never while running or awaiting a PR; retry only after c
   assert.equal(MAX_REPAIRS, 3); assert.equal(decide(entry(full), { state: 'closed', number: 7 }).reason, 'attempts-exhausted');
 });
 
+test('limit failures preserve substantive allowance, unique ordinals, backoff, and complete history through reconstruction', () => {
+  const task = n => n.toString(16).padStart(64, '0');
+  let repair = null;
+  for (let n = 1; n <= 7; n++) repair = foldRepair(repair, [{ task: task(n), runId: n, at: NOW + n, limit: n >= 3 }]);
+  assert.equal(repair.tasks.length, 7); assert.equal(spentRepairs(repair), 2); assert.equal(repair.last, task(7));
+  repair = { ...repair, policy: 'a'.repeat(64) };
+  const entry = { kind: 'operator-request', repair, pr: 6, since: NOW };
+  const base = { entry, policy: repair.policy, now: NOW + 10, feedbackAt: NOW + 1000 };
+  assert.equal(repairDecision(base).reason, 'limit-backoff', 'new feedback alone never skips the limit backoff');
+  assert.deepEqual(repairDecision({ ...base, policy: 'b'.repeat(64), feedbackAt: 0 }), { admit: true, attempt: 8, reason: 'limit-retry' });
+  assert.equal(repairDecision({ ...base, now: repair.at + 86_400_000 }).admit, true);
+  assert.equal(repairDecision({ ...base, running: true, policy: 'b'.repeat(64) }).reason, 'in-flight');
+  assert.deepEqual(foldRepair(repair, [{ task: task(3), runId: 3, at: NOW + 3, limit: true }]), repair, 'old settled failures are discounted once and never replace the latest policy');
+  const next = foldRepair(repair, [{ task: task(8), runId: 8, at: NOW + 8 }]);
+  assert.equal(spentRepairs(next), 3); assert.equal(repairDecision({ ...base, entry: { ...entry, repair: next }, policy: 'b'.repeat(64) }).reason, 'attempts-exhausted');
+  const valid = { fingerprint: INCIDENT, kind: 'job-failed', detail: 'x', runs: [1], firstSeen: NOW, since: NOW, lastSeen: NOW + 10, count: 2, status: 'open', repair };
+  assert.equal(validateIncidents([valid])[0].repair.tasks.length, 7);
+  for (const limits of [[task(99)], [task(3), task(3)], 'bad']) assert.throws(() => validateIncidents([{ ...valid, repair: { ...repair, limits } }]), /malformed incidents/);
+  assert.equal(repairDecision({ ...base, entry: { ...entry, repair: { ...repair, tasks: Array.from({ length: MAX_REPAIR_RUNS }, (_, i) => task(i + 1)) } } }).reason, 'repair-history-full');
+  assert.equal(limitFailure({ phase: 'failed', blocker: 'model request failed: model_error model call limit exceeded' }), true);
+  assert.equal(limitFailure({ phase: 'failed', blocker: 'two hour maintenance deadline exceeded' }), true);
+  for (const report of [{ phase: 'executing', blocker: 'model request failed: model_error model call limit exceeded' }, { phase: 'failed', blocker: 'provider quota exceeded' }, { phase: 'failed', diagnosis: 'model call limit exceeded' }, { phase: 'failed', blocker: 'model request failed: model_error incomplete response' }]) assert.equal(limitFailure(report), false);
+  const note = { issue: 4, pr: 6, decision: null, runId: 42, task: task(7), phase: 'failed', reason: 'model-or-phase-failed', diagnosis: null, attempt: 2, limit: true };
+  validateNotices([note]); assert.match(noticeBody(note), /^\*\*Limit reached\*\*/); assert.match(noticeBody(note), /Annie retries/); assert.doesNotMatch(noticeBody(note), /stops trying/);
+});
 test('repair memory folds ledger attempts and open harness PRs are attributed by marker or known branch, never from forks', () => {
   const T = n => String(n).repeat(64), mine = { tasks: [T(1)], last: T(1), runId: 44, at: NOW, policy: 'a'.repeat(64) };
   assert.deepEqual(foldRepair(null, [{ task: T(1), runId: 44, at: NOW }, { task: T(2), runId: 46, at: NOW + 5 }]), { tasks: [T(1), T(2)], last: T(2), runId: 46, at: NOW + 5, policy: null });

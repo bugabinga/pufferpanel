@@ -59,7 +59,7 @@ console.log('TRIAGE', verdict.answers.flaky.probability > 0.5, JSON.stringify(im
   assert.match(items, /TRIAGE true/); assert.match(items, /image generation is disabled: it has no budget admission/);
   assert.equal(f.seen.images, 0); assert.equal(f.seen.classify.length, 1); assert.equal(f.seen.classify[0].options.maxRetries, 0);
   const calls = await f.calls(), classified = calls.filter(call => call.type === 'classifier');
-  assert.deepEqual(classified, [{ model: 'judge/clef', cap: capOf(flaky), cost: 0.00024, type: 'classifier' }]);
+  assert.deepEqual(classified, [{ model: 'judge/clef', phase: 'executing', cap: capOf(flaky), cost: 0.00024, type: 'classifier' }]);
   const summary = callUsage({ requestId: 'current', calls }, 'current');
   assert.equal(summary.dispatched, calls.length); assert.equal(calls.length, 3); assert.equal(summary.usageComplete, true); assert.ok(summary.cost >= 0.00024);
 });
@@ -78,6 +78,17 @@ test('classifier admission refuses over budget, past deadline, and at the call l
   assert.match(unpriced.errorMessage, /classifier pricing unknown/); assert.equal((await f.calls()).length, 0); assert.equal(f.seen.classify.length, 0);
 });
 
+test('classifiers share their current phase call cap with chat, not the other phase', async t => {
+  const f = await fixture(t, () => ({ answers: {}, stopReason: 'stop', usage: usage(1, 0) }), { phase: 'reviewing' });
+  const seed = async calls => f.root.commit(async tx => { const doc = await tx.doc(CallsDoc, f.root.id); doc.requestId = 'current'; doc.calls = calls; }, ctx);
+  const budgeted = budgetModels(f.models, { root: f.root, harness: f.harness });
+  const call = phase => ({ model: 'faux/faux-1', phase, cap: 0, cost: 0 });
+  await seed([...Array.from({ length: 256 }, () => call('executing')), ...Array.from({ length: 255 }, () => call('reviewing'))]);
+  assert.equal((await budgeted.classify(judge, flaky)).stopReason, 'stop');
+  const last = (await f.calls()).at(-1); assert.equal(last.phase, 'reviewing'); assert.equal(last.type, 'classifier');
+  assert.match((await budgeted.classify(judge, flaky)).errorMessage, /model call limit exceeded/);
+  assert.equal(f.seen.classify.length, 1); assert.equal((await f.calls()).length, 512);
+});
 test('classifier usage: unknown usage holds the reservation, provider errors settle at it, and neither is provider evidence', async t => {
   const outcomes = [
     ['no usage reported', () => ({ answers: {}, stopReason: 'stop' }), null],
@@ -90,7 +101,7 @@ test('classifier usage: unknown usage holds the reservation, provider errors set
     const budgeted = budgetModels(models, { root: f.root, harness: f.harness });
     await budgeted.classify(judge, flaky);
     const calls = await f.calls(), summary = callUsage({ requestId: 'current', calls }, 'current');
-    assert.deepEqual(calls, [{ model: 'judge/clef', cap: capOf(flaky), cost: settles ? capOf(flaky) : null, type: 'classifier' }], name);
+    assert.deepEqual(calls, [{ model: 'judge/clef', phase: 'executing', cap: capOf(flaky), cost: settles ? capOf(flaky) : null, type: 'classifier' }], name);
     assert.equal(summary.held, capOf(flaky), name); assert.equal(summary.usageComplete, Boolean(settles), name);
     assert.deepEqual([summary.providerFailures, summary.modelFailure, [...exhaustedProviders(calls)]], [[], null, []], name);
   }

@@ -212,7 +212,7 @@ async function modelFixture(t, behavior, extra = {}, selectedModel = null, { mod
   const dir = await scratch(t), registry = createRegistry();
   const harness = await Harness.open(await openNodeSqliteStorage(join(dir, 'calls.sqlite')), { registry, models: createModels() }, ctx);
   t.after(() => harness.close(ctx)); const root = await harness.root(ctx);
-  const current = { startedAt: Date.now(), requestId: 'current', spent: 0, usageStart: 0, ...extra };
+  const current = { startedAt: Date.now(), requestId: 'current', spent: 0, usageStart: 0, phase: 'executing', ...extra };
   await root.commit(async tx => { (await tx.doc(RunDoc, root.id)).run = current; }, ctx);
   let called = 0;
   const runtime = { getModel, streamSimple(model, transcript, options) { called++; return behavior(model, transcript, options); } };
@@ -236,6 +236,32 @@ test('review reasoning capacity reserves full phase-specific output cost before 
   }
   const insufficient = await modelFixture(t, () => assert.fail('full reviewer reservation exceeds remainder'), { phase: 'reviewing', budgetCap: 0.01 });
   const blocked = await insufficient.execute(); assert.equal(blocked.called, 0); assert.match(blocked.result.errorMessage, /budget/);
+});
+test('executor and reviewer each get 256 physical calls; a resumed phase and legacy calls cannot reset the allowance', async t => {
+  const f = await modelFixture(t, () => stream([{ type: 'done', reason: 'stop', message: goodMessage }]));
+  const set = async (phase, calls) => f.root.commit(async tx => {
+    (await tx.doc(RunDoc, f.root.id)).run.phase = phase;
+    if (calls) { const doc = await tx.doc(CallsDoc, f.root.id); doc.requestId = 'current'; doc.calls = calls; }
+  }, ctx);
+  const call = phase => ({ model: 'test/test', phase, cap: 0, cost: 0 });
+  await set('executing', Array.from({ length: 255 }, () => call('executing')));
+  assert.equal((await f.execute()).called, 1);
+  const blocked = await f.execute(); assert.equal(blocked.called, 1); assert.match(blocked.result.errorMessage, /model call limit exceeded/);
+  await set('reviewing');
+  assert.equal((await f.execute()).called, 2, '256 executor calls leave a fresh reviewer allowance');
+  await set('reviewing', [...Array.from({ length: 256 }, () => call('executing')), ...Array.from({ length: 255 }, () => call('reviewing'))]);
+  const final = await f.execute(); assert.equal(final.called, 3); assert.equal(final.usage.dispatched, 512);
+  const calls = (await f.harness.snapshot(CallsDoc, f.root.id, ctx)).calls;
+  assert.equal(calls.at(-1).phase, 'reviewing');
+  assert.equal(reportFor({ modelCalls: calls.length }).modelCalls, 512);
+  assert.match((await f.execute()).result.errorMessage, /model call limit exceeded/);
+  await set('executing');
+  assert.match((await f.execute()).result.errorMessage, /model call limit exceeded/, 'a gate repair never resets executor calls');
+  const legacy = Array.from({ length: 256 }, () => ({ model: 'test/test', cap: 0, cost: 0 }));
+  for (const phase of ['executing', 'reviewing']) {
+    await set(phase, legacy);
+    const res = await f.execute(); assert.equal(res.called, 3); assert.match(res.result.errorMessage, /model call limit exceeded/);
+  }
 });
 test('durable provider accounting settles real done and provider errors at their cap; incomplete or usage-less responses stay unknown', async t => {
   const good = await modelFixture(t, () => stream([{ type: 'done', reason: 'stop', message: goodMessage }]));

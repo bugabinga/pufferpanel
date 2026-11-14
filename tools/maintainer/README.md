@@ -85,7 +85,7 @@ Both conversations are offered only Pi Durable's `codemode` tool (QuickJS sandbo
 Each executor turn's final stop reason is reported in `executorDiagnostics`; a final answer cut at the output cap, which can silently drop a truncated codemode script, gets one continuation per executor conversation asking for a shorter script.
 Scripts call the other tools as nested calls; `codemode` and `submit_verdict` are model-only.
 Script `models.*` reaches only code mode's internal tools, which call the Harness models, which are this budgeted boundary.
-`models.classify()` reserves its serialized input bytes as tokens plus 4096 tokens of template and answer headroom, capped at the classifier's context window, at its highest catalog price, and commits that intent before dispatch inside the same lease, `$15` cap, deadline, and 256-call limit.
+`models.classify()` reserves its serialized input bytes as tokens plus 4096 tokens of template and answer headroom, capped at the classifier's context window, at its highest catalog price, and commits that intent before dispatch inside the same lease, `$15` cap, deadline, and the caller phase's 256-call limit.
 It dispatches without provider retries; a completed result with reported prompt tokens settles at pi-ai's usage cost, a provider error settles at the reservation, and missing usage, aborts, or interruption keep the reservation held.
 Classifier calls count toward cost and call count but never toward provider failures, holds, failover, or `modelFailure`, because scripts control their input.
 `models.generateImages()` returns an error without dispatch, raw `stream`, `complete`, and deferred calls are refused, and compaction's `completeSimple` uses the budgeted chat path.
@@ -335,7 +335,9 @@ Approved candidate: `honest-annie-candidate-RUN_ID-1`, always reused by selectiv
 Artifact transport verifies immutable IDs/digests, bounded ZIP contents, and HTTPS storage redirect hosts; native API auth is never forwarded to storage.
 Known complete actual cost replaces cap reservation and is held 24h from original final model-report artifact creation.
 Unknown/partial/interrupted cost holds the entire cap through original creation + 2h + 24h + 5min; nonterminal execution is held more conservatively.
-The provider boundary persists at most 256 request-scoped call intents, each naming its physical model, before dispatch.
+The provider boundary persists at most 256 call intents per phase (`executing` and `reviewing`), at most 512 per run, each naming its physical model and phase, before dispatch.
+Classifier requests and physical provider retries share the caller phase's cap; gate repair or conversation restart never resets a phase's count, and legacy intents without a phase conservatively count against both.
+Run-level dollar limits and the original deadline still cover both phases together.
 Reservations use the dispatched model's highest catalog tier prices for its full context window plus the phase output ceiling.
 Only a valid completed response settles, at pi-ai's normal final `usage.cost.total`: the provider-billed total when `totalFromProvider` is set, otherwise the catalog estimate for the dispatched model.
 A response without prompt and output tokens is treated as missing usage; missing, invalid, aborted, or interrupted usage never settles and keeps its reservation held.
@@ -482,10 +484,16 @@ Each checkpoint incident keeps `repair` memory `{tasks, last, runId, at, policy}
 Open PRs come from the complete open-PR list; an `annie/harness/` PR is attributed by its `annie-harness-incident` body marker or by a known attempt branch, and fork heads are ignored.
 An open harness PR that cannot be attributed, or an unknown lookup of the last attempt's PR, admits no harness repair at all.
 This covers the live PR #2, whose body predates the marker, only while its run is in the ledger or `repair` memory; otherwise every repair waits until Oliver closes or merges it.
-No repair starts while an attempt for the incident is in flight, or while its open PR awaits review without newer trusted feedback (see Feedback on harness PRs); a trusted policy change alone never retries.
+No repair starts while an attempt for the incident is in flight, or while its open PR awaits review without newer trusted feedback (see Feedback on harness PRs); a trusted policy change alone never retries, except after a qualifying host call/deadline failure.
 Another attempt needs (a) the last PR closed unmerged with the incident still present, (b) the last PR merged and either evidence from a run created after the merge or a recurrence after clearing, or (c) no PR from the last attempt and either a different admission policy or 24h, with an unknown admission policy waiting 24h.
 Kinds whose evidence never moves, such as an abandoned run, therefore never retry after a merge.
-At most three attempts are made per incident.
+At most three substantive attempts are made per incident.
+An exact host-generated call-limit or deadline failure in a completed `failed` report does not consume substantive allowance; model prose, provider quota failures, and interruption without such a report do not qualify.
+These exemptions persist as an optional `repair.limits` list of task fingerprints: the full `tasks` history determines the next run ordinal, while `tasks.length - limits.length` determines substantive allowance.
+After an exempt failure, a retry needs a different trusted harness policy or 24h; fresh feedback alone cannot bypass that backoff, and an unknown prior policy waits 24h.
+This exception also works over an open harness PR, without needing the same feedback posted again; in-flight and unknown/unattributable-PR refusals still apply.
+Costs are never refunded and all existing budget/deadline holds stay in force.
+Complete identity history is retained, never truncated or reset; after 64 total runs admission stops with `repair-history-full`, rather than reusing an ordinal or forgetting substantive attempts.
 While a PR awaits review, the incident issue says `Awaiting review/merge of #N` once per PR, found again by a hidden marker.
 It needs allowance, unheld providers, no pending effects, and no environment cooldown, has a $5 lease cap, and never holds a calendar image slot.
 Any settled harness outcome except an environment failure is handled.
@@ -517,7 +525,7 @@ It never updates the earlier PR's branch: that would change code under Oliver's 
 
 Annie answers feedback on her open harness PRs: conversation comments, reviews, and line comments, read with complete pagination on every observation.
 Her own comments (`github-actions[bot]`) and any post carrying an `<!-- annie-` marker are ignored.
-Feedback from an account with write, maintain, or admin permission, or from any bot account (other agents and apps), is trusted: if it is newer than the last attempt's admission, it admits one more attempt within the three-attempt limit; for a request, feedback on the request issue counts too.
+Feedback from an account with write, maintain, or admin permission, or from any bot account (other agents and apps), is trusted: if it is newer than the last attempt's admission, it admits one more attempt within the three-substantive-attempt limit; for a request, feedback on the request issue counts too.
 Feedback from anyone else reaches the executor as untrusted context, marked `trusted: false`, but never buys an attempt.
 The digest gains a `pr` field with the open PR's diff (at most 16 000 characters) and its last twelve feedback items with author, kind, state, path, and line; untrusted text shrinks first when the digest nears 48 KiB.
 The executor judges each point on its merits and decides: rework (a new candidate, delivered as a superseding PR), withdraw (no change, final answer starting `Decision: withdraw`; the incidents job comments on the PR and closes it, only if its head is an `annie/harness/` branch of this repository), or keep (no change, `Decision: keep`, and a point-by-point answer posted visibly on the PR).
@@ -550,9 +558,9 @@ Feedback means comments by the request author or the repository owner; bots, inc
 The digest carries a `request` field with the issue URL, title, Markdown body of at most 10 000 redacted characters, and the last five feedback comments of at most 1 000 characters each, which keeps the digest under 48 KiB; the executor treats it as the goal, newest feedback first, but not as permission to widen any limit.
 Everything else follows the incident rules above: $5 cap, independent review, harness gate, delivery as an `annie/harness/` PR that only Oliver merges, and the delivery comment lands on the request issue.
 A request PR body says `Closes #N`, so merging it closes and clears the request; reopening the issue starts a new streak and admits another attempt.
-An attempt that ends without a PR (no change, review rejection, or failure) is answered on the request issue by the model-free incidents job: outcome, run link, bounded reason and diagnosis, and how many of the three attempts are used, found again by a hidden `annie-request` marker.
+An attempt that ends without a PR (no change, review rejection, or failure) is answered on the request issue by the model-free incidents job: outcome, run link, bounded reason and diagnosis, and how many of the three substantive attempts are used, found again by a hidden `annie-request` marker.
 Observe emits such a notice only for model reports created since the previous observation started, so a notice is posted once rather than on every half-hourly run.
-A request never retries on its own: after a no-op, a closed PR, or a merge into a still-open issue, the next attempt waits for feedback newer than the last attempt's admission, or a reopen.
+Except after a qualifying host call/deadline failure above, a request never retries on its own: after a no-op, a closed PR, or a merge into a still-open issue, the next attempt waits for feedback newer than the last attempt's admission, or a reopen.
 Feedback posted while an attempt is still running is newer than its admission and therefore buys one more attempt after it settles.
 Editing the issue body is not feedback, because GitHub reports no separate edit time; comment instead.
 

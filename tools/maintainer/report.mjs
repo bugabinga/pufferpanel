@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { findEnvKeys } from '@earendil-works/pi-ai/compat';
 import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
-import { FINDING_ID, GATE_NAMES, SAFE_PATH, providerId } from './task.mjs';
+import { FINDING_ID, GATE_NAMES, PHASE_CALL_LIMIT, SAFE_PATH, providerId } from './task.mjs';
 
 export const text = (value, limit = 500) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\\`*_{}[\]()<>#+!|]/g, '\\$&').slice(0, limit).trim();
 // Non-key settings pi-ai reads beside a provider credential: Cloudflare account/gateway, Vertex project/location, Azure endpoint.
@@ -125,7 +125,7 @@ export function reportFor(run, { env = process.env, interrupted = false, gateEve
     gateRepairSkipped: run?.gateRepairSkipped === 'insufficient-time' ? 'insufficient-time' : null,
     usageComplete: modelPending ? false : typeof run?.usageComplete === 'boolean' ? run.usageComplete : null,
     knownSubtotal: safeNumber(run?.knownSubtotal),
-    modelCalls: Number.isInteger(run?.modelCalls) && run.modelCalls >= 0 && run.modelCalls <= 256 ? run.modelCalls : null,
+    modelCalls: Number.isInteger(run?.modelCalls) && run.modelCalls >= 0 && run.modelCalls <= 2 * PHASE_CALL_LIMIT ? run.modelCalls : null,
     budgetCap: safeNumber(run?.budgetCap),
     absoluteDeadline: safeNumber(run?.absoluteDeadline),
     budgetRemainder: safeNumber(run?.budgetRemainder),

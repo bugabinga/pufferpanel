@@ -19,7 +19,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { ModelRuntime, resolveModelScopeWithDiagnostics } from '@earendil-works/pi-coding-agent';
 import { excerpt, redact, redactMarkdown, reportFor, writeReport } from './report.mjs';
 import { collectGitHubSnapshot, writeIntake, removeIntake, installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
-import { GATE_NAMES, PROTECTED_PATHS, RUN_CAP, activeRejections, changedFiles, repeatRejected, selectedTask, validateHolds, validateRejections, versionFor } from './task.mjs';
+import { GATE_NAMES, PHASE_CALL_LIMIT, PROTECTED_PATHS, RUN_CAP, activeRejections, changedFiles, repeatRejected, selectedTask, validateHolds, validateRejections, versionFor } from './task.mjs';
 import { parseDigest } from './incident.mjs';
 import { HARNESS_PATHS, HARNESS_WORKFLOW, harnessScopeViolation } from './scope.mjs';
 import { createGuard } from './guard.mjs';
@@ -402,8 +402,10 @@ export function budgetModels(runtime, state) {
       return await state.root.commit(async tx => {
         const doc = await tx.doc(CallsDoc, state.root.id);
         if (doc.requestId !== run.requestId) { doc.requestId = run.requestId; doc.calls = []; }
-        if (doc.calls.length >= 256) fail('model call limit exceeded');
-        doc.calls.push({ model: `${physical.provider}/${physical.id}`, cap: estimate, cost: null, ...(type ? { type } : {}) });
+        if (!['executing', 'reviewing'].includes(run.phase)) fail('model call outside a model phase');
+        // Phase-less legacy calls count against both phases; classifiers and physical retries share their caller's phase.
+        if (doc.calls.filter(call => !call.phase || call.phase === run.phase).length >= PHASE_CALL_LIMIT) fail('model call limit exceeded');
+        doc.calls.push({ model: `${physical.provider}/${physical.id}`, phase: run.phase, cap: estimate, cost: null, ...(type ? { type } : {}) });
         return doc.calls.length - 1;
       }, ctx);
     } catch (error) { reserved -= estimate; throw error; }

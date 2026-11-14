@@ -8,6 +8,7 @@ export const PROTECTED_PATHS = Object.freeze(['tools/maintainer', '.github']);
 export const HARNESS_CAP = 5;
 // Paid limits: one run spends at most RUN_CAP; all paid runs together at most DAILY_BUDGET per rolling 24 hours.
 export const RUN_CAP = 15;
+export const PHASE_CALL_LIMIT = 256;
 export const DAILY_BUDGET = 50;
 export const HARNESS_BRANCH_PREFIX = 'annie/harness/';
 export const harnessBranch = fingerprint => `${HARNESS_BRANCH_PREFIX}${fingerprint.slice(0, 12)}`;
