@@ -12,7 +12,7 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-work
 import { Harness, createRegistry } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { advance, RunDoc, selectModels, heldProviders, piModelResolver, providerFailure, stateDirectory, versionFor, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER, LENGTH_REMINDER, REPAIR_FLOOR_MS } from './maintain.mjs';
+import { advance, RunDoc, selectModels, heldProviders, imageAlternative, piModelResolver, providerFailure, stateDirectory, versionFor, worstTier, getRun, createHostHooks, installReviewer, ensureWorktree, reconcileCommit, snapshot, budgetModels, captureGateFailure, modelShellEnv, CallsDoc, RETRY, ModelCodingTools, ModelCodemode, reviewVerdict, VERDICT_REMINDER, LENGTH_REMINDER, REPAIR_FLOOR_MS } from './maintain.mjs';
 import { installGitHubTools, installGitHubPlanReader, GitHubPlansDoc } from './github.mjs';
 import { fakeReviewSandbox } from './fake-podman.mjs';
 import { createGuard } from './guard.mjs';
@@ -551,6 +551,40 @@ test('selection orders enabledModels, Pi saved default, then provider defaults; 
   await assert.rejects(select({ enabledModels: 'zai/*' }), /invalid enabledModels/);
   await assert.rejects(selectModels({}, { getAvailable: async () => [] }), /no configured model available$/);
   assert.equal(versionFor('2026-04-03'), '2026.4.3'); assert.equal(stateDirectory({ HOME: '/x' }), '/x/.pi/agent/maintenance/pufferpanel');
+});
+test('selection adds a not-cheaper image alternative beside each text-only default and keeps an independent reviewer that reads images', async () => {
+  const tier = (provider, id, output, images = false, tiers = []) => ({ provider, id, type: 'chat', input: images ? ['text', 'image'] : ['text'], cost: { input: 1, output, cacheRead: 0, cacheWrite: 0, ...(tiers.length ? { tiers } : []) }, reasoning: true });
+  const table = piModelResolver.defaultModelPerProvider;
+  const models = [
+    tier('zai', table.zai, 4), tier('zai', 'zai-light-image', 0.5, true),
+    tier('minimax', table.minimax, 1), tier('minimax', 'mm-strong-image', 2, true, [{ inputTokensAbove: 1000, input: 2, output: 3, cacheRead: 0, cacheWrite: 0 }]), tier('minimax', 'mm-cheap-image', 0.25, true), tier('minimax', 'mm-free-image', 0, true)
+  ];
+  const select = (filter, settings = {}, held) => selectModels(settings, { getAvailable: async () => models.filter(filter) }, held);
+  // The alternative is the provider's strongest image model by worst billed tier, never its cheapest or a free tier.
+  assert.equal(imageAlternative(models, models.find(model => model.id === table.minimax)).id, 'mm-strong-image');
+  assert.equal(worstTier(models.find(model => model.id === 'mm-strong-image')), 3);
+  // A not-cheaper alternative leads its text-only default; a cheaper one only follows it as a fallback.
+  let choices = await select(() => true);
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}`), [`zai/${table.zai}`, 'zai/zai-light-image', 'minimax/mm-strong-image', `minimax/${table.minimax}`]);
+  // The executor keeps the strongest model and is never traded down to the light image variant; the reviewer stays on
+  // another provider, reads images, and is the strongest other-provider image candidate when no not-weaker one exists.
+  assert.equal(choices.executor.modelId, table.zai);
+  assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: 'mm-strong-image', thinkingLevel: 'high' }); assert.equal(choices.reviewerIndependent, true);
+  // One credentialed provider: the reviewer can only be the executor's model, and the selection says so.
+  choices = await select(model => model.provider === 'zai');
+  assert.deepEqual(choices.reviewer, choices.executor); assert.equal(choices.reviewerIndependent, false);
+  // A deprecated text-only default is left behind only through the not-cheaper image alternative.
+  choices = await select(model => model.provider === 'minimax');
+  assert.equal(choices.executor.modelId, 'mm-strong-image'); assert.equal(choices.reviewerIndependent, false);
+  // A default that already reads images gains no alternative entry.
+  choices = await selectModels({}, { getAvailable: async () => [tier('zai', table.zai, 4, true), tier('zai', 'zai-light-image', 0.5, true), tier('minimax', table.minimax, 1)] });
+  assert.deepEqual(choices.available.map(choice => `${choice.provider}/${choice.modelId}`), [`zai/${table.zai}`, `minimax/${table.minimax}`]);
+  // Image input is preferred, not guaranteed: with no image model at all the reviewer still comes from another provider.
+  choices = await selectModels({}, { getAvailable: async () => models.filter(model => !model.input.includes('image')) });
+  assert.deepEqual(choices.reviewer, { provider: 'minimax', modelId: table.minimax, thinkingLevel: 'high' }); assert.equal(choices.reviewerIndependent, true);
+  // An enabledModels pin still leads verbatim, however cheap the pinned model is.
+  choices = await select(() => true, { enabledModels: ['minimax/mm-cheap-image:low'] });
+  assert.deepEqual(choices.available[0], { provider: 'minimax', modelId: 'mm-cheap-image', thinkingLevel: 'low' });
 });
 test('provider holds from trusted observation are strict, and expired holds release their provider', () => {
   const now = Date.parse('2026-04-19T00:00:00Z'), hold = { provider: 'zai', until: now + 1, reason: 'quota' };
