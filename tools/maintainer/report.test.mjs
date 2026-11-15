@@ -21,6 +21,12 @@ test('a model phase that threw after every call settled reports failed with its 
   for (const report of [settled, collected]) assert.deepEqual([report.phase, report.outcome, report.usageComplete, report.reportedUsage], ['failed', 'failed', true, { status: 'known', cost: 1.76 }]);
   for (const open of [reportFor(run, { interrupted: true }), reportFor({ ...run, error: undefined }), reportFor({ ...run, usageComplete: false }), reportFor({ ...run, phase: 'admitted' })]) assert.deepEqual(open.reportedUsage, { status: 'unknown' });
 });
+test('the report states reviewer independence explicitly, including when the reviewer reuses the executor model', () => {
+  const run = { day: '2026-04-03', phase: 'reviewing' };
+  assert.equal(reportFor({ ...run, reviewerIndependent: true }).reviewerIndependent, true);
+  assert.equal(reportFor({ ...run, reviewerIndependent: false }).reviewerIndependent, false);
+  for (const missing of [run, { ...run, reviewerIndependent: 'yes' }]) assert.equal(reportFor(missing).reviewerIndependent, null);
+});
 test('inert keeps Markdown but neutralises mentions, closing keywords, and HTML', () => {
   assert.equal(inert('**Fix** `a` in #4, ask @oliver'), '**Fix** `a` in #4, ask @\u200boliver');
   assert.equal(inert('Closes #12, fixes: #3, Resolved owner/repo#9'), 'Closes #\u200b12, fixes: #\u200b3, Resolved owner/repo#\u200b9');

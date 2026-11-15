@@ -102,15 +102,33 @@ export const piModelResolver = await import(new URL('./core/model-resolver.js', 
 if (piModelResolver.resolveModelScopeWithDiagnostics !== resolveModelScopeWithDiagnostics || typeof piModelResolver.findInitialModel !== 'function' || !Object.keys(piModelResolver.defaultModelPerProvider ?? {}).length || Object.values(piModelResolver.defaultModelPerProvider).some(id => typeof id !== 'string' || !id)) fail('Pi default model table moved');
 // Trusted observe output ANNIE_PROVIDER_HOLDS: providers still held after quota/auth failures; malformed input fails closed.
 export const heldProviders = (text, now = Date.now()) => new Set(text ? validateHolds(JSON.parse(text)).filter(hold => hold.until > now).map(hold => hold.provider) : []);
+// The worst tier a model can bill, from catalog prices only: the highest output price over the base cost and every tier.
+export const worstTier = model => Math.max(model.cost.output, ...(model.cost.tiers ?? []).map(tier => tier.output));
+// A provider whose Pi default cannot read images contributes one alternative beside it: that provider's strongest
+// image-capable catalog model of the same kind, by worst billed tier and never its cheapest. Catalog fields only, because
+// model ids carry no reliable version ordering and the catalog exposes no release date.
+export const imageAlternative = (models, anchor) => models
+  .filter(model => model.provider === anchor.provider && model.id !== anchor.id && model.type === anchor.type && priced(model) && model.input?.includes('image'))
+  .reduce((best, model) => best === null || worstTier(model) > worstTier(best) ? model : best, null);
 // Candidates in Pi's order: settings `enabledModels` (globs, `:thinking`) resolved against authenticated models, Pi's saved
-// default model, then each authenticated provider's Pi default model in findInitialModel's provider order. Unknown prices and
-// held providers are skipped; thinking is the pattern suffix, else `defaultThinkingLevel`, else high, clamped to the model.
+// default model, then each authenticated provider's image alternative and Pi default model in findInitialModel's provider
+// order. Unknown prices and held providers are skipped; thinking is the pattern suffix, else `defaultThinkingLevel`, else
+// high, clamped to the model.
 export async function selectModels(settings, runtime, held = new Set()) {
   const patterns = settings.enabledModels ?? [];
   if (!Array.isArray(patterns) || patterns.some(pattern => typeof pattern !== 'string')) fail('invalid enabledModels');
   const { scopedModels } = await resolveModelScopeWithDiagnostics(patterns, runtime);
   const authenticated = await runtime.getAvailable(), find = (provider, id) => authenticated.find(model => model.provider === provider && model.id === id);
-  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...Object.entries(piModelResolver.defaultModelPerProvider).map(([provider, id]) => ({ model: find(provider, id) }))];
+  const tiered = [];
+  for (const [provider, id] of Object.entries(piModelResolver.defaultModelPerProvider)) {
+    const anchor = find(provider, id);
+    if (!anchor) continue;
+    // The alternative leads only when its worst tier bills no less than the anchor's, so the executor is never traded down
+    // to a lighter image variant; a cheaper alternative only follows, as a fallback and for the reviewer's image pool.
+    const alternative = anchor.input?.includes('image') ? null : imageAlternative(authenticated, anchor);
+    tiered.push(...(alternative && worstTier(alternative) >= worstTier(anchor) ? [alternative, anchor] : [anchor, ...(alternative ? [alternative] : [])]));
+  }
+  const ordered = [...scopedModels, { model: find(settings.defaultProvider, settings.defaultModel) }, ...tiered.map(model => ({ model }))];
   const candidates = [];
   for (const { model, thinkingLevel } of ordered) {
     if (!model || !priced(model) || candidates.some(choice => choice.provider === model.provider && choice.modelId === model.id)) continue;
@@ -118,8 +136,19 @@ export async function selectModels(settings, runtime, held = new Set()) {
   }
   const available = candidates.filter(choice => !held.has(choice.provider));
   if (!available.length) fail(`no configured model available${held.size ? `; held providers: ${[...held].join(', ')}` : ''}`);
-  // Independent review prefers another provider when one is available.
-  return { executor: available[0], reviewer: { ...available.find(choice => choice.provider !== available[0].provider) ?? available[0] }, available, providers: [...new Set(candidates.map(choice => choice.provider))] };
+  // The executor keeps Pi's own first choice. The reviewer is independent above all and reuses the executor's model only
+  // when no other provider is credentialed, which the selection says instead of passing it off as independent; among
+  // other-provider candidates it keeps image input whenever one has it, strongest first, and accepts a weaker image-capable
+  // reviewer only when no not-weaker candidate can read images.
+  const executor = available[0], entry = choice => find(choice.provider, choice.modelId), strength = choice => worstTier(entry(choice));
+  const others = available.filter(choice => choice.provider !== executor.provider);
+  const sighted = others.filter(choice => entry(choice)?.input?.includes('image'));
+  const reviewer = sighted.find(choice => strength(choice) >= strength(executor))
+    ?? sighted.slice().sort((left, right) => strength(right) - strength(left))[0]
+    ?? others.find(choice => strength(choice) >= strength(executor))
+    ?? others[0]
+    ?? executor;
+  return { executor, reviewer, reviewerIndependent: reviewer.provider !== executor.provider, available, providers: [...new Set(candidates.map(choice => choice.provider))] };
 }
 export function createRuntime(agentDir) {
   return ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), modelsStorePath: join(agentDir, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false });
@@ -601,7 +630,7 @@ export function createHostHooks({ root, harness, worktree, state, models, review
       await git(worktree, 'fetch', '--no-tags', 'upstream', upstreamSha);
       const githubDiagnostics = { issuesDisabled: intake.own?.issues?.disabled === true, truncated: [intake.own?.issues, intake.own?.prs, intake.upstream?.issues, intake.upstream?.prs].some(queue => queue?.truncated === true) };
       if (task?.kind === 'pr') await materializePR(worktree, task, { fetchImpl: snapshotHttp ?? fetch, token: process.env.GH_TOKEN, ownUrl, diagnostics: githubDiagnostics });
-      return { providers: models.providers ?? [], githubDiagnostics, taskKind: task?.kind ?? 'maintenance', fingerprint: task?.fingerprint ?? null, prNumber: task?.number ?? null, prHead: task?.head ?? null, prAuthor: task?.author ?? null, trustedUpstreamPin: upstreamSha, base: await git(worktree, 'rev-parse', 'HEAD'), upstream: `upstream/${branch}`, upstreamRef: `refs/heads/${branch}`, upstreamSha, intakePath: policy.intakePath, usageStart: usageCost(await harness.usage(ctx)) };
+      return { providers: models.providers ?? [], reviewerIndependent: typeof models.reviewerIndependent === 'boolean' ? models.reviewerIndependent : null, githubDiagnostics, taskKind: task?.kind ?? 'maintenance', fingerprint: task?.fingerprint ?? null, prNumber: task?.number ?? null, prHead: task?.head ?? null, prAuthor: task?.author ?? null, trustedUpstreamPin: upstreamSha, base: await git(worktree, 'rev-parse', 'HEAD'), upstream: `upstream/${branch}`, upstreamRef: `refs/heads/${branch}`, upstreamSha, intakePath: policy.intakePath, usageStart: usageCost(await harness.usage(ctx)) };
     },
     execute: async run => {
       if (run.taskKind === 'pr') {
