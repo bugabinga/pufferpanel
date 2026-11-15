@@ -55,11 +55,15 @@ func downloadDD(rootBinaryFolder string, version string) error {
 }
 
 func getLatestVersion() (string, error) {
+	return getLatestVersionFrom(RepoReleases)
+}
+
+func getLatestVersionFrom(releasesUrl string) (string, error) {
 	client := pufferpanel.Http()
 	request := &http.Request{}
 
 	var err error
-	request.URL, err = url.Parse(RepoReleases)
+	request.URL, err = url.Parse(releasesUrl)
 	if err != nil {
 		return "", err
 	}
