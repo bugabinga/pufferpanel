@@ -207,6 +207,20 @@ func deleteUser(c *gin.Context) {
 		return
 	}
 
+	ps := &services.Permission{DB: db}
+	perms, err := ps.GetForUserAndServer(user.ID, "")
+	if response.HandleError(c, err, http.StatusInternalServerError) {
+		return
+	}
+	lastAdmin, err := wouldRemoveLastAdmin(ps, perms.Scopes, nil, user.ID)
+	if response.HandleError(c, err, http.StatusInternalServerError) {
+		return
+	}
+	if lastAdmin {
+		response.HandleError(c, pufferpanel.ErrCannotRemoveLastAdmin, http.StatusBadRequest)
+		return
+	}
+
 	if err = us.Delete(user); response.HandleError(c, err, http.StatusInternalServerError) {
 		return
 	}
@@ -285,6 +299,7 @@ func setUserPerms(c *gin.Context) {
 	if response.HandleError(c, err, http.StatusInternalServerError) {
 		return
 	}
+	previousScopes := perms.Scopes
 
 	//get the current user's scopes
 	editorUser := c.MustGet("user").(*models.User)
@@ -303,12 +318,37 @@ func setUserPerms(c *gin.Context) {
 		perms.Scopes = replacement
 	}
 
+	//editing your own account without the login scope would lock you out of the panel
+	if user.ID == editorUser.ID && !scopes.ContainsScope(perms.Scopes, scopes.ScopeLogin) {
+		response.HandleError(c, pufferpanel.ErrCannotRemoveOwnLogin, http.StatusBadRequest)
+		return
+	}
+	lastAdmin, err := wouldRemoveLastAdmin(ps, previousScopes, perms.Scopes, user.ID)
+	if response.HandleError(c, err, http.StatusInternalServerError) {
+		return
+	}
+	if lastAdmin {
+		response.HandleError(c, pufferpanel.ErrCannotRemoveLastAdmin, http.StatusBadRequest)
+		return
+	}
+
 	err = ps.UpdatePermissions(perms)
 	if response.HandleError(c, err, http.StatusInternalServerError) {
 		return
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+// wouldRemoveLastAdmin reports whether a change would strip the admin scope
+// from the only account that has it. updated is nil when the account is deleted.
+func wouldRemoveLastAdmin(ps *services.Permission, current, updated []*scopes.Scope, userId uint) (bool, error) {
+	if !scopes.ContainsScope(current, scopes.ScopeAdmin) || scopes.ContainsScope(updated, scopes.ScopeAdmin) {
+		return false, nil
+	}
+
+	others, err := ps.CountOtherAdmins(userId)
+	return others == 0, err
 }
 
 func newUserSearch() *models.UserSearch {

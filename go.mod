@@ -5,7 +5,7 @@ go 1.27.4
 require (
 	cel.dev/cel-go v0.33.2
 	github.com/MicahParks/jwkset v0.11.4
-	github.com/MicahParks/keyfunc/v3 v3.9.1
+	github.com/MicahParks/keyfunc/v3 v3.9.2
 	github.com/buildkite/shellwords v1.0.1
 	github.com/cavaliergopher/grab/v3 v3.0.1
 	github.com/creack/pty v1.1.24
@@ -29,8 +29,8 @@ require (
 	github.com/mailjet/mailjet-apiv3-go/v4 v4.1.0
 	github.com/mattn/go-sqlite3 v1.14.53
 	github.com/mholt/archives v0.1.5
-	github.com/moby/moby/api v1.56.1
-	github.com/moby/moby/client v0.6.2
+	github.com/moby/moby/api v1.57.0
+	github.com/moby/moby/client v0.6.3
 	github.com/nwaples/rardecode/v2 v2.4.6
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/pkg/sftp v1.13.12

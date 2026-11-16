@@ -58,6 +58,25 @@ func (ps *Permission) GetForUserAndServer(userId uint, serverId string) (*models
 	return permissions, err
 }
 
+// CountOtherAdmins reports how many users other than userId hold the global
+// admin scope. Global scopes are stored as one comma-separated string per row,
+// so we match them in Go to avoid substring hits such as "server.admin".
+func (ps *Permission) CountOtherAdmins(userId uint) (int64, error) {
+	var all []*models.Permissions
+	err := ps.DB.Where("user_id IS NOT NULL AND server_identifier IS NULL").Find(&all).Error
+	if err != nil {
+		return 0, err
+	}
+
+	var count int64
+	for _, perms := range all {
+		if perms.UserId != nil && *perms.UserId != userId && scopes.ContainsScope(perms.Scopes, scopes.ScopeAdmin) {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (ps *Permission) HasPermission(userId uint, serverId string, permission *scopes.Scope) (bool, error) {
 	var query *gorm.DB
 
