@@ -6,6 +6,7 @@ import Btn from '@/components/ui/Btn.vue'
 import Icon from '@/components/ui/Icon.vue'
 import TextField from '@/components/ui/TextField.vue'
 import Toggle from '@/components/ui/Toggle.vue'
+import { toggleScope } from '@/utils/permissions'
 
 const { t, te, locale } = useI18n()
 const route = useRoute()
@@ -141,11 +142,7 @@ function permissionDisabled(scope) {
 }
 
 function togglePermission(scope) {
-  if (permissions.value.indexOf(scope) === -1) {
-    permissions.value = [...permissions.value, scope]
-  } else {
-    permissions.value = permissions.value.filter(e => e !== scope)
-  }
+  permissions.value = toggleScope(permissions.value, scope)
 }
 </script>
 
