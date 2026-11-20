@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { createQueryPoller } from './query-helpers'
 
 const props = defineProps({
   server: { type: Object, required: true }
@@ -10,18 +11,14 @@ const { t } = useI18n()
 
 const data = ref({})
 
-let task = null
-onMounted(async () => {
-  if (await props.server.canQuery()) {
-    task = setInterval(async () => {
-      data.value = await props.server.getQuery()
-    }, 30000)
-    data.value = await props.server.getQuery()
-  }
+let poller = null
+onMounted(() => {
+  poller = createQueryPoller(props.server, { onUpdate: result => { data.value = result } })
+  poller.start()
 })
 
 onUnmounted(() => {
-  if (task) clearInterval(task)
+  if (poller) poller.stop()
 })
 </script>
 

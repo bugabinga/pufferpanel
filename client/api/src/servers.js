@@ -48,8 +48,10 @@ export class ServerApi {
   }
 
   async canQuery(id) {
-    await this._api.head(`/api/servers/${id}/query`)
-    return true
+    const res = await this._api.head(`/api/servers/${id}/query`)
+    // the API reports query support as 202, and 204 when it is unsupported,
+    // but both statuses resolve in axios, so the status must be checked
+    return res.status === 202
   }
 
   async action(id, action, wait = false) {

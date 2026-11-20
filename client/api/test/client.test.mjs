@@ -184,6 +184,20 @@ describe('ServerApi file handling', () => {
     })
   })
 
+  it('reports query support from the HEAD status instead of any 2xx', async () => {
+    const statuses = []
+    const { axios } = makeAxios({ head: async () => ({ status: statuses.shift() }) })
+    const client = makeClient(axios)
+    const server = client.server
+
+    statuses.push(202)
+    assert.equal(await server.canQuery('sid'), true)
+    // the daemon answers 204 when the server type has no query protocol,
+    // and axios resolves both statuses, so the status itself is the signal
+    statuses.push(204)
+    assert.equal(await server.canQuery('sid'), false)
+  })
+
   it('sends normalized archive paths without mutating caller arrays', async () => {
     const calls = []
     const api = { post: async (...args) => { calls.push(args) } }
