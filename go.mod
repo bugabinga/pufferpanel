@@ -4,7 +4,7 @@ go 1.27.4
 
 require (
 	cel.dev/cel-go v0.33.4
-	github.com/MicahParks/jwkset v0.11.4
+	github.com/MicahParks/jwkset v0.12.0
 	github.com/MicahParks/keyfunc/v3 v3.9.2
 	github.com/buildkite/shellwords v1.0.1
 	github.com/cavaliergopher/grab/v3 v3.0.1

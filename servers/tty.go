@@ -21,6 +21,7 @@ import (
 	"github.com/pufferpanel/pufferpanel/v3/utils"
 	"github.com/shirou/gopsutil/v4/process"
 	"github.com/spf13/cast"
+	"golang.org/x/sys/unix"
 )
 
 type tty struct {
@@ -31,6 +32,7 @@ type tty struct {
 	lastStatTime    time.Time
 	//disableStdin        bool
 	disableSpecialStats bool
+	tmpDirFD            int
 
 	DisableUnshare bool     `json:"disableUnshare"`
 	Mounts         []string `json:"mounts"`
@@ -79,6 +81,12 @@ func (t *tty) ExecuteAsyncImpl(environment *pufferpanel.Environment, steps puffe
 	t.disableSpecialStats = steps.DisableStats
 	processTty, err := pty.Start(pr)
 	if err != nil {
+		if !t.DisableUnshare && t.tmpDirFD != 0 {
+			t.releaseWorkspaceLock(pr.Dir)
+			if rmErr := os.RemoveAll(pr.Dir); rmErr != nil {
+				logging.Debug.Printf("Failed to delete %s: %s", pr.Dir, rmErr.Error())
+			}
+		}
 		t.mainProcess = nil
 		t.disableSpecialStats = false
 		t.lifecycleLocker.Unlock()
@@ -274,7 +282,9 @@ func (t *tty) handleClose(environment *pufferpanel.Environment, process *exec.Cm
 	}
 
 	//if we are using unshare AND we're in tmp, we can nuke the workspace at this point
-	if !t.DisableUnshare && strings.HasPrefix(process.Dir, os.TempDir()) {
+	//the workspace holds a flock while the server runs, so we release it before deleting
+	if !t.DisableUnshare && t.tmpDirFD != 0 {
+		t.releaseWorkspaceLock(process.Dir)
 		err = os.RemoveAll(process.Dir)
 		if err != nil {
 			logging.Debug.Printf("Failed to delete %s: %s", process.Dir, err.Error())
@@ -385,6 +395,39 @@ var cmdList = []string{
 
 const Shell = "bash"
 
+// lockWorkspaceDir opens dir and holds an exclusive flock on it for the lifetime
+// of the returned descriptor. Age-based /tmp cleaners such as systemd-tmpfiles
+// skip entries with an active flock, which keeps the unshare workspace alive
+// while a server runs, see upstream issue #1509 (Debian 13 deleting /tmp data).
+// Upstream bf2c420a intended this but only ever unlocked, so the lock was never held.
+func lockWorkspaceDir(dir string) (fd int, err error) {
+	fd, err = unix.Open(dir, unix.O_DIRECTORY|unix.O_RDONLY, 0)
+	if err != nil {
+		return
+	}
+	if err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = unix.Close(fd)
+		fd = 0
+	}
+	return
+}
+
+// releaseWorkspaceLock drops the workspace flock and closes the directory handle.
+// It is a no-op when no workspace handle is open.
+func (t *tty) releaseWorkspaceLock(dir string) {
+	fd := t.tmpDirFD
+	if fd == 0 {
+		return
+	}
+	t.tmpDirFD = 0
+	if err := unix.Flock(fd, unix.LOCK_UN); err != nil {
+		logging.Debug.Printf("Failed to unlock %s: %s", dir, err.Error())
+	}
+	if err := unix.Close(fd); err != nil {
+		logging.Debug.Printf("Failed to close handle on %s: %s", dir, err.Error())
+	}
+}
+
 func (t *tty) createCmd(rootDir, workDir string) (pr *exec.Cmd, err error) {
 	if workDir == "" {
 		workDir = rootDir
@@ -463,6 +506,15 @@ func (t *tty) createCmd(rootDir, workDir string) (pr *exec.Cmd, err error) {
 
 	pr = exec.Command(Shell, "-c", strings.Join(unshareArgs, " && "))
 	pr.Dir, err = os.MkdirTemp("", "unshare-pp-")
+	if err != nil {
+		return
+	}
+	if t.tmpDirFD != 0 {
+		//a prior start never released its handle, drop it instead of leaking it
+		_ = unix.Close(t.tmpDirFD)
+		t.tmpDirFD = 0
+	}
+	t.tmpDirFD, err = lockWorkspaceDir(pr.Dir)
 	if err != nil {
 		return
 	}

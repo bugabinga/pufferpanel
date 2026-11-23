@@ -5,9 +5,69 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/pufferpanel/pufferpanel/v3"
 	"github.com/pufferpanel/pufferpanel/v3/files"
 )
+
+// TestLockWorkspaceDirHoldsExclusiveLock is a regression test for the upstream
+// #1509 fix: the workspace dir must actually hold an exclusive flock while a
+// server runs, or age-based /tmp cleaners still delete it. Upstream bf2c420a
+// only ever unlocked, which held nothing.
+func TestLockWorkspaceDirHoldsExclusiveLock(t *testing.T) {
+	dir := t.TempDir()
+
+	fd, err := lockWorkspaceDir(dir)
+	if err != nil {
+		t.Fatalf("lockWorkspaceDir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = unix.Close(fd)
+	})
+
+	other, err := unix.Open(dir, unix.O_DIRECTORY|unix.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("unix.Open() error = %v", err)
+	}
+	defer func() { _ = unix.Close(other) }()
+
+	if err := unix.Flock(other, unix.LOCK_EX|unix.LOCK_NB); err == nil {
+		t.Fatal("second LOCK_EX succeeded while the workspace lock was held")
+	}
+
+	if err := unix.Flock(fd, unix.LOCK_UN); err != nil {
+		t.Fatalf("unix.Flock(LOCK_UN) error = %v", err)
+	}
+	if err := unix.Flock(other, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("LOCK_EX failed after the workspace lock was released: %v", err)
+	}
+}
+
+// TestReleaseWorkspaceLockClosesHandle verifies the release path closes the
+// directory handle, so server restarts do not leak one descriptor per run.
+func TestReleaseWorkspaceLockClosesHandle(t *testing.T) {
+	dir := t.TempDir()
+
+	fd, err := lockWorkspaceDir(dir)
+	if err != nil {
+		t.Fatalf("lockWorkspaceDir() error = %v", err)
+	}
+
+	impl := &tty{tmpDirFD: fd}
+	impl.releaseWorkspaceLock(dir)
+
+	if impl.tmpDirFD != 0 {
+		t.Fatalf("tmpDirFD = %d after release, want 0", impl.tmpDirFD)
+	}
+	// a closed descriptor cannot be flocked again
+	if err := unix.Flock(fd, unix.LOCK_UN); err == nil {
+		t.Fatal("flock on closed descriptor succeeded")
+	}
+
+	// releasing without a handle stays a no-op
+	impl.releaseWorkspaceLock(dir)
+}
 
 func startTestTTY(tb testing.TB, environment *pufferpanel.Environment) *tty {
 	tb.Helper()
