@@ -1,7 +1,9 @@
 package pufferpanel
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -66,5 +68,57 @@ func TestWaitForMainProcessForDoesNotKillNaturalExit(t *testing.T) {
 	}
 	if implementation.killCalls != 0 {
 		t.Fatalf("Kill() calls = %d, want 0", implementation.killCalls)
+	}
+}
+
+// TestConsoleSinksAgreeOnWriteOrder is the regression test for the console
+// write race: process output flows through environment.Wrapper while
+// lifecycle messages go through DisplayToConsole, and both write to the
+// console buffer and the live tracker as two independently locked sinks.
+// Without a shared lock, the buffer could record "proc then life" while a
+// live websocket client received "life then proc", so the live console and
+// the history a client gets after a refresh disagreed about the order.
+func TestConsoleSinksAgreeOnWriteOrder(t *testing.T) {
+	environment := &Environment{}
+	environment.ConsoleBuffer = CreateCache()
+	environment.ConsoleTracker = CreateTracker()
+	environment.CreateWrapper()
+
+	socket, client := newSocketPair(t)
+	environment.ConsoleTracker.Register(socket)
+	_ = socket
+
+	const rounds = 300
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			if _, err := fmt.Fprintf(environment.Wrapper, "proc %d\n", i); err != nil {
+				t.Errorf("write process output: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			environment.DisplayToConsole(true, "life %d\n", i)
+		}
+	}()
+	wg.Wait()
+
+	history, _ := environment.ConsoleBuffer.Read()
+
+	var live bytes.Buffer
+	for i := 0; i < 2*rounds; i++ {
+		_ = client.SetReadDeadline(time.Now().Add(30 * time.Second))
+		frame := readFrame(t, client)
+		live.Write(frame.Data.Logs)
+	}
+
+	if !bytes.Equal(history, live.Bytes()) {
+		t.Fatalf("console history and live console disagree on order:\nhistory:\n%s\nlive:\n%s", history, live.Bytes())
 	}
 }

@@ -38,15 +38,19 @@ type Environment struct {
 	Wait            *sync.Mutex  `json:"-"`
 	LastExitCode    int          `json:"-"`
 	Wrapper         io.Writer    `json:"-"` //our proxy back to the main
-	ConsoleTracker  *Tracker     `json:"-"`
-	StatusTracker   *Tracker     `json:"-"`
-	StatsTracker    *Tracker     `json:"-"`
-	Installing      bool         `json:"-"`
-	installingMu    sync.RWMutex
-	BackingUp       bool            `json:"-"`
-	Console         Console         `json:"-"`
-	Server          DaemonServer    `json:"-"`
-	Implementation  EnvironmentImpl `json:"-"`
+	// consoleLock serializes writes that must reach ConsoleBuffer and
+	// ConsoleTracker in the same order, so process output and lifecycle
+	// messages cannot appear in one order live and another in history.
+	consoleLock    sync.Mutex `json:"-"`
+	ConsoleTracker *Tracker   `json:"-"`
+	StatusTracker  *Tracker   `json:"-"`
+	StatsTracker   *Tracker   `json:"-"`
+	Installing     bool       `json:"-"`
+	installingMu   sync.RWMutex
+	BackingUp      bool            `json:"-"`
+	Console        Console         `json:"-"`
+	Server         DaemonServer    `json:"-"`
+	Implementation EnvironmentImpl `json:"-"`
 }
 
 type ExecutionData struct {
@@ -152,6 +156,8 @@ func (e *Environment) DisplayToConsole(daemon bool, msg string, data ...interfac
 		}
 		format = "[DAEMON] " + format
 	}
+	e.consoleLock.Lock()
+	defer e.consoleLock.Unlock()
 	if len(data) == 0 {
 		_, _ = fmt.Fprint(e.ConsoleBuffer, format)
 		_, _ = fmt.Fprint(e.ConsoleTracker, format)
@@ -216,10 +222,28 @@ func (e *Environment) WaitForMainProcessFor(timeout time.Duration) (err error) {
 func (e *Environment) CreateWrapper() {
 	if config.ConsoleForward.Value() {
 		//return io.MultiWriter(newLogger(e.ServerId).Writer(), e.ConsoleBuffer, e.ConsoleTracker)
-		e.Wrapper = io.MultiWriter(logging.OriginalStdOut, e.ConsoleBuffer, e.ConsoleTracker)
+		e.Wrapper = e.lockConsoleWrites(io.MultiWriter(logging.OriginalStdOut, e.ConsoleBuffer, e.ConsoleTracker))
 	} else {
-		e.Wrapper = io.MultiWriter(e.ConsoleBuffer, e.ConsoleTracker)
+		e.Wrapper = e.lockConsoleWrites(io.MultiWriter(e.ConsoleBuffer, e.ConsoleTracker))
 	}
+}
+
+// lockConsoleWrites returns a writer that holds consoleLock for the whole
+// write, so the wrapped sinks observe every console write in one shared order
+// no matter which goroutine produced it.
+func (e *Environment) lockConsoleWrites(writer io.Writer) io.Writer {
+	return &serializedConsoleWriter{lock: &e.consoleLock, writer: writer}
+}
+
+type serializedConsoleWriter struct {
+	lock   *sync.Mutex
+	writer io.Writer
+}
+
+func (s *serializedConsoleWriter) Write(p []byte) (n int, err error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.writer.Write(p)
 }
 
 func (e *Environment) GetLastExitCode() int {
